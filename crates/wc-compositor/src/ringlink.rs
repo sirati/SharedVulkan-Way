@@ -303,6 +303,7 @@ impl RingLink {
                 || self.control.ring_kind(slot).ok() != Some(RingKind::Wayland)
                 || self.links.iter().any(|l| l.slot == slot)
                 || quarantined(slot)
+                || has_reader(slot)
                 || !crate::session_svc::may_recycle(self.control.ring_owner(slot).unwrap_or(0))
             {
                 continue;
@@ -559,6 +560,34 @@ pub fn guest_ram_rings_located() {
     LOCATED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// How often this process beats the ring region's owner heartbeat (§113).
+pub const GUEST_BEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Make `control` the ring region every service uses, and beat for it.
+fn publish_shared(control: &Arc<Control>) {
+    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(control));
+    start_guest_beat();
+}
+
+/// §113: the guest's heartbeat. Every 100 ms, for as long as this process
+/// runs, the owner word of the ring region moves, on a thread that does
+/// nothing else. Every session's proxy reads it: a session whose pings stop
+/// while this moves is gone; pings and this stopping together is the whole
+/// guest stalled (its GPU waking from D3 held every vCPU for up to ten
+/// seconds on testhost), which the proxy's lease rides out.
+fn start_guest_beat() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("guest-beat".into()).spawn(|| loop {
+        if let Some(c) = shared_control() {
+            let _ = c.beat_now();
+        }
+        std::thread::sleep(GUEST_BEAT_EVERY);
+    });
+}
+
 /// The ring region, once made: the launcher's control and sound channels are
 /// ring slots of it.
 pub fn shared_control() -> Option<Arc<Control>> {
@@ -782,7 +811,7 @@ impl PendingRings {
         let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
         let control = Arc::new(Control::create(region, self.geometry, ids, 1).map_err(|e| e.to_string())?);
         control.stamp_epoch().map_err(|e| e.to_string())?;
-        *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+        publish_shared(&control);
         let reader = match self.bell {
             Some(b) => {
                 println!(
@@ -869,6 +898,10 @@ pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::Po
     }
     #[cfg(windows)]
     {
+        // §111.8: the broker opens the port and moves it here.
+        if let Some(p) = wc_broker::client::lend::port(name, "compositor") {
+            return Ok(sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)));
+        }
         sv_transport::winpipe::open_virtio_port(name, 500)
             .map(|p| sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)))
             .map_err(|e| std::io::Error::other(format!("{e}")))
@@ -900,7 +933,7 @@ pub fn over_ivshmem(id: u32, port: Option<sv_transport::vdoorbell::PortHandle>) 
     control.stamp_epoch().map_err(|e| e.to_string())?;
     let control = Arc::new(control);
     // §105: the session's service threads (control, sound) use the same region.
-    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+    publish_shared(&control);
     let reader = match port {
         Some(port) => {
             let (reader, writer) = port.split().map_err(|e| e.to_string())?;
@@ -1044,6 +1077,41 @@ pub fn quarantined(slot: u32) -> bool {
     let now = std::time::Instant::now();
     q.retain(|(_, until)| *until > now);
     q.iter().any(|(s, _)| *s == slot)
+}
+
+/// §107.11: the slots a thread of this process reads outside the Wayland
+/// thread's links: a session's control, sound, arena and hostint channels.
+/// [`RingLink::reap`] never recycles one of them, whatever its quarantine
+/// says, so a slot cannot mean somebody else's connection while an old
+/// reader of it is still running. One entry per [`SlotReader`].
+static READERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// A thread's claim to read `slot`, held for as long as it may touch the
+/// slot's ring, and released when it is dropped.
+#[derive(Debug)]
+pub struct SlotReader {
+    slot: u32,
+}
+
+impl SlotReader {
+    pub fn new(slot: u32) -> SlotReader {
+        READERS.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+        SlotReader { slot }
+    }
+}
+
+impl Drop for SlotReader {
+    fn drop(&mut self) {
+        let mut r = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = r.iter().position(|s| *s == self.slot) {
+            r.swap_remove(i);
+        }
+    }
+}
+
+/// Whether a thread still holds a [`SlotReader`] for `slot`.
+pub fn has_reader(slot: u32) -> bool {
+    READERS.lock().unwrap_or_else(|e| e.into_inner()).contains(&slot)
 }
 
 /// The ring region's geometry for the ivshmem tail: §107's 64 slots when this

@@ -1138,6 +1138,18 @@ the identity. Nothing on either side logs a URL or a title. Firefox's
 `browser.taskbar.lists.enabled` and `…frequent.enabled` turn the pages off.
 Private windows record no history, so nothing from one can appear.
 
+**One installation's history stays in its own jump list** (`waycompose-design.md`
+§92.12). Until then the identity, and so the jump list, was the application's:
+every installation of Firefox wrote `Waycompose.app.firefox`'s list, and a test
+installation's run replaced the user's list with the test profile's pages. Now
+each installation has its own identity (`Waycompose.install.<name>.<app>`) and
+its own jump-list directory; only the one installation deploy found the user's
+pin of keeps the old identity, and a claim file and the compositor keep a
+second from taking it. A session's `taskbar=` boot field must name the
+session's own installation, which the host has already checked against that
+installation's key; it cannot name another's windows. All of it is one Windows
+user's own taskbar.
+
 ### R34 — The GPU sessions share one pool
 Added 2026-10-16 with `waycompose-design.md` §97. The GPU ivshmem device was cut
 into fixed slots, one per session (§87); it is now one pool, and every session
@@ -1448,6 +1460,38 @@ process (macOS: bundle `org.waycompose.host`, after the user grants the TCC
 prompt once), never by a per-application process, and only while the
 session has a source node that a Linux client records from.
 
+### R39 — A userspace render node, and guest sections named by tokens
+Added 2026-10-19 with `waycompose-design.md` §104. The nested KWin composites on
+the forwarded GPU through pieces that each widen something a little.
+
+**`sv-drm serve` runs as root** (started by `atp-nested-seat`, only with
+`kwinGpu` and a GPU offered). It is a CUSE device answering a fixed list of DRM
+ioctls; nothing it does touches a kernel driver or memory. The one ioctl that
+reads anything is `PRIME_FD_TO_HANDLE`: it opens `/proc/<pid>/fd/<fd>` of the
+pid that issued the ioctl, and only if that is a regular file on tmpfs (a
+memfd), so a client cannot make it block on a FIFO or reopen the node; it then
+reads at most the token header. The node is `root:users` 0660: any member of
+`users` can open it and gets only those answers.
+
+**`sv-drm ns` is unprivileged**: a user and mount namespace that hides nothing
+and grants nothing; it overlays `/sys/dev/char` and `/tmp/.X11-unix` with
+tmpfs files of its own and drops back to the real ids before exec.
+
+**The desktop user may map the GPU region** (`waycomposeArena.gpu.users`, a
+named ACL on `/run/windows-vm/wc-arena/gpu` only): that user's sv-icd maps the
+pool like the session user's does. It can read and write every GPU session's
+pool memory, as the session user always could; the compositor's arena and the
+doorbells stay the session user's.
+
+**Tokens and sections.** A dma-buf here is a sealed memfd naming a section; a
+reader refuses an unsealed one, an unknown version, a name outside
+`[A-Za-z0-9_-./\\]` or with `..`. The GPU process opens only names it
+created itself, with the nonce it gave them, so one session can import
+another's buffer only by holding its token (the dma-buf the producer handed
+over). The compositor opens a section by the name the proxy passes, read and
+write for GDI's `CreateDIBSection`, and only reads it. The fence record
+(§104.11) is a page per GPU session that the compositor and other sessions only
+read.
 ### R40 — A macOS guest starts its sessions through a record in its own RAM
 Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
 (role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It
@@ -1538,6 +1582,90 @@ installation's session at once, where before it ended one. The next click
 starts a new compositor with a new run id, which voids every old record,
 region and slot (`waycompose-design.md` §107.6). The host side is one user,
 as above.
+
+### R43 — The host maps the Windows guest's own RAM, and the guest lends it on request
+Added 2026-10-19 with `waycompose-design.md` §108. The GPU pool, and through
+§110 the Wayland arena, grow into **regions of the guest's RAM**. These are
+large-page sections that a SYSTEM keeper in the guest creates and holds, and
+the host finds them by a 2 MiB probe of QEMU's RAM backend. Before §108 the
+host touched only the two ivshmem devices; now it maps pages that Windows
+lent and will reuse. What can go wrong, and what holds it:
+
+* **A host write into memory Windows has reused.** This is the failure that
+  panicked the macOS guest (§103.15). Here it would corrupt the Windows
+  kernel or another process: the worst outcome in this document. It is held
+  by §108.4's rules and nothing else:
+  * the provider frees a region only after the peer's `UNMAPPED` for that
+    region's epoch, never on a timeout;
+  * the peer answers only after its own mapping is gone and the broker says
+    every lease on the region has ended (by `close`, by its connection, or
+    by its process's exit, which the kernel reports through a pidfd). After a
+    restart of the daemon, it also waits for every holder its record names
+    (pid and start time);
+  * every host mapper unmaps to `PROT_NONE`, so a stale pointer faults in its
+    own process;
+  * the memory has two holders in the guest (the keeper's handle and the
+    provider's view), so a crashed GPU process or compositor does not free it.
+
+  Tested on a test VM (§108.12): 86 provider kills under host writes, a
+  canary in reused memory, 0 corrupt words. **Residual:** the keeper and
+  every provider of a pool killed together before the host lets go (108.10).
+  An administrator can do that; a user's logoff cannot, because the keeper is
+  SYSTEM.
+* **Who can reach guest RAM on the host.** Mapping any region needs the RAM
+  backend, which is the whole guest.
+  * **Decided (user, 2026-10-19):** only a broker reaches it. The broker runs
+    as its own system user (the VM's user, `windows-vm`, once QEMU runs as
+    that user instead of root) and alone opens the memfd and `/dev/udmabuf`.
+  * Clients (ICDs, proxies, the desktop user's processes) get **udmabufs of
+    exactly their regions** over the broker's socket. The kernel refuses any
+    mapping beyond them (§108.15, tested as root and as an ordinary user).
+  * **Identity:** `SO_PEERCRED` uid, with no keys and no cryptography (user,
+    2026-10-19). A region belongs to the host user its pool serves; that uid
+    and root get handles, nobody else.
+  * **What still trusts the host user:** every process of that uid is one
+    trust domain. One that keeps a udmabuf past its lease's release can still
+    write the region after the guest has reused it, because a dma-buf cannot
+    be revoked. Revocation is cooperative (the lease); only a process's death
+    is enforced by the kernel.
+  * **Built (§108.18).** The broker daemon (`wc-arena-host sessiond
+    --broker`) runs as its own system account with its guest-RAM component.
+    The ICD and the proxy get regions only by `find gpu.<k>`. The run lists
+    and lease files that named the whole backend are gone. A NixOS VM test
+    proves the rules with a nested QEMU guest: a client user cannot open
+    `/dev/udmabuf`, the memfd or `/proc/<qemu>`, and another user's `find`
+    is refused.
+* **A forged or stale stamp points the host at the wrong pages.** The nonce
+  is 128 random bits per region and comes from the keeper (a guest process
+  can only stamp its own memory, which is its own business). The peer
+  refuses a region whose unit appears twice (`DUPLICATE`). It checks every
+  stamp again through its own mapping before answering, and it never
+  translates a guest-physical address, so R21's silent wrong offset cannot
+  occur. The table lives in the pool's bootstrap device, which only the
+  pool's owner maps (one mapping per device), so another guest process
+  cannot rewrite an entry.
+* **The guest starves itself.** The keeper refuses any region that would
+  leave Windows less than `max(1 GiB, 15% of RAM)` available, and a pool's
+  budget caps what it may add. Large pages are never paged, so what is lent
+  is unavailable to Windows until it is given back. The pool gives back
+  idle regions after 30 s (5 min inside the low-water margin) and everything
+  on an orderly exit.
+* **Windows users against each other.** Sections are **unnamed**. The
+  keeper gives each to the asking process by `DuplicateHandle`, after reading
+  the process's user SID at connect. A pool is (SID, name), so user B can
+  neither open, adopt nor free user A's regions. A provider of B that maps
+  the bootstrap after A's provider died marks A's table entries foreign:
+  the host lets go and they are cleared, but nothing is freed, and A's next
+  run frees them. Tested on the test VM with a second user (§108.10).
+  * The first build had named `Global\` sections with an SDDL admitting
+    every interactive user. That was a cross-user hole, found in review and
+    fixed.
+  * The keeper's pipe admits every authenticated user; that grants nothing
+    by itself.
+  * The user's account needs **no** `SeLockMemoryPrivilege`: only the SYSTEM
+    keeper creates large-page sections. The keeper becomes a module of the
+    one privileged Windows service (§111, R44).
+
 
 ### R44 — One privileged broker per machine: users by uid or SID, handles moved, keys held
 

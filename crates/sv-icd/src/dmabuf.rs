@@ -15,8 +15,10 @@
 //! - an exportable allocation is `svAllocShared`, an import `svImportShared`,
 //!   and the "dma-buf" is a sealed memfd token carrying the section's name
 //!   (`sv_drm::token`);
-//! - a `SYNC_FD` export waits for the semaphore's work and returns -1 (already
-//!   signalled), an import drops the wait it would add;
+//! - a `SYNC_FD` export returns -1 (already signalled) at once and numbers the
+//!   work for the GPU side's fence record, which the token's sync page names
+//!   to whoever reads the buffer next (§104.11, [`Fences`]); an import drops
+//!   the wait it would add;
 //! - `FOREIGN`/`EXTERNAL` queue families become `IGNORED` before the GPU side
 //!   sees them.
 
@@ -127,31 +129,156 @@ pub fn device_type_override() -> Option<i32> {
 }
 
 /// What a shared allocation's token says (`sv_drm::token::Token`, kept here in
-/// a form that also builds for Windows).
+/// a form that also builds for Windows). `record` is the fence record of the
+/// GPU session that made it (§104.11), empty for a version-1 token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedToken {
     pub size: u64,
     pub nonce: [u8; 16],
     pub name: String,
+    pub record: String,
 }
 
-/// A new token fd for `t`; the caller owns it.
+/// The token file behind a shared `VkDeviceMemory` (§104.11).
+///
+/// One per allocation, made once: every `vkGetMemoryFdKHR` hands out a `dup`
+/// of it, as a kernel dma-buf export hands out another fd for the same
+/// buffer, so the sync page every holder maps is the same page.
+pub enum TokenFile {
+    /// Made by this process: its sync page is writable here. An import of a
+    /// token this process made (KWin renders into an EGLImage of its own GBM
+    /// buffer) shares the creator's handle.
+    #[cfg(target_os = "linux")]
+    Own(std::sync::Arc<sv_drm::token::Created>),
+    /// Made by another process: the imported fd, kept (the specification
+    /// gives it to the implementation), and its sync page, read-only.
+    #[cfg(target_os = "linux")]
+    Foreign { fd: std::os::fd::OwnedFd, page: Option<sv_drm::token::SyncPage> },
+    /// No token file (not Linux).
+    None,
+}
+
+impl TokenFile {
+    /// Say that GPU work `seq` wrote the allocation, if this process can.
+    pub fn mark(&self, seq: u64) {
+        #[cfg(target_os = "linux")]
+        if let TokenFile::Own(c) = self {
+            c.mark(seq);
+        }
+        let _ = seq;
+    }
+
+    /// The work a user of a foreign allocation must wait for: the number its
+    /// creator last stored. 0 for our own, or a version-1 token.
+    pub fn foreign_seq(&self) -> u64 {
+        match self {
+            #[cfg(target_os = "linux")]
+            TokenFile::Foreign { page: Some(p), .. } => p.load(),
+            _ => 0,
+        }
+    }
+
+    pub fn is_own(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let TokenFile::Own(_) = self {
+            return true;
+        }
+        false
+    }
+
+    /// A new fd for `vkGetMemoryFdKHR`; the caller owns it.
+    pub fn export(&self) -> Option<i32> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::IntoRawFd;
+            let r = match self {
+                TokenFile::Own(c) => c.dup(),
+                TokenFile::Foreign { fd, .. } => fd.try_clone(),
+                TokenFile::None => return None,
+            };
+            return match r {
+                Ok(fd) => Some(fd.into_raw_fd()),
+                Err(e) => {
+                    eprintln!("sv-icd: vkGetMemoryFdKHR: dup: {e}");
+                    None
+                }
+            };
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+}
+
+/// A shared `VkDeviceMemory` (§104): what its token says, and its file.
+pub struct SharedMem {
+    pub token: SharedToken,
+    pub file: TokenFile,
+}
+
+/// The tokens this process made, by section name, so that an import of one
+/// of them writes the creator's sync page (see [`TokenFile::Own`]). Weak: a
+/// token goes with the last memory that holds it.
 #[cfg(target_os = "linux")]
-pub fn token_fd(t: &SharedToken) -> Option<i32> {
-    use std::os::fd::IntoRawFd;
-    let tok = sv_drm::token::Token { size: t.size, nonce: t.nonce, name: t.name.clone() };
+static OWN_TOKENS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Weak<sv_drm::token::Created>>>> =
+    std::sync::Mutex::new(None);
+
+/// The token file for a new exportable allocation.
+#[cfg(target_os = "linux")]
+pub fn make_token(t: &SharedToken) -> TokenFile {
+    let tok = sv_drm::token::Token { size: t.size, nonce: t.nonce, name: t.name.clone(), record: t.record.clone() };
     match sv_drm::token::create(&tok) {
-        Ok(fd) => Some(fd.into_raw_fd()),
+        Ok(c) => {
+            let c = std::sync::Arc::new(c);
+            let mut g = OWN_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+            let m = g.get_or_insert_with(Default::default);
+            m.retain(|_, w| w.strong_count() > 0);
+            m.insert(t.name.clone(), std::sync::Arc::downgrade(&c));
+            TokenFile::Own(c)
+        }
         Err(e) => {
-            eprintln!("sv-icd: vkGetMemoryFdKHR: {e}");
-            None
+            eprintln!("sv-icd: the token for {}: {e}", t.name);
+            TokenFile::None
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn token_fd(_t: &SharedToken) -> Option<i32> {
-    None
+pub fn make_token(_t: &SharedToken) -> TokenFile {
+    TokenFile::None
+}
+
+/// Take an imported fd (the specification gives it to the implementation on
+/// success; on failure the caller still owns it, so it is only borrowed until
+/// [`adopt`] is called).
+#[cfg(target_os = "linux")]
+pub fn adopt(fd: i32, t: &SharedToken) -> TokenFile {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the application handed this descriptor over with a successful
+    // import; nothing else closes it.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let mine = OWN_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&t.name))
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(c) = mine {
+        return TokenFile::Own(c);
+    }
+    let page = match sv_drm::token::SyncPage::open(std::os::fd::AsFd::as_fd(&owned)) {
+        Ok(p) => p,
+        Err(e) => {
+            sv_icd_entry::report_always(&format_args!("an imported dma-buf's sync page: {e}"));
+            None
+        }
+    };
+    TokenFile::Foreign { fd: owned, page }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn adopt(fd: i32, _t: &SharedToken) -> TokenFile {
+    close_fd(fd);
+    TokenFile::None
 }
 
 /// The token behind `fd`, which stays open.
@@ -163,7 +290,7 @@ pub fn read_token(fd: i32) -> Option<SharedToken> {
     // SAFETY: the application's descriptor, borrowed for the call only.
     let b = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
     match sv_drm::token::read(b) {
-        Ok(t) => Some(SharedToken { size: t.size, nonce: t.nonce, name: t.name }),
+        Ok(t) => Some(SharedToken { size: t.size, nonce: t.nonce, name: t.name, record: t.record }),
         Err(e) => {
             sv_icd_entry::report_always(&format_args!("an imported dma-buf fd is not ours: {e}"));
             None
@@ -208,6 +335,98 @@ pub struct Semaphore {
     pub signal_queue: Option<u64>,
     /// A sync fd was imported into it: the next wait on it is dropped.
     pub presignalled: bool,
+}
+
+/// The implicit-sync bookkeeping of §104.11, app side.
+///
+/// Zink's implicit-sync export after a flush is, per exported image,
+/// `vkGetSemaphoreFdKHR(SYNC_FD)` immediately followed by `vkGetMemoryFdKHR`
+/// of the image's memory and `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` on that fd
+/// (`zink_screen_import_dmabuf_semaphore`). The export numbers the work
+/// ([`Fences::begin_mark`]); the memory fd that follows says which allocation
+/// it wrote, and the mark goes to the GPU side then. Before a batch first uses
+/// an imported image, Zink asks for the memory fd *without* an export in front
+/// (`zink_screen_export_dmabuf_semaphore`, for `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`):
+/// that is the moment to note what the next submit must wait for.
+#[derive(Debug, Default)]
+pub struct Fences {
+    /// The session's fence record: `None` not asked yet, `Some(None)` the GPU
+    /// side has none (the export then waits, as before §104.11).
+    pub record: Option<Option<String>>,
+    /// The last number given out.
+    pub seq: u64,
+    /// Exports whose memory fd has not come yet, one per thread: Zink asks
+    /// for the sync fd and the memory fd one after the other on one thread,
+    /// so two contexts flushing on two threads do not swap their numbers.
+    pub pending: Vec<(std::thread::ThreadId, Mark)>,
+    /// Exports another thread's submit sent before their memory fd came:
+    /// the mark is out, but the sync page still wants the number.
+    pub sent: Vec<(std::thread::ThreadId, Mark)>,
+    /// What the next submit waits for: `(memory, record, seq)`.
+    pub waits: Vec<(u64, String, u64)>,
+}
+
+/// One numbered export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    pub queue: u64,
+    pub semaphore: u64,
+    pub seq: u64,
+}
+
+impl Fences {
+    /// Number the export of `semaphore`, last signalled on `queue`, on this
+    /// thread. Returns this thread's export still pending before it (to be
+    /// sent with no memory).
+    pub fn begin_mark(&mut self, queue: u64, semaphore: u64) -> (Mark, Option<Mark>) {
+        self.seq += 1;
+        let m = Mark { queue, semaphore, seq: self.seq };
+        let me = std::thread::current().id();
+        let before = self.pending.iter().position(|(t, _)| *t == me).map(|i| self.pending.swap_remove(i).1);
+        self.sent.retain(|(t, _)| *t != me);
+        self.pending.push((me, m));
+        (m, before)
+    }
+
+    /// This thread's last export, if its memory fd has not come yet, and
+    /// whether its mark was already sent (by a flush on another thread).
+    pub fn take_pending(&mut self) -> Option<(Mark, bool)> {
+        let me = std::thread::current().id();
+        if let Some(i) = self.pending.iter().position(|(t, _)| *t == me) {
+            return Some((self.pending.swap_remove(i).1, false));
+        }
+        let i = self.sent.iter().position(|(t, _)| *t == me)?;
+        Some((self.sent.swap_remove(i).1, true))
+    }
+
+    /// Every pending export, in number order, for a flush on this thread.
+    /// Another thread's stays known as sent, for its memory fd to come.
+    pub fn take_all_pending(&mut self) -> Vec<Mark> {
+        let me = std::thread::current().id();
+        self.sent.retain(|(t, _)| *t != me);
+        let mut out = Vec::new();
+        for (t, m) in std::mem::take(&mut self.pending) {
+            if t != me {
+                self.sent.retain(|(u, _)| *u != t);
+                self.sent.push((t, m));
+            }
+            out.push(m);
+        }
+        out.sort_by_key(|m| m.seq);
+        out
+    }
+
+    /// A wait for the next submit, once per memory: the larger number wins.
+    pub fn add_wait(&mut self, memory: u64, record: &str, seq: u64) {
+        if let Some(w) = self.waits.iter_mut().find(|w| w.0 == memory) {
+            if seq > w.2 {
+                w.1 = record.to_string();
+                w.2 = seq;
+            }
+            return;
+        }
+        self.waits.push((memory, record.to_string(), seq));
+    }
 }
 
 fn is_special_family(f: u32) -> bool {
@@ -644,6 +863,57 @@ mod tests {
         assert_eq!(si.wait_semaphore_count, 2);
         let p::PNextLink::VkTimelineSemaphoreSubmitInfo(t) = &si.p_next[0] else { unreachable!() };
         assert_eq!(t.p_wait_semaphore_values, vec![100, 300]);
+    }
+
+    /// Zink's order: export, then the memory fd, on one thread. A second
+    /// export on the same thread before the fd sends the first without a
+    /// memory; another thread's flush sends this thread's mark but leaves its
+    /// number for the memory fd that follows.
+    #[test]
+    fn an_export_is_paired_with_the_next_memory_fd_of_its_thread() {
+        let mut f = Fences::default();
+        let (a, before) = f.begin_mark(1, 10);
+        assert_eq!((a.seq, before), (1, None));
+        assert_eq!(f.take_pending(), Some((a, false)));
+        assert_eq!(f.take_pending(), None);
+
+        let (b, _) = f.begin_mark(1, 11);
+        let (c, before) = f.begin_mark(1, 12);
+        assert_eq!(before, Some(b));
+        assert_eq!(c.seq, 3);
+
+        // Another thread exports, then this thread flushes (a submit): both
+        // marks go out; the other thread's memory fd still gets its number,
+        // already sent.
+        let f = std::sync::Mutex::new(f);
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Mark>();
+        std::thread::scope(|s| {
+            let f = &f;
+            s.spawn(move || {
+                let (d, _) = f.lock().unwrap().begin_mark(2, 20);
+                done_tx.send(d).unwrap();
+                go_rx.recv().unwrap();
+                assert_eq!(f.lock().unwrap().take_pending(), Some((d, true)));
+            });
+            let d = done_rx.recv().unwrap();
+            let out = f.lock().unwrap().take_all_pending();
+            assert_eq!(out.iter().map(|m| m.seq).collect::<Vec<_>>(), [3, d.seq]);
+            assert_eq!(f.lock().unwrap().take_pending(), None, "this thread's own flushed mark is not reused");
+            go_tx.send(()).unwrap();
+        });
+        let f = f.into_inner().unwrap();
+        assert!(f.pending.is_empty() && f.sent.is_empty());
+    }
+
+    #[test]
+    fn a_wait_is_kept_once_per_memory_with_the_larger_number() {
+        let mut f = Fences::default();
+        f.add_wait(7, "a", 3);
+        f.add_wait(7, "b", 2);
+        f.add_wait(8, "", 0);
+        f.add_wait(7, "c", 5);
+        assert_eq!(f.waits, vec![(7, "c".to_string(), 5), (8, String::new(), 0)]);
     }
 
     #[test]

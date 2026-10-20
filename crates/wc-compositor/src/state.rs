@@ -139,7 +139,7 @@ use smithay::{
 };
 
 use crate::platform::{
-    CursorSpec, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
+    CursorSpec, DirectFrame, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
 };
 use crate::surface::{
     bars, decorator, fold_caption, view_of, Agreed, Bars, Decorator, PixelError, PixelFormat,
@@ -304,6 +304,69 @@ struct Viewed {
     view: View,
 }
 
+/// What a window's composite depends on besides the pixels: the canvas, and
+/// each drawn surface in drawing order with its place and its staging
+/// shadow's size and format. See `Window::composed`.
+#[derive(Clone, Debug, PartialEq)]
+struct TreeShape {
+    canvas: (i32, i32, i32, i32),
+    format: PixelFormat,
+    surfaces: Vec<Placed>,
+}
+
+/// §104's follow-up: the buffer a window is drawn from directly, and the
+/// surface it is attached to. The surface's staging shadow does not follow the
+/// buffers drawn this way; `State::leave_direct` brings it back.
+struct DirectShown {
+    surface: WlSurface,
+    buffer: wl_buffer::WlBuffer,
+}
+
+/// §104's follow-up: what the direct present keeps across windows.
+#[derive(Default)]
+struct DirectPresent {
+    /// `WC_DIRECT_PRESENT=off`: every window is drawn from its shadow, as
+    /// before. The switch to reach for if a driver draws a DIB section over
+    /// a client's section wrongly, and the control leg of a measurement.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    off: bool,
+    /// The platform's description of each buffer drawn directly so far, with
+    /// its section opened once (`wc_handle::Handle::open_section_object`).
+    /// Dropped with the buffer (`BufferHandler::buffer_destroyed`).
+    frames: HashMap<wl_buffer::WlBuffer, DirectFrame>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    next_key: u64,
+    /// The last `ToUi::Direct` serial sent.
+    serial: u64,
+    /// Buffers no window draws from any more, each with the serial whose
+    /// `FromUi::DirectShown` lets it go back to its client.
+    held: Vec<(u64, wl_buffer::WlBuffer)>,
+    /// Surfaces whose current buffer is one opaque black pixel (KWin's main
+    /// surface). Over those, a translucent buffer composites to its own
+    /// colour, which is what drawing it directly shows.
+    opaque_black: std::collections::HashSet<WlSurface>,
+}
+
+/// What `State::tree_now` finds: every surface of the tree with where it sits,
+/// the declared window geometry, the surfaces that are drawn (bottom to top),
+/// and their shape.
+struct TreeNow {
+    placed: Vec<(WlSurface, (i32, i32))>,
+    geometry: Option<Rectangle<i32, Logical>>,
+    drawn: Vec<(WlSurface, (i32, i32))>,
+    shape: TreeShape,
+}
+
+/// One drawn surface of a [`TreeShape`]: where it sits, and its staging
+/// shadow's size and format.
+#[derive(Clone, Debug, PartialEq)]
+struct Placed {
+    surface: WlSurface,
+    at: (i32, i32),
+    size: (i32, i32),
+    format: PixelFormat,
+}
+
 /// §102. The globals `--nested-compositor-globals` adds. Held so they live as
 /// long as the compositor; nothing reads them, because smithay's dispatch is
 /// on the types.
@@ -337,6 +400,9 @@ struct Window {
     /// rather than looked up per use, because a window outlives the moments at
     /// which its surface is convenient to ask.
     client: u32,
+    /// §107, §92.12: which session (so which installation) the client is
+    /// of. The taskbar identity is the installation's.
+    session: u8,
     /// Callbacks the client is waiting on before it draws its next frame.
     ///
     /// Held rather than answered immediately. Answering at once is legal and is
@@ -346,6 +412,29 @@ struct Window {
     /// and a machine that sounds broken.
     frame_callbacks: Vec<WlCallback>,
     presented: u64,
+    /// The shape of the tree the window's shadow was last composited from
+    /// (`State::compose_tree`), or `None` when the shadow is not known to be
+    /// a composite of the current staging pixels and must be redrawn whole.
+    ///
+    /// ADDED FOR §104's follow-up. While the tree keeps this shape — the same
+    /// surfaces at the same places with buffers of the same size and format,
+    /// the same canvas — a commit's damage is all that changed, and only it is
+    /// recomposed.
+    composed: Option<TreeShape>,
+    /// §104's follow-up: the client buffer this window is drawn from instead
+    /// of its shadow, if it is (`State::direct_frame`).
+    direct: Option<DirectShown>,
+    /// The platform could not draw this window from a client buffer; it is
+    /// not asked again.
+    direct_refused: bool,
+    /// Which path the log last said this window takes: `Some(true)` drawn
+    /// directly, `Some(false)` from its shadow, `None` not said yet. One line
+    /// per change (`State::note_path`).
+    path_said: Option<bool>,
+    /// Whether the caption was folded into the client area at map
+    /// (`report_decorator`), which the direct present refuses: the caption's
+    /// colour and corner are read from the shadow.
+    folds_caption: bool,
     /// The client has set an icon of its own through `xdg-toplevel-icon-v1`.
     ///
     /// Once it has, a publish on `wc_icon_manager_v1` for the same app id must
@@ -550,6 +639,14 @@ pub struct State {
     /// Tried in order until one recognises the buffer. One entry today; see
     /// `surface.rs` for why it is a list.
     sources: Vec<Box<dyn PixelSource>>,
+    /// §104's follow-up: windows drawn straight from a client's section.
+    direct: DirectPresent,
+    /// §104.11 with §104.12: commits whose fence wait gave up, per client
+    /// (`gpu_fence::Unfinished`); such a commit is never drawn directly.
+    pub(crate) fence_unfinished: crate::gpu_fence::Unfinished<ClientId>,
+    /// The damage of a surface's commit that went on unfinished, read again
+    /// at its next commit (`present`).
+    fence_stale: HashMap<WlSurface, Vec<Rect>>,
     /// ADDED FOR STAGE 9: one shadow per **surface**, not per window.
     ///
     /// A commit copies the client's buffer in here; `compose_tree` copies these
@@ -943,6 +1040,8 @@ impl State {
                 1,
                 (),
             );
+        // §104.11: wc-proxy holds a dma-buf commit here until its GPU frame is done.
+        crate::gpu_fence::register(dh);
         let mut toplevel_icon =
             smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<State>(dh);
         // The sizes Windows will ask for, told to the client at bind time:
@@ -1008,6 +1107,9 @@ impl State {
             }
         });
 
+        if std::env::var("WC_DIRECT_PRESENT").is_ok_and(|v| v == "off") {
+            println!("wc-compositor: WC_DIRECT_PRESENT=off: every window is drawn from its shadow");
+        }
         State {
             compositor: CompositorState::new::<State>(dh),
             shm: ShmState::new::<State>(dh, Vec::new()),
@@ -1050,6 +1152,12 @@ impl State {
             // §102: a single-pixel buffer is "read" like any other, and only
             // exists when the nested-compositor globals do.
             sources: vec![Box::new(ShmSource), Box::new(SinglePixelSource)],
+            fence_unfinished: Default::default(),
+            fence_stale: HashMap::new(),
+            direct: DirectPresent {
+                off: std::env::var("WC_DIRECT_PRESENT").is_ok_and(|v| v == "off"),
+                ..DirectPresent::default()
+            },
             staging: HashMap::new(),
             viewed: HashMap::new(),
             windows: HashMap::new(),
@@ -1330,6 +1438,7 @@ impl State {
             }
             match event {
                 FromUi::Stopped => self.stopped = true,
+                FromUi::DirectShown { id, serial, ok } => self.direct_shown(id, serial, ok),
                 FromUi::Resized { id, width, height } => self.on_resized(id, width, height),
                 FromUi::CloseRequested { id } => {
                     if let Some(w) = self.by_id(id) {
@@ -2911,6 +3020,9 @@ impl State {
         }
         let root = root_of(surface);
         if !self.windows.get(&root).is_some_and(|w| w.mapped) {
+            if let Some(w) = self.windows.get_mut(&root) {
+                w.composed = None;
+            }
             return;
         }
         let (_, w, h) = self.compose_tree(&root, surface, &[]);
@@ -2961,6 +3073,46 @@ impl State {
         let root = root_of(surface);
         let is_root_of_a_window = self.windows.contains_key(&root);
 
+        // §104's follow-up: a window whose picture is exactly this buffer —
+        // the topmost surface, covering the window corner to corner, opaque
+        // or over opaque black — is drawn from the buffer itself, which is
+        // not read here at all (`State::direct_frame`). Any other commit
+        // brings the window back to its shadow first.
+        // §104.11: a commit whose fence wait gave up may carry a frame the GPU
+        // is still writing; it is read into the shadow now, as before, and
+        // never handed to GDI to read whenever `WM_PAINT` comes.
+        let unfinished = surface
+            .client()
+            .is_some_and(|c| self.fence_unfinished.take_open(&c.id()));
+        // And what it damaged was read before the GPU wrote it, so the
+        // surface's next commit reads it again: that buffer is complete there
+        // (the client repaints what a buffer owes), and its own damage would
+        // leave the rest of the late frame's change stale on screen.
+        let mut damage = damage;
+        if let Some(stale) = self.fence_stale.remove(surface) {
+            damage.extend(stale);
+        }
+        if unfinished {
+            self.fence_stale.insert(surface.clone(), damage.clone());
+        }
+        let decided = if unfinished {
+            Err(Some("its GPU frame was not done when it was committed".to_string()))
+        } else {
+            self.direct_frame(surface, &root, buffer)
+        };
+        match decided {
+            Ok(frame) => {
+                self.present_direct(surface, &root, buffer, frame, &damage);
+                return;
+            }
+            Err(why) => {
+                if let Some(why) = &why {
+                    self.note_path(&root, false, why);
+                }
+                self.leave_direct(&root, why.as_deref().unwrap_or("its tree changed"));
+            }
+        }
+
         let read_started = Instant::now();
         // §102: the viewport and buffer scale this commit applied, or `None`
         // when the nested-compositor globals are off and no viewport can exist.
@@ -2969,11 +3121,17 @@ impl State {
         let viewed = &mut self.viewed;
         let mut result: Option<(Vec<Rect>, i32, i32)> = None;
         let mut served_by = "";
+        // §104's follow-up: whether the buffer is one opaque black pixel.
+        let mut black = false;
         // Ask each source in turn. Today there is one; the loop is what lets a
         // buffer that lives in an arena rather than a `wl_shm` pool arrive
         // without this function changing (docs/goal-firefox.md).
         for source in &self.sources {
             let read = source.with_pixels(buffer, &mut |bytes, spec| {
+                black = spec.width == 1
+                    && spec.height == 1
+                    && !spec.format.has_alpha()
+                    && bytes.get(..3) == Some(&[0, 0, 0][..]);
                 let Some((src, dst, scale)) = viewport else {
                     result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
                     return;
@@ -3030,6 +3188,11 @@ impl State {
         // are already in the shadow. Releasing only on success would deadlock
         // any client whose buffer we failed to read.
         buffer.release();
+        if black {
+            self.direct.opaque_black.insert(surface.clone());
+        } else {
+            self.direct.opaque_black.remove(surface);
+        }
 
         let Some((written, _, _)) = result else {
             eprintln!("wc-compositor: no pixel source could read the committed buffer");
@@ -3070,6 +3233,10 @@ impl State {
             && !self.windows[&root].mapped
             && declared_geometry(&root).is_none()
         {
+            // Its pixels are in staging and not in the window's shadow.
+            if let Some(w) = self.windows.get_mut(&root) {
+                w.composed = None;
+            }
             return;
         }
 
@@ -3112,6 +3279,7 @@ impl State {
         window.mapped = true;
         let (title, app_id) = (window.title.clone(), window.app_id.clone());
         let client = window.client;
+        let session = window.session;
         // ADDED FOR STAGE 32. A popup has no taskbar button — it is
         // `WS_EX_TOOLWINDOW` with an owner — so there is nothing for an
         // identity to group, and stamping one on a menu would be a claim about
@@ -3218,6 +3386,9 @@ impl State {
                  (mapped: {sections} section, {files} shared-file, {slices} arena-slice)"
             );
             let fold_caption = self.report_decorator(&root, id, &app_id);
+            if let Some(w) = self.windows.get_mut(&root) {
+                w.folds_caption = fold_caption;
+            }
             // ADDED FOR STAGE 9. `wl_surface.enter` is how a client learns
             // which output it is on, and therefore what scale to draw at and
             // what refresh rate to expect. It is sent at map because before a
@@ -3245,7 +3416,7 @@ impl State {
                 self.ui.send(ToUi::AppId {
                     id,
                     app_id: app_id.clone(),
-                    aumid: crate::taskbar::identity(&app_id, client),
+                    aumid: crate::taskbar::identity_in(&app_id, client, session),
                 });
             }
             // §91.6: a client that chose nothing is shown at its default.
@@ -3652,35 +3823,12 @@ impl State {
         folded
     }
 
-    /// Draw every surface of `root`'s tree into `root`'s window shadow, and say
-    /// what that changed and how big the result is.
-    ///
-    /// ADDED FOR STAGE 9. This is the whole scene graph, and it is deliberately
-    /// the smallest one that is *correct* rather than the fastest one:
-    ///
-    /// * The canvas is the **window geometry rectangle**
-    ///   (`xdg_surface.set_window_geometry`), not the root buffer. A GTK client
-    ///   commits a buffer that is larger than its window on every side — 26 px
-    ///   of invisible resize margin and drop shadow — and says so with a
-    ///   geometry rectangle. Drawing the buffer instead of the rectangle offsets
-    ///   the window, shows the client's own title bar under the system one and
-    ///   clips the opposite edges away. Stage 8 measured that with
-    ///   `weston-terminal`; Firefox has it for the same reason, since it is
-    ///   GTK's code in both.
-    /// * Surfaces are drawn parent first, in the order the protocol stacks
-    ///   them, which is what `with_surface_tree_upward` promises.
-    /// * The whole tree is redrawn on every commit. One `memcpy` per surface
-    ///   per frame, on the machine with spare CPU; the alternative is tracking
-    ///   which regions of the canvas each surface owns, which is a renderer.
-    ///   The **damage** reported is still only what the committing surface
-    ///   changed, so the Win32 side does not repaint the world.
-    fn compose_tree(
-        &mut self,
-        root: &WlSurface,
-        committed: &WlSurface,
-        committed_damage: &[Rect],
-    ) -> (Vec<Rect>, i32, i32) {
-
+    /// The tree `compose_tree` would composite for `root` right now: where
+    /// each surface sits, the declared geometry, the surfaces drawn, and the
+    /// shape all that makes. ADDED FOR §104's follow-up, as its own function
+    /// because the direct present must ask it too: a subsurface moved by a
+    /// commit that attached nothing changes the picture as surely as a buffer.
+    fn tree_now(&self, root: &WlSurface) -> TreeNow {
         // Where each surface of the tree sits, relative to the root surface's
         // own origin. Collected first because composing needs `&mut` on the
         // window's shadow while `staging` is read, and because the traversal
@@ -3757,6 +3905,91 @@ impl State {
             .map(|s| s.format())
             .unwrap_or(PixelFormat::Xrgb8888);
 
+        // The surfaces that are drawn, bottom to top. The same rule as the
+        // bounds above and as the hit test: a subsurface of an unmapped
+        // surface is not mapped, so it is not drawn either. In practice such a
+        // surface usually has no staging entry of its own and this changes
+        // nothing — but "usually" is not a reason for the paint path to use a
+        // different predicate from the two that decide where the window is and
+        // what is under the pointer.
+        let drawn: Vec<(WlSurface, (i32, i32))> = placed
+            .iter()
+            .filter(|(surface, _)| self.ancestors_mapped(surface, root))
+            .map(|(surface, at)| (surface.clone(), *at))
+            .collect();
+        let shape = TreeShape {
+            canvas: (gx, gy, gw, gh),
+            format,
+            surfaces: drawn
+                .iter()
+                .filter_map(|(surface, at)| {
+                    let s = self.staging.get(surface)?;
+                    Some(Placed {
+                        surface: surface.clone(),
+                        at: *at,
+                        size: (s.width(), s.height()),
+                        format: s.format(),
+                    })
+                })
+                .collect(),
+        };
+        TreeNow { placed, geometry, drawn, shape }
+    }
+
+    /// Draw every surface of `root`'s tree into `root`'s window shadow, and say
+    /// what that changed and how big the result is.
+    ///
+    /// ADDED FOR STAGE 9. This is the whole scene graph, and it is deliberately
+    /// the smallest one that is *correct* rather than the fastest one:
+    ///
+    /// * The canvas is the **window geometry rectangle**
+    ///   (`xdg_surface.set_window_geometry`), not the root buffer. A GTK client
+    ///   commits a buffer that is larger than its window on every side — 26 px
+    ///   of invisible resize margin and drop shadow — and says so with a
+    ///   geometry rectangle. Drawing the buffer instead of the rectangle offsets
+    ///   the window, shows the client's own title bar under the system one and
+    ///   clips the opposite edges away. Stage 8 measured that with
+    ///   `weston-terminal`; Firefox has it for the same reason, since it is
+    ///   GTK's code in both.
+    /// * Surfaces are drawn parent first, in the order the protocol stacks
+    ///   them, which is what `with_surface_tree_upward` promises.
+    /// * The whole tree is redrawn on every commit. One `memcpy` per surface
+    ///   per frame, on the machine with spare CPU; the alternative is tracking
+    ///   which regions of the canvas each surface owns, which is a renderer.
+    ///   The **damage** reported is still only what the committing surface
+    ///   changed, so the Win32 side does not repaint the world.
+    ///
+    ///   §104's follow-up: no longer while the tree keeps its shape
+    ///   (`Window::composed`). Then only the committing surface's damage is
+    ///   recomposed, every surface drawn into just those rectangles, which is
+    ///   the same picture for a fraction of the work; a tree that changed shape
+    ///   is still redrawn whole.
+    fn compose_tree(
+        &mut self,
+        root: &WlSurface,
+        committed: &WlSurface,
+        committed_damage: &[Rect],
+    ) -> (Vec<Rect>, i32, i32) {
+        // §104's follow-up: a window drawn from a client buffer is drawn from
+        // its shadow again before the shadow is touched. A no-op on the paths
+        // that already did it (`present`), and from `leave_direct` itself.
+        self.leave_direct(root, "its tree changed");
+        let TreeNow { placed, geometry, drawn, shape } = self.tree_now(root);
+        let (gx, gy, gw, gh) = shape.canvas;
+        let format = shape.format;
+        // The committing surface's damage, in window coordinates.
+        let (cx, cy) = placed
+            .iter()
+            .find(|(s, _)| s == committed)
+            .map(|(_, l)| *l)
+            .unwrap_or((0, 0));
+        let damage: Vec<Rect> = committed_damage
+            .iter()
+            .filter_map(|r| {
+                Rect::new(r.x + cx - gx, r.y + cy - gy, r.w, r.h).clip(gw, gh)
+            })
+            .collect();
+
         let window = self.windows.get_mut(root).expect("caller checked");
         // The one place this number is decided, for the pixels *and* for the
         // pointer. See `Window::content_offset`.
@@ -3803,60 +4036,365 @@ impl State {
                 dy: gy - was.1,
             });
         }
+        // §104's follow-up: **only the damage is recomposed while the tree
+        // keeps its shape.** Until then every commit recomposed the whole
+        // window — a nested KWin's 1264x713 black root and its 1264x713 layer
+        // over it, per frame, whatever the frame changed — and that, not the
+        // read of the client's buffer (always damage-scoped, `present`), was
+        // the compositor's per-frame cost: 3 % of a core under Wine with a
+        // 64x64 change at 60 fps, 14 % with a translucent layer, whose blend is
+        // per pixel. The window's shadow is a composite of the staging
+        // shadows, which are per surface and hold each surface's current
+        // picture, so pixels outside the committing surface's damage are
+        // already right when nothing else moved. An empty damage list is a
+        // caller that changed something it cannot name (a view, a removed
+        // subsurface, a geometry), and gets everything.
+        let partial = !damage.is_empty() && window.composed.as_ref() == Some(&shape);
+        window.composed = Some(shape);
         let shadow = window.shadow.clone();
         let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
         let reshaped = shadow.reset(gw, gh, format);
         // §95: every surface after the first is drawn *over* what is under it
         // (`Shadow::compose_over`), so what is under it must be this frame's.
-        // The root's copy repaints the whole canvas whenever the canvas lies
-        // inside the root's buffer, which a declared geometry always does; a
-        // tree whose bounds reach past the root (a subsurface overhanging it)
-        // starts from transparent instead of from the last frame's pixels.
-        let root_covers = self.staging.get(root).is_some_and(|s| {
-            gx >= 0 && gy >= 0 && gx + gw <= s.width() && gy + gh <= s.height()
-        });
-        if !root_covers {
-            shadow.clear();
-        }
-        let mut first = true;
-        for (surface, (x, y)) in &placed {
-            // The same rule as the bounds above and as the hit test: a
-            // subsurface of an unmapped surface is not mapped, so it is not
-            // drawn either. In practice such a surface usually has no staging
-            // entry of its own and this changes nothing — but "usually" is not
-            // a reason for the paint path to use a different predicate from
-            // the two that decide where the window is and what is under the
-            // pointer.
-            if !self.ancestors_mapped(surface, root) {
-                continue;
+        // The first surface's copy repaints the canvas wherever it covers it,
+        // which the root does whenever the canvas lies inside the root's
+        // buffer (a declared geometry always does); what it does not cover (a
+        // subsurface overhanging the root) starts from transparent instead of
+        // from the last frame's pixels. `Shadow::compose_stack` is the one place
+        // that rule is applied, for the whole canvas and a damaged part alike.
+        let full = Rect::new(0, 0, gw, gh);
+        let layers: Vec<(Option<&Shadow>, (i32, i32))> = drawn
+            .iter()
+            .map(|(surface, (x, y))| (self.staging.get(surface), (x - gx, y - gy)))
+            .collect();
+        if partial && !reshaped {
+            for r in &damage {
+                shadow.compose_stack(&layers, *r);
             }
-            if let Some(src) = self.staging.get(surface) {
-                if first {
-                    shadow.compose(src, (x - gx, y - gy));
-                } else {
-                    shadow.compose_over(src, (x - gx, y - gy));
-                }
-            }
-            first = false;
+            return (damage, gw, gh);
         }
+        shadow.compose_stack(&layers, full);
         drop(shadow);
 
         if reshaped {
-            return (vec![Rect::new(0, 0, gw, gh)], gw, gh);
+            return (vec![full], gw, gh);
         }
-        // Translate the committing surface's damage into window coordinates.
-        let (cx, cy) = placed
-            .iter()
-            .find(|(s, _)| s == committed)
-            .map(|(_, l)| *l)
-            .unwrap_or((0, 0));
-        let damage: Vec<Rect> = committed_damage
-            .iter()
-            .filter_map(|r| {
-                Rect::new(r.x + cx - gx, r.y + cy - gy, r.w, r.h).clip(gw, gh)
-            })
-            .collect();
         (damage, gw, gh)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §104's follow-up: drawing a window straight from its client's section
+// ---------------------------------------------------------------------------
+
+impl State {
+    /// May this commit be shown by drawing `buffer` itself, with nothing read
+    /// into a shadow? `Err(None)` when the question does not arise (not a
+    /// section, not Windows, a window not composited yet), `Err(Some(why))`
+    /// when it does and the answer is no.
+    ///
+    /// Yes exactly when the window's picture *is* the buffer: a mapped
+    /// toplevel whose caption is not folded; the buffer in a `Section` or
+    /// `SharedFile` pool, `Xrgb8888` or `Argb8888`, rows and offset
+    /// DWORD-aligned; no transform, scale or viewport between buffer and
+    /// surface; the surface the topmost of its tree, at the canvas's corner and
+    /// its size, with the tree otherwise as it was last composited
+    /// (`Window::composed`); and either opaque, or translucent over nothing but
+    /// opaque black pixels — premultiplied over black is the buffer's own
+    /// colour, and GDI draws a window's pixels opaque. That is a nested KWin's
+    /// output: a black single pixel stretched by a viewport, and its primary
+    /// layer over it.
+    fn direct_frame(
+        &mut self,
+        surface: &WlSurface,
+        root: &WlSurface,
+        buffer: &wl_buffer::WlBuffer,
+    ) -> Result<DirectFrame, Option<String>> {
+        #[cfg(not(windows))]
+        {
+            let _ = (surface, root, buffer);
+            Err(None)
+        }
+        #[cfg(windows)]
+        {
+            use smithay::reexports::wayland_server::protocol::wl_shm;
+            if self.direct.off {
+                return Err(None);
+            }
+            let Some(window) = self.windows.get(root) else { return Err(None) };
+            if !window.mapped || self.cursor_surface.as_ref() == Some(surface) {
+                return Err(None);
+            }
+            let Ok(Some((handle, data))) = smithay::wayland::shm::buffer_pool_handle(buffer) else {
+                return Err(None);
+            };
+            if !matches!(
+                handle.descriptor(),
+                wc_handle::Descriptor::Section { .. } | wc_handle::Descriptor::SharedFile { .. }
+            ) {
+                return Err(None);
+            }
+            let Some(shape) = window.composed.as_ref() else { return Err(None) };
+            // From here the buffer is one that could be drawn directly, and
+            // why it is not is worth a line in the log.
+            if window.direct_refused {
+                return Err(Some("the platform could not draw from its client's section".into()));
+            }
+            if window.role.toplevel().is_none() {
+                return Err(Some("a popup is a layered window, drawn from its shadow".into()));
+            }
+            if window.folds_caption {
+                return Err(Some("its caption is folded into the client area".into()));
+            }
+            let format = match data.format {
+                wl_shm::Format::Argb8888 => PixelFormat::Argb8888,
+                wl_shm::Format::Xrgb8888 => PixelFormat::Xrgb8888,
+                other => return Err(Some(format!("wl_shm format {other:?}"))),
+            };
+            let (w, h, stride, offset) = (data.width, data.height, data.stride, data.offset);
+            if w <= 0 || h <= 0 || stride < w.saturating_mul(4) || stride % 4 != 0 || offset < 0 || offset % 4 != 0 {
+                return Err(Some(format!(
+                    "{w}x{h}, stride {stride}, offset {offset}: a DIB needs DWORD-aligned rows and offset"
+                )));
+            }
+            let (scale, transform) = compositor::with_states(surface, |st| {
+                let mut attrs = st.cached_state.get::<SurfaceAttributes>();
+                let a = attrs.current();
+                (a.buffer_scale, a.buffer_transform)
+            });
+            if transform != wl_output::Transform::Normal {
+                return Err(Some(format!("buffer transform {transform:?}")));
+            }
+            let viewed = match self.viewport_of(surface) {
+                Some((src, dst, s)) => view_of((w, h), s, src, dst).is_some(),
+                None => scale != 1,
+            };
+            if viewed || self.viewed.contains_key(surface) {
+                return Err(Some("a viewport or buffer scale stands between buffer and surface".into()));
+            }
+            // The tree as it is now, not as it was composited: a subsurface
+            // can move, appear or go in a commit that attached nothing.
+            if &self.tree_now(root).shape != shape {
+                return Err(Some("its tree changed since it was last composited".into()));
+            }
+            let Some(top) = shape.surfaces.last() else { return Err(None) };
+            if &top.surface != surface {
+                return Err(Some("it is not the topmost surface of its window".into()));
+            }
+            let (gx, gy, gw, gh) = shape.canvas;
+            if top.at != (gx, gy) || top.size != (gw, gh) || (w, h) != (gw, gh) {
+                return Err(Some(format!("its {w}x{h} buffer is not the whole {gw}x{gh} window")));
+            }
+            if top.format != format {
+                return Err(Some(format!("its buffer changed from {:?} to {format:?}", top.format)));
+            }
+            let below = &shape.surfaces[..shape.surfaces.len() - 1];
+            if format.has_alpha() && !below.iter().all(|p| self.direct.opaque_black.contains(&p.surface)) {
+                return Err(Some("it is translucent, over something other than opaque black".into()));
+            }
+            if let Some(frame) = self.direct.frames.get(buffer) {
+                return Ok(frame.clone());
+            }
+            let section = handle
+                .open_section_object()
+                .map_err(|e| Some(format!("its section could not be opened for GDI: {e}")))?;
+            self.direct.next_key += 1;
+            let frame = DirectFrame {
+                key: self.direct.next_key,
+                section: Arc::new(section),
+                offset: offset as u32,
+                width: w,
+                height: h,
+                stride,
+                format,
+            };
+            self.direct.frames.insert(buffer.clone(), frame.clone());
+            self.direct.opaque_black.retain(|s| s.is_alive());
+            Ok(frame)
+        }
+    }
+
+    /// Show the commit of `buffer` on `surface` by drawing `buffer` itself.
+    ///
+    /// The buffer is **not released**: the platform may draw from it at any
+    /// time until it draws from something else — `WM_PAINT` comes when the
+    /// window is uncovered, not when the client commits. The buffer it drew
+    /// from before goes back to its client when the platform has said it is
+    /// done with it (`State::direct_shown`). KWin's swapchain has two or three
+    /// buffers, so holding one is what every compositor that scans out does.
+    fn present_direct(
+        &mut self,
+        surface: &WlSurface,
+        root: &WlSurface,
+        buffer: &wl_buffer::WlBuffer,
+        frame: DirectFrame,
+        damage: &[Rect],
+    ) {
+        let started = Instant::now();
+        let window = self.windows.get_mut(root).expect("direct_frame found the window");
+        let id = window.id;
+        let previous =
+            window.direct.replace(DirectShown { surface: surface.clone(), buffer: buffer.clone() });
+        window.presented += 1;
+        let entering = previous.is_none();
+        // As `present` does; a client may change its hints in any commit.
+        let hints = size_hints_of(root);
+        let hints_changed = hints != window.size_hints;
+        window.size_hints = hints;
+        self.presents += 1;
+        self.direct.serial += 1;
+        let serial = self.direct.serial;
+        if let Some(previous) = previous
+            && &previous.buffer != buffer
+        {
+            self.direct.held.push((serial, previous.buffer));
+        }
+        if hints_changed {
+            self.ui.send(ToUi::SizeHints { id, min: hints.0, max: hints.1 });
+        }
+        // The buffer is the canvas, corner to corner, so its damage is the
+        // window's.
+        let (w, h) = (frame.width, frame.height);
+        let damage: Vec<Rect> = damage.iter().filter_map(|r| r.clip(w, h)).collect();
+        if entering {
+            let detail = format!(
+                "surface {}, {w}x{h} {:?}, stride {}, offset {}",
+                surface.id().protocol_id(),
+                frame.format,
+                frame.stride,
+                frame.offset
+            );
+            self.note_path(root, true, &detail);
+        }
+        if sv_transport::frametrace::enabled() {
+            sv_transport::frametrace::emit_at(
+                sv_transport::frametrace::at_us(started),
+                "wc.present",
+                format_args!(
+                    "surf={} root={} read_us=0 compose_us=0 rects={} {w}x{h} direct=1 us={}",
+                    surface.id().protocol_id(),
+                    root.id().protocol_id(),
+                    damage.len(),
+                    sv_transport::frametrace::us(started.elapsed()),
+                ),
+            );
+        }
+        self.ui.send(ToUi::Direct { id, frame: Some(frame), damage, serial });
+    }
+
+    /// Draw the window from its shadow again, made whole first.
+    ///
+    /// The staging shadow of the surface that was drawn directly stopped
+    /// following its buffers, so it is read once, whole, from the buffer on
+    /// screen — still held, so its client cannot have written it since — and
+    /// the window is composited whole. Only then is the platform told, so it
+    /// never draws a shadow that is not yet the picture. A surface whose
+    /// staging shadow is gone (a subsurface that committed a null buffer) is
+    /// not brought back.
+    fn leave_direct(&mut self, root: &WlSurface, why: &str) {
+        let Some(window) = self.windows.get_mut(root) else { return };
+        let Some(shown) = window.direct.take() else { return };
+        let id = window.id;
+        window.composed = None;
+        if shown.buffer.is_alive()
+            && let Some(staging) = self.staging.get_mut(&shown.surface)
+        {
+            let mut read = false;
+            for source in &self.sources {
+                let r = source.with_pixels(&shown.buffer, &mut |bytes, spec| {
+                    staging.blit(bytes, spec, &[Rect::new(0, 0, spec.width, spec.height)]);
+                });
+                match r {
+                    Ok(()) => {
+                        read = true;
+                        break;
+                    }
+                    Err(PixelError::UnknownSource) => continue,
+                    Err(_) => break,
+                }
+            }
+            if !read {
+                eprintln!(
+                    "wc-compositor: window {id}: the buffer it was drawn from could not be read \
+                     back; its last composite stands until the next frame"
+                );
+            }
+        }
+        let (_, w, h) = self.compose_tree(root, &shown.surface, &[]);
+        self.direct.serial += 1;
+        let serial = self.direct.serial;
+        self.direct.held.push((serial, shown.buffer));
+        let damage = if w > 0 && h > 0 { vec![Rect::new(0, 0, w, h)] } else { Vec::new() };
+        self.ui.send(ToUi::Direct { id, frame: None, damage, serial });
+        self.note_path(root, false, why);
+    }
+
+    /// A window drawn directly is going away (destroyed, or unmapped by a null
+    /// buffer): the platform stops drawing from the buffer, which then goes
+    /// back to its client. Nothing is composited; nothing will be shown.
+    fn drop_direct(&mut self, id: WindowId, shown: Option<DirectShown>) {
+        let Some(shown) = shown else { return };
+        self.direct.serial += 1;
+        let serial = self.direct.serial;
+        self.direct.held.push((serial, shown.buffer));
+        self.ui.send(ToUi::Direct { id, frame: None, damage: Vec::new(), serial });
+    }
+
+    /// `FromUi::DirectShown`: the platform has done what `ToUi::Direct`
+    /// `serial` said, and every message before it (they are answered in
+    /// order), so the buffers they stopped drawing go back to their clients.
+    ///
+    /// `ok` false: no DIB could be made over that buffer's section, and the
+    /// window still shows what it showed before. It goes back to its shadow
+    /// for good, and what the failed message would have released is released
+    /// with the answer to that instead.
+    fn direct_shown(&mut self, id: WindowId, serial: u64, ok: bool) {
+        if !ok {
+            let root = self.windows.iter().find(|(_, w)| w.id == id).map(|(s, _)| s.clone());
+            if let Some(root) = root {
+                if let Some(w) = self.windows.get_mut(&root) {
+                    w.direct_refused = true;
+                }
+                self.leave_direct(&root, "the platform could not draw from its client's section");
+            }
+            let next = self.direct.serial;
+            if next > serial {
+                for (s, _) in &mut self.direct.held {
+                    if *s <= serial {
+                        *s = next;
+                    }
+                }
+                return;
+            }
+        }
+        let (done, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.direct.held).into_iter().partition(|(s, _)| *s <= serial);
+        self.direct.held = kept;
+        for (_, buffer) in done {
+            if buffer.is_alive() {
+                buffer.release();
+            }
+        }
+    }
+
+    /// One line per window whenever the way it is drawn changes, saying which
+    /// and why: the line to look for when a nested KWin costs more than it
+    /// should.
+    fn note_path(&mut self, root: &WlSurface, direct: bool, detail: &str) {
+        let Some(w) = self.windows.get_mut(root) else { return };
+        if w.path_said == Some(direct) {
+            return;
+        }
+        w.path_said = Some(direct);
+        if direct {
+            println!(
+                "wc-compositor: window {} is drawn directly from its client's buffer, which this \
+                 process does not read ({detail})",
+                w.id
+            );
+        } else {
+            println!("wc-compositor: window {} is drawn from its shadow: {detail}", w.id);
+        }
     }
 }
 
@@ -4366,6 +4904,8 @@ impl CompositorHandler for State {
     /// `surface_under` after the surface itself was gone.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.staging.remove(surface);
+        self.fence_stale.remove(surface);
+        self.direct.opaque_black.remove(surface);
         self.viewed.remove(surface);
         let ended: Vec<i32> = self
             .touch_contacts
@@ -4532,6 +5072,9 @@ impl CompositorHandler for State {
                     let id = window.id;
                     println!("wc-compositor: window {id} unmapped (null buffer)");
                     window.mapped = false;
+                    window.composed = None;
+                    let shown = window.direct.take();
+                    self.drop_direct(id, shown);
                     self.ui.send(ToUi::SetWindowState {
                         id,
                         maximized: None,
@@ -4715,7 +5258,11 @@ impl CompositorHandler for State {
 }
 
 impl BufferHandler for State {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+    fn buffer_destroyed(&mut self, buffer: &wl_buffer::WlBuffer) {
+        // §104's follow-up: its section is closed with it. A window still
+        // drawn from it keeps its DIB, which holds the object itself.
+        self.direct.frames.remove(buffer);
+    }
 }
 
 impl ShmHandler for State {
@@ -4826,6 +5373,13 @@ fn metadata(toplevel: &ToplevelSurface) -> (String, String) {
     })
 }
 
+/// §92.12: the session a surface's client belongs to, so the installation
+/// whose taskbar identity its windows carry. 0 for a client that is gone.
+fn surface_session(surface: &WlSurface) -> u8 {
+    use smithay::reexports::wayland_server::Resource as _;
+    surface.client().map_or(0, |c| client_session(&c))
+}
+
 /// Which connection a surface belongs to, counted from 1 in accept order.
 ///
 /// ADDED FOR STAGE 32. [`ClientState::index`] already exists and is already
@@ -4858,15 +5412,19 @@ impl XdgShellHandler for State {
 
         let (title, app_id) = metadata(&surface);
         let client = client_index(surface.wl_surface());
+        let session = surface_session(surface.wl_surface());
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
         let popup_bounds: PopupBounds = Arc::new(Mutex::new(None));
         // §85. A new toplevel ends every popup grab: the grab was a claim on
         // the pointer and keyboard for a menu, and a new window is about to
         // take both. WLCS `grabbed_popup_gets_done_event_when_new_toplevel_created`.
         self.dismiss_grabs_above(0, "a new toplevel was created");
+        // §107.11: a shared compositor says whose window it is, so that
+        // installation's launcher measures its click by its own window.
         println!(
-            "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
-            self.toplevels
+            "wc-compositor: xdg_toplevel created (#{}) -> window {id}{}",
+            self.toplevels,
+            if session == 0 { String::new() } else { format!(" of session {session}") }
         );
 
         self.ui.send(ToUi::Create {
@@ -4880,7 +5438,7 @@ impl XdgShellHandler for State {
             // identity here and their real one at map; a client that set it
             // before the first round trip — `weston-terminal` does — gets the
             // real one immediately.
-            aumid: crate::taskbar::identity(&app_id, client),
+            aumid: crate::taskbar::identity_in(&app_id, client, session),
             shadow: shadow.clone(),
             kind: WindowKind::Toplevel,
             bounds: popup_bounds.clone(),
@@ -4904,8 +5462,14 @@ impl XdgShellHandler for State {
                 title,
                 app_id,
                 client,
+                session,
                 frame_callbacks: Vec::new(),
                 presented: 0,
+                composed: None,
+                direct: None,
+                direct_refused: false,
+                path_said: None,
+                folds_caption: false,
                 icon_from_client: false,
                 shown_size: (0, 0),
                 size_hints: ((0, 0), (0, 0)),
@@ -4940,6 +5504,7 @@ impl XdgShellHandler for State {
         window.app_id = app_id.clone();
         let (id, mapped, own) = (window.id, window.mapped, window.icon_from_client);
         let client = window.client;
+        let session = window.session;
         if mapped {
             self.ui.send(ToUi::AppId {
                 id,
@@ -4949,7 +5514,7 @@ impl XdgShellHandler for State {
                 // for it under the old identity. What that costs is measured in
                 // docs/waycompose-design.md §32.6; the platform is told, and
                 // the platform decides what it can do about it.
-                aumid: crate::taskbar::identity(&app_id, client),
+                aumid: crate::taskbar::identity_in(&app_id, client, session),
             });
             // A new app id is a new answer to "what is this application", so
             // the icon is looked up again — unless the client has said what its
@@ -5191,6 +5756,8 @@ impl XdgShellHandler for State {
                     self.feedback_presented, self.feedback_discarded, self.feedback_superseded
                 );
             }
+            // §104's follow-up: the buffer it was drawn from goes back.
+            self.drop_direct(window.id, window.direct);
             self.ui.send(ToUi::Destroy { id: window.id });
             // §96: if it held the pointer, the platform is told to let go.
             self.update_pointer_hold();
@@ -5281,6 +5848,7 @@ impl XdgShellHandler for State {
         let _ = surface.send_configure();
 
         let client = client_index(surface.wl_surface());
+        let session = surface_session(surface.wl_surface());
         self.windows.insert(
             surface.wl_surface().clone(),
             Window {
@@ -5292,8 +5860,14 @@ impl XdgShellHandler for State {
                 title: String::new(),
                 app_id: String::new(),
                 client,
+                session,
                 frame_callbacks: Vec::new(),
                 presented: 0,
+                composed: None,
+                direct: None,
+                direct_refused: false,
+                path_said: None,
+                folds_caption: false,
                 // A popup has no taskbar button and no caption, so neither of
                 // these can ever be true of one. They are here because `Window`
                 // is one type for both roles, which is stage 9's decision.

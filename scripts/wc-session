@@ -132,15 +132,41 @@ WCBELL="${WC_LAUNCH_WCBELL:-/run/windows-vm/wc-arena/wcbell.sock}"
 # holds both for every session of every installation and serves them here.
 # Without it a session falls back to holding the port itself, said loudly.
 HUBDIR="${WC_LAUNCH_BELL_HUB:-/run/user/$(id -u)/wc-bell}"
+SVHUB="$HUBDIR/sv.sock"
+WLHUB="$HUBDIR/wl.sock"
+# §111.10: THE BROKER. On a host whose session service runs as a system
+# account and starts this session as the Linux user its guest user is mapped
+# to, this user may not open the BAR files or the hub's sockets: the service
+# published the BARs for this user (region ids below) and connects the hub for
+# it. Every path above then becomes a `broker:` spec the binaries understand
+# (wc-proxy, sv-hostd, sv-icd, wc-arena-host broker-read). Without the broker
+# the paths stay as they were.
+BROKERED=""
+if [ -n "${WC_BROKER:-}" ] && [ -n "${WC_LAUNCH_BROKER_ARENA:-}" ]; then
+  [[ "$WC_LAUNCH_BROKER_ARENA" =~ ^[0-9]{1,19}$ ]] || { echo "wc-session: WC_LAUNCH_BROKER_ARENA is not a region id" >&2; exit 1; }
+  BROKERED=1
+  ARENA="broker:$WC_LAUNCH_BROKER_ARENA"
+  GPUREGION=""
+  [[ "${WC_LAUNCH_BROKER_GPU:-}" =~ ^[0-9]{1,19}$ ]] && GPUREGION="broker:$WC_LAUNCH_BROKER_GPU"
+  SVHUB="broker:sv-hub"
+  WLHUB="broker:wl-hub"
+fi
+# The GPU region is there for this user: published by the broker, or a file it
+# may read and write.
+gpu_region_ok() {
+  if [ -n "$BROKERED" ]; then [ -n "$GPUREGION" ]; else [ -r "$GPUREGION" ] && [ -w "$GPUREGION" ]; fi
+}
 # Whether the hub RUNS, not whether its socket files exist: they outlive it
 # (with the fd store they are meant to), and a session that trusted a stale
 # file had no GPU doorbell and sent its Wayland connections over ssh (§99.8).
 hub_up() {
+  # §111.10: a system service the broker reaches; not this user's to start.
+  [ -n "$BROKERED" ] && return 0
   # A harness that runs its own hub, outside systemd (scripts/wc-no-ssh.sh).
   if [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ]; then
     [ -S "$HUBDIR/sv.sock" ] || [ -S "$HUBDIR/wl.sock" ]; return
   fi
-  local sd="env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user"
+  local sd="env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user"
   $sd is-active --quiet wc-bell-hub.service || $sd start wc-bell-hub.service >/dev/null 2>&1 || return 1
   for _ in $(seq 1 40); do
     $sd is-active --quiet wc-bell-hub.service && [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
@@ -153,11 +179,12 @@ hub_up() {
 # hosts the sessions itself (§103.17, role b) has only that: its hub holds the
 # guest's own port, and there is no QEMU socket at $WCBELL.
 wl_hub() {
+  [ -n "$BROKERED" ] && return 0
   [ -S "$HUBDIR/wl.sock" ] || return 1
   [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ] && return 0
-  env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active --quiet wc-bell-hub.service
+  env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user is-active --quiet wc-bell-hub.service
 }
-wcbell_use() { if wl_hub || hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
+wcbell_use() { if wl_hub || hub_up; then echo "$WLHUB"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -250,6 +277,30 @@ check_metrics() {
 }
 
 dir_of() { echo "$RUNROOT/$1"; }
+
+# §105.14: stop one of a session's user units and KNOW that it stopped.
+# `systemctl --user` fails while the user's manager re-executes (a NixOS
+# switch does that), and `down` used to ignore the failure, remove the
+# session's directory and say "down ok": its PulseAudio and GPU units ran on
+# with nobody left who knew their names. So a unit counts as stopped only
+# when the manager says `inactive` or `failed` (a collected unit is
+# `inactive`); an unreachable manager is asked again, for up to
+# WC_LAUNCH_STOP_TRIES tenths of a second.
+sd_user() { XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user "$@"; }
+unit_state() { local s; s=$(sd_user is-active "$1" 2>/dev/null | head -n 1); echo "${s:-unknown}"; }
+stop_unit() {
+  local U="$1" st=unknown i
+  for ((i = 0; i < ${WC_LAUNCH_STOP_TRIES:-100}; i++)); do
+    sd_user stop "$U" 2>/dev/null
+    st=$(unit_state "$U")
+    case "$st" in
+      inactive|failed) sd_user reset-failed "$U" 2>/dev/null; return 0 ;;
+    esac
+    sleep 0.1
+  done
+  echo "wc-session: $U is still $st (the user's service manager did not answer, or would not stop it)" >&2
+  return 1
+}
 
 # WHERE AN APPLICATION ACTUALLY IS, WHICH IS NOT A CONSTANT
 #
@@ -380,6 +431,7 @@ check_app() {
 #
 # load_app APP sets DEF_EXEC, DEF_ARGS (array), DEF_PROFILE, DEF_PREFS,
 # DEF_TITLEBAR, DEF_DESKTOP, DEF_GPU and DEF_ENV (array), or dies.
+home_path() { case "$1" in '~/'*) printf '%s/%s\n' "$HOME" "${1#'~/'}" ;; *) printf '%s\n' "$1" ;; esac; }
 load_app() {
   local want="$1" sec="" line k v found=""
   check_app "$want"
@@ -396,15 +448,19 @@ load_app() {
     case "$line" in *=*) ;; *) die "$APPS [$want]: not key = value: $line" ;; esac
     k="${line%%=*}"; k="${k%"${k##*[![:space:]]}"}"
     v="${line#*=}"; v="${v#"${v%%[![:space:]]*}"}"
+    # §111.10: `~/` is the home of the user the session runs as, so one
+    # installation's apps.ini serves whichever Linux user its guest user is
+    # mapped to (exec, profile, each word of args, env values).
     case "$k" in
-      exec) DEF_EXEC="$v" ;;
-      args) read -r -a DEF_ARGS <<<"$v" ;;
-      profile) DEF_PROFILE="$v" ;;
+      exec) DEF_EXEC=$(home_path "$v") ;;
+      args) read -r -a DEF_ARGS <<<"$v"
+            local i; for i in "${!DEF_ARGS[@]}"; do DEF_ARGS[i]=$(home_path "${DEF_ARGS[i]}"); done ;;
+      profile) DEF_PROFILE=$(home_path "$v") ;;
       prefs) DEF_PREFS="$v" ;;
       titlebar) DEF_TITLEBAR="$v" ;;
       desktop) DEF_DESKTOP="$v" ;;
       gpu) DEF_GPU="$v" ;;
-      env) DEF_ENV+=("$v") ;;
+      env) case "$v" in *=*) DEF_ENV+=("${v%%=*}=$(home_path "${v#*=}")") ;; *) DEF_ENV+=("$v") ;; esac ;;
       *) die "$APPS [$want]: no key $k" ;;
     esac
   done <"$APPS"
@@ -825,12 +881,15 @@ sound_ring_args() {
     *) return 0 ;;
   esac
   printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix %q' "$PACTL" "$SRV" "$D" "$PREFIX"
-  PWNODE=$(pw_node_bin 2>/dev/null)
   case "$KIND" in
     pipewire) PWSOCK="$D/pw/pipewire-0" ;;
     system|user-pipewire) PWSOCK="/run/user/$UID_/pipewire-0" ;;
     *) PWSOCK="" ;;
   esac
+  # §105.14: looked for only when there is a PipeWire to use it with; the
+  # look is a scan of the store, 25–35 ms of every session's start.
+  PWNODE=""
+  [ -n "$PWSOCK" ] && PWNODE=$(pw_node_bin 2>/dev/null)
   # The socket may not exist yet when the server starts beside the proxy;
   # the proxy asks the server what it is when the first device arrives.
   [ -n "$PWNODE" ] && [ -n "$PWSOCK" ] && { [ -n "$GIVEN" ] || [ -S "$PWSOCK" ]; } \
@@ -943,6 +1002,8 @@ start_app() {
       # `gpu` started, if the port was there to hold.
       if [ -s "$D/bell.path" ]; then
         GPUENV+=("SV_BELL=$(cat "$D/bell.path")")
+        # §111.10: `broker:sv-hub` is connected by the broker for the ICD.
+        case "$(cat "$D/bell.path")" in broker:*) GPUENV+=("WC_BROKER=$WC_BROKER") ;; esac
       elif [ -S "$D/bell.sock" ]; then
         GPUENV+=("SV_BELL=$D/bell.sock")
       fi
@@ -1213,19 +1274,29 @@ up)
     [ "$#" -eq 3 ] || die "up ID RUNID ivshmem takes no more words"
     D=$(dir_of "$ID")
     rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
-    [ -e "$ARENA" ] || die "no ivshmem arena at $ARENA: the VM has no wc-arena device (virtualisation.windowsVm.waycomposeArena), and there is no fallback to guest RAM"
-    if [ ! -r "$ARENA" ] || [ ! -w "$ARENA" ]; then
-      die "$ARENA exists and $(id -un) cannot read and write it: not in its group ($(stat -c %G "$ARENA" 2>/dev/null)), and there is no fallback to root"
+    # The header page, read once into the run directory: from the file, or
+    # (§111.10) from the region the broker published for this user.
+    HEAD="$D/arena.head"
+    if [ -n "$BROKERED" ]; then
+      [ -x "$BIN/wc-arena-host" ] || die "no $BIN/wc-arena-host (it reads the arena's header through the broker)"
+      "$BIN/wc-arena-host" broker-read "$ARENA" 4096 >"$HEAD" 2>"$D/arena.err" \
+        || die "the broker at $WC_BROKER would not give $(id -un) the arena ($ARENA): $(cat "$D/arena.err")"
+    else
+      [ -e "$ARENA" ] || die "no ivshmem arena at $ARENA: the VM has no wc-arena device (virtualisation.windowsVm.waycomposeArena), and there is no fallback to guest RAM"
+      if [ ! -r "$ARENA" ] || [ ! -w "$ARENA" ]; then
+        die "$ARENA exists and $(id -un) cannot read and write it: not in its group ($(stat -c %G "$ARENA" 2>/dev/null)), and there is no fallback to root"
+      fi
+      head -c 4096 "$ARENA" >"$HEAD" 2>/dev/null
     fi
-    MAGIC=$(head -c 8 "$ARENA" 2>/dev/null | tr -d '\0')
+    MAGIC=$(head -c 8 "$HEAD" 2>/dev/null | tr -d '\0')
     [ "$MAGIC" = WCIVSHM1 ] || die "$ARENA has no published header (magic '$MAGIC'): the compositor has not published, or has exited"
     # The u64s are little-endian and so is this machine, so od prints them as
     # numbers. Offsets are wc_handle::ivshmem's: run id 16, generation 24, length 32.
-    HAVE=$(od -A n -t x8 -j 16 -N 8 "$ARENA" | tr -d ' ')
+    HAVE=$(od -A n -t x8 -j 16 -N 8 "$HEAD" | tr -d ' ')
     WANT=$(printf '%016x' "$RUNID")
     [ "$HAVE" = "$WANT" ] || die "$ARENA describes run 0x$HAVE and the compositor said $RUNID: another compositor's header"
-    GEN=$(od -A n -t u8 -j 24 -N 8 "$ARENA" | tr -d ' ')
-    LEN=$(od -A n -t u8 -j 32 -N 8 "$ARENA" | tr -d ' ')
+    GEN=$(od -A n -t u8 -j 24 -N 8 "$HEAD" | tr -d ' ')
+    LEN=$(od -A n -t u8 -j 32 -N 8 "$HEAD" | tr -d ' ')
     printf '%s\n' "$RUNID" >"$D/arena.run"
     echo "ivshmem run $RUNID generation $GEN, $LEN bytes at $ARENA"
     # THE WAYLAND RINGS (docs/waycompose-design.md §89). A version-2 header
@@ -1235,9 +1306,9 @@ up)
     # Wayland connections cross ssh as before -- said here, in capitals, and
     # again by the proxy, because a session that went back to ssh is otherwise
     # indistinguishable from one that did not until somebody measures it.
-    VER=$(od -A n -t u4 -j 8 -N 4 "$ARENA" | tr -d ' ')
+    VER=$(od -A n -t u4 -j 8 -N 4 "$HEAD" | tr -d ' ')
     RLEN=0
-    [ "$VER" = 2 ] && RLEN=$(od -A n -t u8 -j 72 -N 8 "$ARENA" | tr -d ' ')
+    [ "$VER" = 2 ] && RLEN=$(od -A n -t u8 -j 72 -N 8 "$HEAD" | tr -d ' ')
     if [ "${RLEN:-0}" = 0 ]; then
       WHY="the compositor kept no rings (header version $VER; its log says why)"
     elif wl_hub; then
@@ -1250,7 +1321,7 @@ up)
       WHY=""
     fi
     if [ -z "$WHY" ]; then
-      ROFF=$(od -A n -t u8 -j 64 -N 8 "$ARENA" | tr -d ' ')
+      ROFF=$(od -A n -t u8 -j 64 -N 8 "$HEAD" | tr -d ' ')
       echo "rings" >"$D/transport"
       echo "transport rings: $RLEN bytes at $ROFF, doorbell $(wcbell_use)"
     elif [ "${WC_LAUNCH_SERVICE:-}" = 1 ] && [ "${RLEN:-0}" != 0 ]; then
@@ -1406,6 +1477,9 @@ proxy)
   words 1 1 "ID" "$@"
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
+  # §105.14: where the verb's time goes, in ms since it started.
+  STAMP0=${EPOCHREALTIME/./}
+  stamp() { [ -d "$D" ] && echo "$1 $(( (${EPOCHREALTIME/./} - STAMP0) / 1000 ))" >>"$D/proxy.timing"; }
   # IVSHMEM ARENA (§83): this user, a user unit, no $ROOTC. The socket is made
   # by this user, so there is nothing to chown. `--arena-run` is the run id `up`
   # checked, and the proxy refuses a header carrying any other. No
@@ -1437,41 +1511,57 @@ proxy)
     fi
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
     UNIT="wc-launch-$ID"
-    RUN=$(cat "$D/arena.run")
+    RUN=$(<"$D/arena.run")
     {
       echo '#!/usr/bin/env bash'
       echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
       # §105: this host's settings, for the wc-session the control ring runs
       # (as §103.14 does): the unit does not inherit this process's environment.
-      [ $SERVICE = 1 ] && env | grep '^WC_LAUNCH_' | grep -v '^WC_LAUNCH_SERVICE=' | while IFS= read -r kv; do printf 'export %q\n' "$kv"; done
+      # §105.14: built-ins only from here to the unit's start; every fork
+      # here was ~2 ms of each session's start.
+      if [ $SERVICE = 1 ]; then
+        for kv in "${!WC_LAUNCH_@}"; do
+          [ "$kv" = WC_LAUNCH_SERVICE ] || printf 'export %q\n' "$kv=${!kv}"
+        done
+      fi
+      # §111.10: the broker the proxy opens the arena and the hub through.
+      [ -n "$BROKERED" ] && printf 'export %q\n' "WC_BROKER=$WC_BROKER"
       # §88. A `WC_FRAME_TRACE=` line in gpu.env traces the proxy as well:
       # the frame timeline has a proxy half, and gpu.env is where a measured
-      # run already says what the session's frame should record.
-      ft=$(grep -m1 '^WC_FRAME_TRACE=' "$BASE/gpu.env" 2>/dev/null)
-      [ -n "$ft" ] && printf 'export %q\n' "$ft"
-      # §89: and its clock, so the proxy's half of an input timeline is on
-      # the machine's monotonic counter like the compositor's.
-      ft=$(grep -m1 '^WC_FRAME_TRACE_CLOCK=' "$BASE/gpu.env" 2>/dev/null)
-      [ -n "$ft" ] && printf 'export %q\n' "$ft"
+      # run already says what the session's frame should record. §89: and
+      # its clock, so the proxy's half of an input timeline is on the
+      # machine's monotonic counter like the compositor's. §105.14: and the
+      # control round trip's hops, on the same clock. The first of each.
+      if [ -f "$BASE/gpu.env" ]; then
+        local_seen=" "
+        while IFS= read -r ft; do
+          case "$ft" in
+            WC_FRAME_TRACE=*|WC_FRAME_TRACE_CLOCK=*|WC_HOP_TRACE=*)
+              [[ "$local_seen" == *" ${ft%%=*} "* ]] && continue
+              local_seen="$local_seen${ft%%=*} "
+              printf 'export %q\n' "$ft" ;;
+          esac
+        done <"$BASE/gpu.env"
+      fi
       printf 'rm -f %q\n' "$D/wl-proxy"
       # §89: the rings, when `up` found both them and their doorbell. The
       # tunnel's socket stays the upstream either way: the icon and clipboard
       # feeds use it, and so does a connection that cannot have a ring.
       RINGARGS=""
       UPARGS=$(printf -- '--upstream %q' "$D/up.sock")
-      [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
-        && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$(wcbell_use)")
+      # §105.14: the doorbell looked up once (it asks systemd twice).
+      BELLUSE=poll
+      [ -f "$D/transport" ] && [ "$(<"$D/transport")" = rings ] && BELLUSE=$(wcbell_use)
+      [ "$BELLUSE" != poll ] && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$BELLUSE")
       if [ $SERVICE = 1 ]; then
         UPARGS=""
-        BELLUSE=poll
-        [ "$(cat "$D/transport" 2>/dev/null)" = rings ] && BELLUSE=$(wcbell_use)
         RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q --session-control %q --session-id %q' "$BELLUSE" "$BASE/wc-session" "$ID")
         # §107: a session of the guest's shared compositor.
-        IDX=$(cat "$D/session.index" 2>/dev/null)
+        IDX=""; [ -f "$D/session.index" ] && IDX=$(<"$D/session.index")
         [ -n "$IDX" ] && RINGARGS="$RINGARGS --session-index $IDX"
         # §110: the GPU device is region 1 of the one pool the shared
         # compositor leases Wayland buffers from when its BAR is full.
-        [ -n "$IDX" ] && [ -r "$GPUREGION" ] && RINGARGS="$RINGARGS $(printf -- '--arena-region 1=%q' "$GPUREGION")"
+        [ -n "$IDX" ] && gpu_region_ok && RINGARGS="$RINGARGS $(printf -- '--arena-region 1=%q' "$GPUREGION")"
         # §106: host integration, and every Windows endpoint a stream of the
         # sound ring with stable names (§103.16, §106.3).
         # The session's server starts beside the proxy (§105.13), so its kind
@@ -1483,16 +1573,22 @@ proxy)
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
+    stamp script
     export XDG_RUNTIME_DIR="/run/user/$UID_"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT (is this user's manager running? loginctl enable-linger)"
+    stamp unit
     for _ in $(seq 1 1000); do [ -S "$D/wl-proxy" ] && break; sleep 0.01; done
+    stamp bound
     if [ ! -S "$D/wl-proxy" ]; then
       echo "wc-session: the proxy never bound its socket" >&2
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
       exit 1
     fi
+    # §105.14: waited for even here. Not waiting was tried: the guest's sound
+    # ring announced its device before the session's server listened, and
+    # the proxy made no sink for it (scripts/wc-no-ssh.sh, leg 1b).
     [ -n "$APID" ] && wait "$APID"
     [ $SERVICE = 1 ] || audio_up "$D" "$ID"
     echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem$([ $SERVICE = 1 ] && echo ', no ssh: control, sound and feeds on rings'))"
@@ -1505,6 +1601,7 @@ proxy)
         sleep 0.01
       done
       echo "transport ${T:-the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
+      stamp rings
     elif [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
       T=""
       for _ in $(seq 1 200); do
@@ -1826,8 +1923,8 @@ down)
   # The user unit first, always: stopping one that does not exist costs
   # nothing. Root only for a guest-RAM session, which is the kind that wrote a
   # plan; an ivshmem session never had a root unit to stop (§83).
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-$ID" 2>/dev/null
+  STUCK=""
+  stop_unit "wc-launch-$ID" || STUCK="$STUCK wc-launch-$ID"
   # §103.16: a sound ring's devices on the user's own server outlive the
   # proxy that made them; the session's own server goes with its unit.
   if [ -s "$D/sound.modules" ] && [[ "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" =~ ^(system|user-pipewire)$ ]] && PACTL=$(pulse_bin pactl 2>/dev/null); then
@@ -1835,10 +1932,10 @@ down)
       [[ "$m" =~ ^[0-9]+$ ]] && PULSE_SERVER="unix:/run/user/$UID_/pulse/native" "$PACTL" unload-module "$m" 2>/dev/null
     done <"$D/sound.modules"
   fi
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-audio-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-audio-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-gpu-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-gpu-$ID" 2>/dev/null
+  stop_unit "wc-launch-audio-$ID" || STUCK="$STUCK wc-launch-audio-$ID"
+  stop_unit "wc-launch-gpu-$ID" || STUCK="$STUCK wc-launch-gpu-$ID"
+  # The directory names the units; it goes only once they have.
+  [ -z "$STUCK" ] || die "down $ID: could not stop$STUCK; the session stays for the next down"
   if [ -f "$D/arena.plan" ] && [ "${WC_LAUNCH_GUEST_RAM:-}" = 1 ]; then
     printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
       "wc-launch-$ID" "wc-launch-$ID" | eval "$ROOTC" >/dev/null 2>&1
@@ -1904,15 +2001,16 @@ gpu)
     echo "gpu ok at $D/icd.sock (guest RAM, label $LABEL, as $(id -un)$([ -s "$D/bell.path" ] && echo ", doorbell $(cat "$D/bell.path")" || echo ', no doorbell: polled'))"
     exit 0
   fi
-  [ -r "$GPUREGION" ] && [ -w "$GPUREGION" ] \
-    || die "cannot open the GPU arena $GPUREGION as $(id -un) (is the VM's GPU ivshmem device configured, and this user in its group?)"
+  gpu_region_ok \
+    || die "cannot open the GPU arena ${GPUREGION:-(none published)} as $(id -un) (is the VM's GPU ivshmem device configured, and this user in its group or the broker's users?)"
   UNIT="wc-launch-gpu-$ID"
   BELLARGS=""
   rm -f "$D/bell.path"
   if hub_up; then
-    # §99: the shared hub holds the port; this session's ICDs connect to it.
-    printf '%s\n' "$HUBDIR/sv.sock" >"$D/bell.path"
-    BELLARGS=$(printf -- '--cold-bell %q' "$HUBDIR/sv.sock")
+    # §99: the shared hub holds the port; this session's ICDs connect to it
+    # (§111.10: through the broker).
+    printf '%s\n' "$SVHUB" >"$D/bell.path"
+    BELLARGS=$(printf -- '--cold-bell %q' "$SVHUB")
   elif [ -S "$BELL" ] && [ -w "$BELL" ]; then
     echo "wc-session: NO SHARED DOORBELL HUB ($HUBDIR): this session holds QEMU's doorbell port itself, and no other session can have it until this one is gone (§99)" >&2
     BELLARGS=$(printf -- '--bell %q --bell-hub %q' "$BELL" "$D/bell.sock")
@@ -1921,6 +2019,7 @@ gpu)
     echo '#!/usr/bin/env bash'
     echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
     printf 'rm -f %q %q\n' "$D/icd.sock" "$D/bell.sock"
+    [ -n "$BROKERED" ] && printf 'export %q\n' "WC_BROKER=$WC_BROKER"
     printf 'exec %q ivshmem-serve --region %q --cold pool --socket %q %s >%q 2>&1\n' \
       "$BIN/sv-hostd" "$GPUREGION" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
   } >"$D/gpu.sh"

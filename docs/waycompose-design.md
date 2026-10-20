@@ -28868,10 +28868,207 @@ separate check found nothing personal in them.
    is used for other applications.
 5. **A second application** would get its own identity, pin and jump list from
    its desktop entry. Only Firefox has been run.
-6. **Multiple installations share an identity.** `wcivs`, `wcpins` and `wcmil`
-   all launch `firefox`, so they all write `Waycompose.app.firefox`'s jump list,
-   and the last one to refresh wins. That is right for one installation per
-   user, which is the product.
+6. **Multiple installations shared an identity.** `wcivs`, `wcpins` and `wcmil`
+   all launch `firefox`, so they all wrote `Waycompose.app.firefox`'s jump
+   list, and the last one to refresh won. Fixed in 92.12: the identity is
+   per installation, and only the installation whose pin already carries the
+   old identity keeps it.
+
+### 92.12 One identity per installation
+
+Branch `session-fixes-aumid`, 2026-10-19.
+
+**The cause.** `taskbar::identity` was a function of the app id alone. Every
+installation of Firefox put its windows, shortcuts, pins, jump list and
+relaunch file under `Waycompose.app.firefox`. The test installation "Windows
+7 (Linux, no ssh)" shared `Waycompose.app.atp-nested` with the user's "Windows
+7 (Linux)". `ICustomDestinationList` keys a jump list by that string and the
+last writer wins, so a test run replaced the user's Firefox jump list with
+the test profile's pages. Since §107 one compositor serves every
+installation, so windows of two installations of one application shared one
+button, and a pin made from either relaunched whichever installation's
+relaunch directory came first in boot order.
+
+**The scheme.** An installation's applications carry
+`Waycompose.install.<installation>.<app id>`, for example
+`Waycompose.install.wclinux.atp-nested` (`taskbar::installed_identity`).
+`install.` is a segment of its own beside `app.` and `unnamed.`, so no
+installation name and no client's app id can produce another namespace's
+string. The installation's name has no dot (the session service allows
+letters, digits, `-` and `_`, at most 32), so the segment after it is the
+app. Windows does not document whether it compares AUMIDs with regard to
+case, so the scoped form is lower case only. An upper-case letter is
+lowered, and the name then counts as mapped: it carries the hash of the
+original, as `identity` already did for spaces and long names. Two
+installations, or two app ids, that differ at all get different strings,
+and every string fits Windows' 128 characters with no space
+(`every_scoped_identity_fits_what_windows_documents` checks 30 pairs of
+odd names, all distinct). A client that never set an app id keeps
+`Waycompose.unnamed.c<N>`: the connection number is unique in the
+compositor, and such a window cannot be pinned.
+
+**The one exception: the user's existing pin.** The old identity is in the
+user's pinned shortcuts, desktop shortcuts and Explorer's own copy of the
+pins (the Taskband blob). Two ways were weighed:
+
+* (a) rewrite every shortcut's AUMID at deploy and rebuild the jump list
+  under the new id. Changing a pinned shortcut's identity under a running
+  Explorer splits the pin and its windows into two buttons until Explorer
+  restarts, because Explorer reads its cached copy. That is a visible change
+  to the user's taskbar, or an Explorer restart, and neither is allowed.
+* (b) keep `Waycompose.app.<app>` for the one installation whose pin already
+  carries it. Nothing the user sees changes, by construction: the pin, its
+  windows and its jump list keep the string they have.
+
+So (b), with (a)'s rewrite only where it is invisible. Deploy runs
+`wc-launch.exe --taskbar-ids` on the guest (`taskbar_id::decide`). For each
+`[app.*]` of the installation:
+
+1. A decision an earlier deploy made is kept. Deploy copies the old ini to
+   `wc-launch.ini.prev` before it copies the new one, and the verb reads
+   `taskbar-id` from it. A decision never flips.
+2. A test installation always gets its own identity: `WC_LAUNCH_TEST_HOME`
+   set for the deploy, a `test-home` file beside its `wc-session` on the VM
+   host, or `WC_LAUNCH_TASKBAR_ID=install`.
+3. A claim file, `%LOCALAPPDATA%\waycompose\taskbar\<identity>.owner`, names
+   the `wc-launch.exe` that holds an old identity. If it names another
+   installation that still exists, this one gets its own.
+4. Otherwise the user's shortcuts decide: those in `User Pinned\TaskBar`, on
+   the desktop and in the Start menu's programs, read through `IShellLinkW`
+   and its property store. A pin with the old identity that runs this
+   installation keeps it. A pin that runs another installation gives it to
+   that one. With no pin, a desktop shortcut decides, unless another
+   installation has one too; then neither keeps it. Start menu entries are
+   not evidence, because every launch writes one. A shortcut of a removed
+   installation is not evidence either.
+5. Anything else gets its own identity.
+
+The result is written into the installation's `wc-launch.ini` as
+`[app.<id>] taskbar-id = legacy` or `install` (absent is `install`). A
+`legacy` decision writes the claim file. An `install` decision gives this
+installation's own unpinned desktop and Start menu shortcuts the new
+identity (`shell::set_link_aumid`, which keeps everything else in the
+file), and removes the relaunch file of the form it no longer uses. Its pin,
+if it has one with the old identity (only a test installation can), is left
+alone and the log says so: its windows get their own button until the user
+pins again. A shortcut whose identity cannot be read is taken to carry the
+old one, so it can only keep it where it is, and it is never rewritten.
+`scripts/wc-launch.sh taskbar-plan` is the same verb with `--dry-run`: it
+prints the shortcuts it found and each decision, and changes nothing.
+
+**Two installations never carry one identity.** The claim file is checked
+before any shortcut. The compositor checks again: a session whose boot
+claims an old identity that another live session holds does not get it, and
+the log says `taskbar: session N … asked for the application-wide identity of
+…` (`Registry::add_session`).
+
+**The compositor.** The launcher sends its scope in the boot line,
+`taskbar=INSTALL[:APP,…]` (107.3), where the apps are the window app ids that
+keep the old identity. The scope must name the boot's own installation. A
+one-session compositor gets it as `--taskbar-scope`. Each window remembers its
+client's session, and `taskbar::identity_in(app_id, client, session)` stamps
+the session's installation's identity. A session with no scope (a launcher
+from before §92.12) keeps the old identity, as before. A launcher whose boot
+is refused with `unknown boot field "taskbar"` is talking to a compositor
+from before §92.12 (another installation started it); it boots again without
+the field and logs that its windows carry the old identity until that
+compositor ends.
+
+**Relaunch, per installation.** A window's relaunch file is looked up only in
+the directory of the session whose scope owns the identity
+(`Registry::relaunch_dirs`). Before, every session's directory was searched
+in boot order, and a stale `Waycompose.app.firefox.relaunch` left in a test
+installation's `apps` could give the user's window the test installation's
+command. An identity no scope owns is looked up in the unscoped sessions'
+directories, as before.
+
+**The jump list.** `ICustomDestinationList::SetAppID` gets the same string as
+the windows and shortcuts. The jump list's own files (icons, removed pages,
+refresh period) were in `%LOCALAPPDATA%\waycompose\jumplist\<app>`, shared by
+every installation too. An installation with its own identity now keeps them
+in `jumplist\<installation>\<app>`; the one with the old identity keeps the
+old directory, and with it the pages the user removed.
+
+**Removal.** `wc-launch.exe --uninstall-taskbar` (`scripts/wc-launch.sh
+uninstall-taskbar`) deletes the installation's own jump list
+(`ICustomDestinationList::DeleteList` on its own identity). It deletes the
+old identity's list only while this installation holds the claim, and then
+removes the claim. It removes its desktop and Start menu shortcuts, its
+relaunch files and its jump-list directory. It never touches another
+installation's, and it lists its pins, which only the user can unpin
+(`taskbar_id::plan_removal`).
+
+**What deploy does to the user's installations.** On the next deploy of
+each, with this build, nothing else running:
+
+| installation | expected decision | what the user sees |
+|---|---|---|
+| `wcivs` ("Firefox (Linux)") | `legacy`: the pin `Firefox (Linux)` in `User Pinned\TaskBar` carries `Waycompose.app.firefox` and runs `wcivs\wc-launch.exe` (92.9). Claim written | nothing changes: the pin, its windows and its jump list keep their identity. The list's pages are rebuilt at the next launch from the user's profile, which replaces whatever a test run left in it |
+| `wclinux` ("Windows 7 (Linux)") | `legacy` if its pin or desktop shortcut is the only one with `Waycompose.app.atp-nested`; `install` if the test installation's desktop shortcut carries it too and neither is pinned | `legacy`: nothing. `install`: nothing visible either; the unpinned desktop and Start menu shortcuts get `Waycompose.install.wclinux.atp-nested`, and a pin made afterwards joins its windows |
+| `wcmc` (Minecraft) | `legacy`, from its pin or desktop shortcut | nothing |
+| the test installations | `install` | their windows leave the user's buttons and get their own; their Start menu entries move with them |
+
+The real decisions are in each deploy's log (`taskbar-id: <app> legacy|install
+<identity>: <why>`); `taskbar-plan` shows them before anything is written.
+Not run on the guest from this branch.
+
+**The tests.**
+
+| where | what |
+|---|---|
+| `taskbar.rs` `install_tests` (both crates) | the scheme: legible ids, case and mapping, uniqueness over 30 odd pairs, the 128-character limit, no dot in the installation segment, the scope's parse and render, legacy only where the scope says, a shared compositor naming three sessions' windows by their installations, a second legacy claim refused, the one-session default, relaunch files found only in the owning installation's directory |
+| `session_svc.rs` | the boot line carries `taskbar=`, and a scope of another installation or a bad app id is refused |
+| `taskbar_id.rs` | the decision: the user's situation (pin of `wcivs`, a test installation's Start menu entry), never two `legacy` in either deploy order over six shortcut layouts, test installations, a persisted decision that does not flip, claims (another's, ours, stale), shortcuts of removed installations and Start menu entries are not evidence, unreadable identities, path comparison, removal |
+| `config.rs` | `taskbar-id` parsed, defaulted and refused; read from any ini text; set in place, CRLF kept |
+| `plan.rs`, `appmeta.rs` | the scope the launcher sends, and the launcher's identity equal to the compositor's for the same installation |
+
+Under Wine (`/mnt/datasets/builds/evidence/session-fixes/aumid/wine-taskbar-ids.txt`):
+two installations `wcivs` and `wcpins` of one Firefox, both first configured as
+before §92.12 and `--install`ed, `wcivs`'s shortcut copied into `User
+Pinned\TaskBar`. Then the deploy's step: `wcpins --taskbar-ids` decided
+`install` ("the user's pin carries it and runs …\wcivs\wc-launch.exe") and
+removed its old relaunch file; `wcivs --taskbar-ids` decided `legacy` and wrote
+the claim. A second deploy kept both ("kept from the installation's ini").
+`--refresh` then wrote `Waycompose.app.firefox.relaunch` in `wcivs\apps` and
+`Waycompose.install.wcpins.firefox.relaunch` in `wcpins\apps`.
+`wcpins --uninstall-taskbar` removed its two shortcuts and its relaunch file
+and left `wcivs`'s three. Wine's shell links do not implement
+`IPropertyStore::GetValue` (`E_NOTIMPL`) and do not store the identity, so
+every identity read as unreadable, which is the path the rule above takes
+for that; `DeleteList` is `E_NOTIMPL` too.
+
+On a real Windows 11 (a throwaway clone of the local test image, 24H2,
+build 26100; `/mnt/datasets/builds/evidence/session-fixes/aumid/vm/`), the
+same scenario with two throwaway installations whose shortcuts our
+`--install` wrote, `wcivs`'s copied into `User Pinned\TaskBar`, and a cached
+host answer for Firefox:
+
+| step | result |
+|---|---|
+| the property store read | every shortcut read `[Waycompose.app.firefox]`, the same as the shell's own `System.AppUserModel.ID` column; nothing unreadable |
+| `--taskbar-ids`, `wcpins` first | `wcpins`: `install` ("the user's pin carries it and runs …\wcivs\wc-launch.exe"), its desktop and Start menu shortcuts rewritten, the shell then reads `Waycompose.install.wcpins.firefox`; `wcivs`: `legacy`, claim written |
+| `--taskbar-ids`, `wcivs` first | `wcivs`: `legacy`, claim written; `wcpins`: `install` ("…\wcivs\wc-launch.exe holds the claim") |
+| the pinned `.lnk` | SHA-256 the same before and after, in both orders |
+| `--refresh` for both | `SetAppID` and `CommitList` succeeded for both identities (`jump list 3 task(s)`, 10 slots); two `customDestinations-ms` files, one whose links run `wcivs`, one `wcpins`; relaunch files `Waycompose.app.firefox.relaunch` in `wcivs\apps` and `Waycompose.install.wcpins.firefox.relaunch` in `wcpins\apps` |
+| `--uninstall-taskbar` of `wcpins` | its list file gone (`DeleteList` succeeded), `wcivs`'s list unchanged; its two shortcuts and its relaunch file gone, `wcivs`'s three shortcuts and relaunch file still there; `jumplist\wcpins` removed |
+
+The first run left an empty `jumplist\wcpins` after the removal; the removal
+now takes the installation's directory too once it is empty.
+
+**Not run:** per-session identities on window properties in a shared
+compositor. A session's clients reach the compositor only through the
+ivshmem rings that the VM host's session service serves; a socket client is
+always session 0. That path is covered by the registry's and the boot line's
+unit tests above, and the code that writes the property (`win32.rs`,
+`set_taskbar_identity`) is §92's, unchanged.
+
+**Gates.** `cargo test --workspace --no-fail-fast`: 114 binaries, 3291
+passed, 0 failed, 9 ignored. `cargo clippy --workspace --all-targets`, and
+`-p wc-launch -p wc-compositor --all-targets` for Windows: no warning in a
+line this section wrote. `cargo check --workspace --target
+x86_64-pc-windows-gnu` and `-p wc-launch -p wc-compositor --target
+x86_64-apple-darwin`: exit 0. `scripts/wc-xref.sh --list` and
+`design_citations`: no missing citation.
 
 ## 93. Two bugs from real use: the clipboard, and a menu that closes instead of opening
 
@@ -31885,6 +32082,88 @@ never answered it. Which application asks for elevation at unlock is
 tests now record the peak of `MemTotal - MemAvailable`: `nested-waycompose`
 1426 MiB → 2048 (was 8192), `nested-login` 1194 MiB → 1792 (was 6144).
 
+### 102.14 One window per application: clicks that wait, and a launch that says it failed
+
+**The bug, 2026-10-19 on the guest.** Nothing appeared at once after a click
+on "Windows 7 (Linux)", so the user clicked several more times within a second.
+Each click was a `run` on the host, six seats started at once and tore each
+other down, and the user got no window and no message. The host now takes a
+lock (a second `run` fails with "a nested session is already running"). The
+launcher stops sending those runs.
+
+**`single = on`** in an `[app.*]` block (set for `linux-desktop` and
+`linux-desktop-win11` in `scripts/wc-linux-desktop-apps-guest.ini`) applies to
+a plain click (`Request::Run`). Jump-list tasks and pages are unchanged.
+
+1. **A window is up.** The launcher looks for a visible, unowned top-level
+   window of the session's compositor. The compositor's pid comes from the
+   state file, and only counts while the session's mutex exists, which is the
+   same test that makes a click warm (`session_alive`, `OpenMutexW`, never
+   creating it). The window must carry the application's identity
+   (`PKEY_AppUserModel_ID` = `appmeta::aumid`, §92). If the identity cannot be
+   read (Wine), the window's exact title must equal the block's `title`, which
+   is also the title `wc-proxy` gives both nested windows (102.4). If such a
+   window exists, the launcher restores it when minimised (`ShowWindowAsync`),
+   calls `SetForegroundWindow` (the click's own process may take the
+   foreground), logs one line and exits 0 without contacting the host.
+2. **A launch is in progress.** The launching click holds
+   `Local\waycompose-single-<session>-<section>` from the gate until its window
+   is found, or for at most 90 s. A click that finds the lock held waits (95 s
+   at most) for that window and then does 1. If the lock is let go with no
+   window, the first launch failed and has told the user, so this click exits
+   quietly. A lock left by a crashed launcher (`WAIT_ABANDONED`) counts as free.
+3. **A failed launch says so.** The cases are: the session could not start,
+   the host refused the `run`, or no window appeared within 90 s. The launcher
+   lets the lock go first, then shows a `MessageBoxW` captioned with the
+   application's title. The text is German when the UI language is
+   (`GetUserPreferredUILanguages`, as for the jump list), otherwise English.
+   The host's "already running" becomes "läuft bereits oder wird gerade
+   beendet … versuchen Sie es dann erneut". The dialog runs on a thread of its
+   own, so a session owner keeps supervising while the dialog is open. The
+   process waits for the dialog before it exits.
+
+The decisions (`crates/wc-launch/src/single.rs`) are pure functions with unit
+tests. The Win32 half in `main.rs` enumerates windows, waits on the mutex and
+focuses the window.
+
+**Under Wine** (`scripts/wc-launch-single-wine.sh`, 20 checks; the 90 s case
+with `WC_SINGLE_SLOW=1`), the real `wc-launch.exe` runs with
+`scripts/wc-launch-single-fake.rs` standing in for `ssh.exe`, the compositor
+and the relay:
+
+| case | result |
+|---|---|
+| a cold click | one `run`; the lock is taken and let go when the window appears |
+| a click on a minimised window | restored and foreground; exit 0; still one `run` |
+| five clicks 150 ms apart | one `run`, one window; four clicks waited and focused it |
+| the host refuses, three clicks | one `run`, one dialog ("already running"); the two others exit 0 quietly |
+| the session cannot start, `LANG=de_DE` | the German dialog |
+| accepted, no window in 90 s, plus a second click | one dialog; the second click exits 0 quietly |
+
+Wine has no window property store, so these runs exercise the title path
+only. The identity path is checked on the guest. Log lines on the guest
+(`%LOCALAPPDATA%\waycompose\wc-launch-<session>.log`):
+`single: <section>: a window is already up (hwnd …, by identity); …; no run sent`,
+`… another click is launching it; waiting up to 95 s …`,
+`… the other click's window is up after N ms …`,
+`… the other click's launch ended without a window …`,
+`CLICK-TO-WINDOW N ms (cold|warm, single; …)` and
+`single: <section>: FAILED after N ms (…); lock released; telling the user: …`.
+
+**With §107's shared compositor.** The installation has no compositor of its
+own then, and its state file says `comp-pid=0` so that `--stop` never kills
+the compositor every other installation's windows are in. The window lookup
+needs a process all the same: the launcher keeps the shared compositor's pid
+from its answer to `ping` (`compositor <pid>`) as `shared-pid` in the state
+file, and looks among that process's windows (`single::window_pid`). Several
+installations' windows share that process; they are told apart by identity
+(the AUMID from the app id), so two installations that give a `single`
+application the same app id would also share one taskbar button, and the
+lock (`Local\waycompose-single-<session>-<app>`) stays per installation.
+Checked on the guest when the shared compositor is deployed there; before
+that, by unit tests (`a_shared_compositors_windows_are_looked_for_…`,
+`the_shared_compositors_pid_comes_from_its_ping`).
+
 ### 102.10 The GPU
 
 `nestedTest.gpuForwarding` (off) lets the seat pass the session's GPU
@@ -33415,20 +33694,264 @@ was not measured.
 1. **CPU.** The compositor's blit from a section is not damage-scoped, and the
    per-frame SYNC_FD wait is synchronous on KWin's thread. Both are the next
    steps; a heavy-repaint workload is the measurement that should decide.
+   *The wait is gone since §104.11; the composite is damage-scoped, and a
+   window whose picture is one section is drawn without reading it, since
+   §104.12.*
 2. **Plasma's clients** still hand KWin `wl_shm` (llvmpipe) or kopper frames.
    Clients inside the namespace could use dma-bufs too; that needs the GPU side
    to import a section into another session's device, which the registry
-   already allows by name.
+   already allows by name. *The GPU side is ready since §104.11; the NixOS side
+   is not.*
 3. **`zwp_linux_buffer_params_v1.create`** (not immediate) answers `failed`.
 4. **Two installations with the GPU at once**: the GPU device has one mapping,
    so a Firefox session with the GPU and this one exclude each other (as
    before §104).
 5. **A crashed GPU process on Linux** leaves its `/dev/shm` files behind
-   (Windows frees sections itself).
+   (Windows frees sections itself). *Swept at the next start since §104.11.*
 6. **The seat's node is for group `users`**: whichever of the login screen's
    users logs in gets it; any member of the group can open it, which gives
    access to nothing but the fake ioctls.
 
+### 104.11 Implicit sync that nobody waits for, and a client's buffer in KWin
+
+Branch `kwin-gpu-zc-icd`. Three changes to the path above: the sync fd export
+no longer waits for the guest's GPU; a buffer one ICD session made can be
+imported into another (a Plasma client's into KWin's); a crashed GPU process's
+`/dev/shm` files are removed.
+
+**The problem.** Zink exports a `SYNC_FD` semaphore after every flush that
+touched an exported image (`zink_screen_import_dmabuf_semaphore`), and §104.4
+answered it by submitting a wait with a fence and waiting for the fence: KWin's
+thread stalled a round trip to the guest's GPU per frame. The export must
+return at once, and still nobody may read a frame the GPU has not finished.
+The difficulty is ordering: KWin's submit reaches the GPU process on the ICD's
+rings, its commit reaches the compositor through wc-proxy, and the commit can
+arrive before the GPU process has even dequeued the submit. Whoever waits
+must therefore be told *which* work to wait for by somebody who knew it before
+the commit was sent — the ICD.
+
+**The options weighed.**
+
+| option | why not / why |
+|---|---|
+| a per-section "submitted/completed" record the GPU side writes, read by the compositor at commit | racy: "submitted" is bumped when the GPU process dequeues the work, which can be after the commit arrives; the compositor would wait for the previous frame |
+| the token as an open file of the `sv-drm` CUSE node, so `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` reaches the daemon | the import direction works, but the consumer side (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, which Zink uses before sampling an imported buffer) must return a new fd, and a CUSE server cannot put an fd into its caller; it also puts every frame through a root daemon |
+| proxy holds the commit until the GPU is done | the host cannot see the guest's completion without another channel, and the frame would wait for a host round trip after the GPU finished |
+| **the ICD numbers the work; the token carries the number; the consumer waits in the guest** | **chosen**: the number exists before the commit, the wait is where the pixels are read, nothing is added to the GPU's work |
+
+**How it works.**
+
+* **Fence records.** Each GPU session has one (`sv_gpu_server::fence`): a
+  4 KiB named section (`Local\sv-fence-<pid>-<n>-<tag>`, a `/dev/shm` file on
+  Linux) holding `"SVFENCE1"` and `completed`, a little-endian u64.
+  `svFenceRecord` (answered, once per session) names it to the ICD.
+* **Tokens, version 2** (`sv_drm::token`): the header also names the
+  session's record, and the second page of the memfd is the **sync page**, the
+  number of the last work that wrote the allocation. The file is sealed with
+  `F_SEAL_FUTURE_WRITE` instead of `F_SEAL_WRITE`: no `write` and no new
+  writable mapping for anybody, but the ICD's mapping of the sync page, made
+  before sealing, stays writable. One token file per allocation;
+  `vkGetMemoryFdKHR` returns a `dup` (as a kernel export returns another fd for
+  the same buffer), so every holder maps the same page.
+* **The export.** `vkGetSemaphoreFdKHR(SYNC_FD)` numbers the semaphore's
+  pending signal (`seq`, from 1 per session) and returns -1 at once. Zink asks
+  for the image's memory fd right after (measured with Mesa 26.2's real path
+  in `sv-dmabuf-e2e.sh`); then the ICD sends `svFenceMark{queue, semaphore,
+  seq, memory}` on the queue ring, unanswered, and stores `seq` in the sync
+  page. The GPU side submits an empty batch waiting on the semaphore with a
+  fence (what the export did before, minus the wait); a watcher thread per
+  session waits for the fences in order and writes `completed = seq`.
+* **KWin → compositor.** wc-proxy maps the sync page of each dma-buf buffer's
+  token. On a commit it reads `seq` and, if it is larger than what it already
+  sent for that record, sends `wc_gpu_fence_v1.wait(record, seq)` before the
+  commit (`crates/wc-compositor/protocols/wc-gpu-fence-v1.xml`), on an object
+  bound at the id one past the client's highest and destroyed right after; its
+  `delete_id` is dropped by count. The compositor (`gpu_fence.rs`, a new module;
+  `surface.rs` is untouched) does not return from the request until the record
+  says `completed >= seq` — usually the first check — or 100 ms passed; a
+  record that ran out its time is not waited on again until it moves.
+* **Client → KWin (another session).** Before Zink samples an imported
+  dma-buf it asks for its memory fd *without* an export in front
+  (`zink_screen_export_dmabuf_semaphore`, whose `EXPORT_SYNC_FILE` then fails
+  on the memfd). The ICD takes that as "the next batch reads this": it reads
+  the producer's record and number from the token and sends `svFenceWait{memory,
+  seq, record}` before the next submit. The GPU side waits on the producer's
+  in-process progress on the consumer's queue-ring thread (not the app's,
+  and no GPU work), up to 2 s. The same message also waits for every mark
+  another session has made on that section that the GPU process has already
+  seen: the reads of a consumer, before the producer writes again.
+* **Fallback.** A GPU side without a record (`svFenceRecord` refused) gets
+  the old behaviour, the export waits; a version-1 token is waited for by
+  nobody, as before §104.11 except that the export no longer blocks.
+
+**Cross-session import.** The registry of sections was already process-wide
+(a static); what changes is that it is now exercised and its lifetime spelled
+out: each import maps its own view (a new mapping of the section, never the
+creator's pointer imported into a second device), the entry counts the views
+of every session, the creator's free does not end the section while another
+session holds a view (Windows: each view's own section handle keeps it; Linux:
+the file is unlinked with the last view), and the nonce is checked as before.
+
+**Crashed GPU processes** (Linux): before its first section a GPU process
+removes `/dev/shm/sv-shared-<pid>-<n>-<16 hex>` and `sv-fence-…` files owned by
+its user whose pid is not a process (`kill(pid, 0)` is `ESRCH`); a reused pid
+keeps its files. Windows has nothing to sweep.
+
+**Checked locally** (logs: `/mnt/datasets/builds/evidence/kwin-gpu-zero-cost/`):
+
+| test | result |
+|---|---|
+| `scripts/sv-dmabuf-e2e.sh` | PASS: the export returns in microseconds, the record reaches the number ~0.3 ms later, all pixels right; Zink's own path (egl-dmabuf) marked its export for its section without waiting |
+| `scripts/sv-dmabuf-xsession-e2e.sh` (new; two processes, one pool-guest) | PASS: the producer hands the token on 40 µs after a submit that keeps lavapipe busy for ~80 ms; the consumer's copy waits for it on the GPU side and reads the producer's colour in every pixel. With `SVX_NO_ACQUIRE=1` (no acquire, so no wait) the same copy finishes in 2 ms and reads 32768 wrong pixels. The consumer's frame back to the producer, and the section outliving the producer's free |
+| `scripts/wc-dmabuf.sh` (Wine; the client draws each frame 15 ms *after* committing it and completes its own record) | 15 passed: 355 `wc_gpu_fence_v1.wait`s, the compositor held all 355 commits until the frame was done, the bar where the last frame put it |
+| `scripts/sv-pool-e2e.sh` | PASS |
+
+**What is not done.** The compositor's wait blocks its thread (bounded); a
+commit held without blocking would need the surface code. Zink's export and
+the memory fd that follows are paired per thread, by order; a Mesa that asked
+for them in another order would leave the sync page at the previous frame.
+The consumer-to-producer ordering (a producer writing again while
+another session still reads) is as good as the order the GPU process sees the
+marks in. Plasma's clients still need the NixOS side (104.6) to run inside
+`sv-drm ns` with the ICD's environment.
+
+### 104.12 What the compositor pays per frame
+
+2026-10-19, branch `kwin-gpu-zc-comp`. 104.8 measured the guest's compositor
+at 34–35 % of a core under OpenGL against 16–20 % under QPainter, and put it
+down to a read of the whole section at every commit.
+
+**It was not the read.** `present` copies only the commit's damage out of the
+client's buffer into the surface's staging shadow, for a section as for every
+pool. The staging shadow is per surface, and a commit's damage is relative to
+the surface's previous content, which is what that shadow holds, so no
+per-buffer arrears are needed here (the proxy needs them, §27.4, because its
+copies are per buffer). KWin damages its layer with `damage_buffer` and the
+frame's damaged region (`wayland_layer.cpp`). The full-frame work came after
+the read: `compose_tree` recomposited the window's whole tree into its shadow
+at every commit (KWin's 1264x713 black root, a single pixel stretched by a
+viewport, and the 1264x713 layer over it), blending a translucent layer pixel
+by pixel, and `WM_PAINT` handed the whole shadow to `SetDIBitsToDevice`.
+Locally, in KWin's shape with a 64x64 change at 60 fps, that cost 3 % of a core
+with opaque frames and 15–17 % with translucent pixels in the layer. An OpenGL
+framebuffer can carry alpha below 1 where QPainter's frames are opaque; that
+would explain the guest's difference, and was not measured there.
+
+**(a1) Only the damage is recomposed.** `Window::composed` keeps the shape the
+shadow was last composited from: the canvas, and each drawn surface's place,
+size and format. While a commit leaves that shape as it was, only the commit's
+damage is recomposed. `Shadow::compose_stack` recomputes each rectangle from
+the staging shadows alone, and it is the same function the whole canvas is
+drawn with, so a part cannot disagree with the whole, and overlapping
+rectangles give the same pixels. A changed shape, or a change with no damage to
+name (a view, a removed subsurface, a geometry), is recomposed whole.
+`WM_PAINT` hands GDI only the band of rows the update region spans.
+
+**(a2) A window whose picture is one buffer is drawn from that buffer.** The
+conditions: the committing surface is the topmost of a mapped toplevel whose
+caption is not folded, covers the canvas exactly, with no viewport, scale or
+transform between buffer and surface; the tree is as it was last composited;
+the buffer is `Xrgb8888`, or `Argb8888` over nothing but opaque black single
+pixels (premultiplied over black is the buffer's own colour, and GDI draws a
+window opaque); its pool is a `Section` or a `SharedFile`, rows and offset
+DWORD-aligned. KWin's primary layer over its black root is that case. Then
+nothing is read. The section is opened once per buffer
+(`wc_handle::Handle::open_section_object`, readable and writable because GDI
+refuses read-only sections; GDI is its only user and only reads it), the UI
+thread makes a DIB section over it (`CreateDIBSection(…, hSection, offset)`,
+`stride / 4` pixels wide so padded rows fit), selects it into a memory DC and
+`BitBlt`s the update region.
+
+Such a buffer is not released at its commit, because `WM_PAINT` can draw from
+it at any time. The buffer it replaced is released when the UI thread answers
+the `ToUi::Direct` that replaced it (`FromUi::DirectShown`; the answers come in
+order). KWin's swapchain keeps two or three buffers and expects the one shown
+to be held. Leaving the path (any other commit, a changed tree, a DIB that
+could not be made) re-reads the surface's staging shadow whole from the buffer
+still held, recomposites the window whole, and only then tells the UI thread to
+draw the shadow, so it never draws a shadow that is not yet the picture.
+Popups (layered windows), folded captions, and every other pool (arena slices,
+memfds) stay on the shadow, and `WC_DIRECT_PRESENT=off` puts every window
+there.
+
+**How to tell which path a window took.** One log line per window whenever
+it changes:
+
+    wc-compositor: window 1 is drawn directly from its client's buffer, which this process does not read (surface 17, 1280x720 Argb8888, stride 5120, offset 0)
+    wc-compositor: window 1 is drawn from its shadow: <why>
+
+`<why>` is the first condition above that failed. The frame trace's
+`wc.present` and `wc.paint` lines carry `direct=1` on the direct path.
+
+**Measured locally**, under Wine on Xvfb, release builds: the compositor
+process's CPU (utime + stime of the Wine process, `/proc`) over 20 s at 60 fps,
+two runs each. `scripts/wc-dmabuf.sh` with `WC_DMABUF_BENCH="NBUF FMT SQ
+SHAPE"` runs it: a 1280x720 window, three buffers in `/dev/shm` sections used
+as KWin's swapchain uses them (reused only after release, each repainting what
+it owes), an SQ x SQ square moving, only it damaged. `kwin` is KWin's shape (a
+black single pixel, the frames in a subsurface over it); `argbt` is
+translucent.
+
+| shape, damage | before | (a1) | (a1) + (a2) |
+|---|---|---|---|
+| one surface, xrgb, 64x64 | 2.3 / 1.9 % | 1.7 / 1.5 % | 1.5 / 1.2 % |
+| kwin, xrgb, 64x64 | 3.1 / 3.1 % | 1.7 / 1.3 % | 1.5 / 1.5 % |
+| kwin, argb, 64x64 | 3.2 / 4.3 % | 1.1 / 1.3 % | 1.8 / 1.4 % |
+| kwin, argbt, 64x64 | 17.5 / 15.0 % | 2.7 / 1.3 % | 1.8 / 1.4 % |
+| kwin, xrgb, 720x720 moving | 5.2 / 5.2 % | 5.8 / 4.7 % | 3.3 / 3.2 % |
+| kwin, argbt, 720x720 moving | 12.4 / 11.8 % | 6.9 / 8.2 % | 3.0 / 3.5 % |
+
+With little damage, (a1) already does what (a2) does; what remains, about
+1.5 %, is the per-commit work around the pixels (the Wayland dispatch, the
+frame callback, a log line per commit). With much damage, (a2) halves (a1),
+because nothing of the frame is copied on this side. Xvfb stayed under 1.1 %.
+Numbers: `/mnt/datasets/builds/evidence/kwin-gpu-zero-cost/`.
+
+**Checked.** A unit test that a stack recomposed in parts, overlapping parts
+included, is the stack recomposed whole. `scripts/wc-dmabuf.sh`: 13 of 13 (it
+now takes the direct path). `WC_DMABUF_BENCH_CHECK=1`: the compositor's last
+frame dump and the screen (Xvfb's root window) are the client's last buffer
+pixel for pixel, on both paths, in both shapes, opaque and translucent; with
+`toggle` (a buffer in the other format every 50th frame and last) the window
+left the direct path and came back 11 times in 4 s, and the last frame, drawn
+right after leaving, was exact on screen too.
+
+**With §104.11's fence.** A commit held for `wc_gpu_fence_v1.wait` is
+processed only after the wait returns, so when the record said done, the
+direct path, which reads the buffer later still (at `WM_PAINT`), never sees an
+unfinished frame. A wait that gave up (`Late`) or could not wait (`Refused`)
+lets the commit go on unfinished; that client's next buffer commit is then
+drawn from the shadow ("drawn from its shadow: its GPU frame was not done when
+it was committed"), unless the record got there meanwhile
+(`gpu_fence::Unfinished`, unit-tested), and the next commit of that surface
+reads the late commit's damage again, from a buffer that is complete there:
+without it, the part of the late frame's change that the next frame does not
+damage stayed stale on screen (measured: a 64x4 strip). `scripts/wc-dmabuf.sh` with
+`WC_DMABUF_FENCE=1 WC_DMABUF_FENCE_LATE=N` and a bench makes every Nth frame
+miss the 100 ms limit and checks that each such commit fell back.
+
+**On the guest, still to see.**
+
+1. The log line for KWin's window. "Drawn from its shadow: …" names the
+   condition that failed.
+2. That `OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE)` on the GPU
+   process's section succeeds (same user, default DACL, so it should), and
+   that `CreateDIBSection` accepts the section the Intel driver imported. If
+   either fails, the log says "its section could not be opened for GDI" or
+   "cannot be drawn from its client's buffer: CreateDIBSection failed", and the
+   window stays on (a1).
+3. The compositor's CPU by 104.8's method, and the picture: correct, no
+   tearing, the caption and frame unchanged.
+4. Whether GDI's reads of those pages are slow: they are imported into the
+   GPU's device as host memory, and whatever cache attribute the driver gave
+   them, the compositor's `BitBlt` now reads them where `present` read them
+   before.
+
+| gate | result |
+|---|---|
+| `cargo test -p wc-compositor -p wc-handle` | 238 and 55 passed, 0 failed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `cargo clippy -p wc-compositor -p wc-handle` (Linux, `--all-targets`, and the Windows target) | no warning in a line this branch wrote |
 
 ## 105. Windows without ssh: the session boots from the device's header page, and every byte crosses on its rings
 
@@ -33936,6 +34459,339 @@ with full suites alongside as load.
   the whole suite at 32 threads). The test now uses an owned region, and
   `soundring::spawn`'s thread keeps the `Control` alive as long as it runs: 24
   parallel suite runs, 0 failures.
+
+### 105.14 An isolated request: the hop timeline, and what each hop cost
+
+105.13's numbers were for requests that followed each other. The user's bound
+is for every request, and the common one is the opposite: a click after the
+machine sat idle, which finds every thread on both sides parked and every
+core in an idle state. Measured on the guest before this section
+(installation `wcivs`, session 0, release build, `rtt`):
+
+| gap between requests | mean | p50 | p90 | p99 |
+|---|---|---|---|---|
+| none (back to back) | 21.3 µs | 18.6 | 21.6 | 40.2 |
+| 20 ms | 694.9 µs | 418.8 | 1496.3 | 1943.3 |
+| 1 s | 1061.5 µs | 922.1 | 1683.0 | 3614.2 |
+
+**The instrument.** `WC_HOP_TRACE=FILE` (`%p` is the pid) makes a process
+stamp each hop of a request with the machine's monotonic counter in
+nanoseconds (`frametrace::hop`: a counter read and a push under an
+uncontended lock; a thread of its own writes the file every half second).
+The guest's stamps are `QueryPerformanceCounter`, the host's
+`CLOCK_MONOTONIC`, which is also what bpftrace's `nsecs` reads, so the
+proxy's stamps line up with a kernel trace of the same run
+(`scripts/wc-hop-host.bt`: wakeups, the C-state each woken thread's CPU
+came out of, KVM's halt wakeups, and the one-byte bell reads and writes of
+QEMU, the hub and the proxy). The two machines' clocks are fitted from the
+back-to-back runs before and after each measurement, where both sides spin:
+per request the guest writes the ring (g1), the proxy reads it (h1) and
+answers (h2), and the guest sees the answer (g2); the fastest tenth gives
+the offset to 0.2 µs, and the line through two such runs follows the drift,
+which was 40–100 ppm between QPC and the host's slewed monotonic clock.
+`scripts/wc-hop-timeline.py` and `scripts/wc-hop-host.py` print the tables
+below. The harness that drives the guest (session 0 only, one lease per run)
+and every run's raw data are kept out of the repository, with the evidence.
+
+Stamps, in order: `L.send`/`L.recv` (the launcher around one request),
+`C.line` (the compositor has read the request from the launcher's socket),
+`C.ringtx0`/`C.ringtx1` (around writing it into the control ring),
+`bell.poke` (the doorbell rung), `bell.wr0`/`bell.wr1` (the old detached
+writer thread around its `WriteFile`) or `bell.issued` (the new inline
+write issued), `door.rx` (a doorman read a bell byte), `P.unpark`/`P.rx`/
+`P.tx` (the proxy's control thread woke, read the request, wrote the
+answer), `C.park`/`C.unpark`/`C.reply` (the compositor gave up spinning,
+was woken, saw the answer), `C.socktx` (the answer written to the
+launcher's socket).
+
+**Before**, 20 ms between requests (µs after `L.send`; p50 and mean):
+
+| hop | p50 | mean |
+|---|---|---|
+| the compositor's request thread wakes on its socket (`C.line`) | 39.7 | 45.2 |
+| request in the ring, bell rung (`bell.poke`) | 44.5 | 50.1 |
+| the detached writer thread wakes and starts its `WriteFile` (`bell.wr0`) | 105.3 | 407.6 |
+| the proxy's doorman has the byte (`H:door.rx`) | 308.4 | 550.2 |
+| the proxy's control thread is awake and has the request (`H:P.rx`) | 366.6 | 593.1 |
+| the answer written (`H:P.tx`) | 369.7 | 609.7 |
+| the compositor sees it (`C.reply`); 154 of 500 had stopped spinning at 1 ms and waited for a bell back | 384.8 | 664.3 |
+| the launcher has it (`L.recv`) | 418.3 | 693.2 |
+
+At 1 s between requests the same hops were 61.6 (the compositor's wake),
+389 (the writer thread's wake, mean 598), 608 (the doorman), 660 (the control
+thread), 793 (the compositor) and 859 µs (the launcher; mean 1050).
+
+The host's half, from the kernel trace (815 requests that found the proxy
+parked; p50/mean):
+
+| hop | p50 | mean |
+|---|---|---|
+| QEMU's main thread woken by the vCPU's kick (ioeventfd) until it runs | 2.6 | 4.4 |
+| QEMU's virtio-serial work until it writes the byte to the hub | 33.1 | 32.3 |
+| the hub's reader woken and running | 5.5 | 15.5 |
+| the hub reads the byte, then sends it to every client in turn | 6.0 + 20.1 | 6.7 + 26.0 |
+| the proxy's doorman woken and running | 24.9 | 41.1 |
+| the doorman reads the byte, rings the lane (`door.rx`) | 10.1 | 17.3 |
+| the control thread woken by the doorman's futex wake and running | 17.3 + 6.4 | 32.3 + 10.2 |
+| **QEMU woken to the proxy reading the request** | **156.6** | **184.5** |
+
+The CPUs those threads ran on came out of C1 or C2 almost every time
+(the hub and the proxy on the host's two user cores, 14–15; C3, with its
+1 ms exit latency, in 4%), so this was not the deep idle states 105.13
+suspected. It was the number of thread wakes in a row, each a few to tens
+of microseconds on a core that had been idle and clocked down, on both
+machines.
+
+**What changed, hop by hop.**
+
+1. **The guest's bell is written by the thread that rang it** (Windows
+   only: `winpipe::AsyncWriter`). The detached writer (§99.5) handed every
+   bell byte to a thread of its own, and on an idle guest that thread's
+   wake was the slowest hop on the guest: 61 µs p50 at 20 ms gaps, 318 µs at
+   1 s, with a tail past a millisecond. The ringing thread now issues the
+   overlapped `WriteFile` itself (the virtqueue kick happens inside that
+   call) and never waits for it: the request and its byte live in one of 32
+   slots until the write completes, which the next write notices. A pool
+   whose writes all still pend (a host end that stopped draining) has them
+   cancelled and the byte refused, which the bell counts as dropped as it
+   counted a full queue; §99.5's promise, that a port that stops draining
+   never stops a ring thread, is kept with no thread. The call itself costs
+   20–50 µs on the guest (vioser's request path and the kick's exit).
+   `WC_BELL_INLINE=0` puts the detached writer back, to compare.
+2. **The hub rings the lane itself** (shared: `bellhub::DirectRings`,
+   `--port UPSTREAM=HUB,rings=FILE`). The hub already reads every byte the
+   guest rings; the lanes' wake words are in the ring region at the tail of
+   the shared-memory file, which the hub maps as the proxy does, and a
+   `FUTEX_WAKE` on a shared file mapping reaches a waiter in any process that
+   maps the file. So the waiting thread is woken by the hub's own thread,
+   and the two wakes after it (the proxy's doorman, then the doorman's futex
+   wake of the waiter: 71 µs p50, 90 mean, from the hub's read to the control
+   thread being woken) are gone from the path. The clients still get every
+   byte; for a futex waiter their wake is a spurious one, and a waiter that
+   waits some other way (the proxy's eventfd per Wayland connection) still
+   needs it. The hub attaches only the ring layout
+   (`Control::attach_for_bells`: the protocol's ids are read from the region,
+   the layout is checked as for any attach), follows the header's run id to
+   a new compositor, and rings nothing while the file has no rings.
+   `bellhub::tests::the_hub_wakes_a_lane_waiter_in_a_shared_file_with_no_client`.
+3. **The hub lets the thread it woke run first** (shared, Linux host). The
+   kernel trace showed the proxy's control thread, once the hub woke it,
+   waiting a median 60 µs for a CPU: in 40 of 41 traced requests the
+   scheduler had put it on the hub's own CPU (the wake is "affine"), where
+   the hub went on to send the byte to every client. The hub now yields
+   once after ringing a lane that had a waiter parked on it, before the
+   fan-out; with nobody waiting, the yield returns at once.
+4. **Every wait for an answer yields while it spins, and only the side that
+   must spin does** (shared). 105.13's spins were busy loops. On the guest a
+   busy spin held its vCPU against the very thread it was waiting for (the
+   launcher spinning kept the compositor's request thread off the vCPU, and
+   two busy spinners on one vCPU lost it for a 15.6 ms tick). The
+   compositor's wait for the host's answer now yields (`SwitchToThread`) for
+   up to 2 ms (it was a busy 1 ms; a third of the 20 ms-gap requests used to
+   outlast it and need a bell back), and the proxy's 200 µs spin yields
+   too. The launcher no longer spins at all: on a loaded guest its yielding
+   spin and the compositor's shared a vCPU and lost it to the load for
+   10–25 ms. `WC_LAUNCH_SPIN_US` and `WC_CTL_SPIN_US` set them, to measure.
+5. **Tried and taken out: the request's threads above normal priority.** On
+   a guest loaded by a game, 7 requests in 2000 took 2–53 ms, all of it the
+   guest's scheduler (a readied thread waiting one or two 15.6 ms ticks for
+   the quantum of the thread running where it was queued). Raising the
+   launcher's and the compositor's request threads to
+   `THREAD_PRIORITY_HIGHEST` for the request, and yielding with `Sleep(0)`,
+   made it worse: a high-priority thread that spins starves the
+   normal-priority threads the request needs. Measured in one lease, 1000
+   requests 20 ms apart and 60 1 s apart per configuration:
+
+   | bell writer | request threads | 20 ms: mean / p50 / p99 / max | 1 s: mean / p99 |
+   |---|---|---|---|
+   | inline (this section) | HIGHEST | 255 / 160 / 567 µs / 35 ms | 322 / 834 µs |
+   | **inline (this section)** | **normal** | **180 / 158 / 353 µs / 8.8 ms** | **298 / 470 µs** |
+   | detached thread (before) | HIGHEST | 440 ms / 480 ms / 612 ms / 2.0 s | 56 ms / 501 ms |
+   | detached thread (before) | normal | 310 / 160 / 1387 µs / 47 ms | 481 / 868 µs |
+
+   With the detached writer the starved thread was the bell writer itself,
+   and the bell then went out with the next lease ping, half a second
+   later. The change is not kept; what the loaded guest's ticks cost is
+   left to the guest's own scheduling.
+
+**Which hops are whose.** For another platform (the real Mac, §103.17):
+
+| hop | where it lives | platform |
+|---|---|---|
+| the launcher's request to the compositor (a local socket) | `wc-launch`, `session_svc` | Windows only: on macOS the launcher and the main process are one |
+| the compositor's thread wakes on that socket | guest scheduler | Windows only |
+| the bell's write (vioser `WriteFile`, the kick) | `winpipe` | Windows (a virtio-console write and its kick on Linux/libkrun) |
+| the hypervisor carrying the kick to the host's port (QEMU's main loop: 33 µs here) | QEMU | QEMU; HVF/libkrun on the Mac has its own |
+| the hub reading the byte and ringing the lane | `bellhub` | shared |
+| the waiting thread's wake | `park`, `wlbytes` | shared (a futex on Linux, a shared word on macOS) |
+| the answer back while the asker spins (no bell) | `session_svc`, `macsvc` | shared |
+| a yielding spin, never a busy one, on the side that expects the answer | `session_svc`, `macsvc` | shared |
+| the hub yielding to the thread it just woke (the wake is affine) | `bellhub` | Linux hosts; any host whose hub and proxy share few cores |
+| a guest freeze while the passed-through GPU leaves D3 (up to ~6 s, about once a minute) | the guest's GPU driver, vfio | this VM; samples within one are set apart below |
+
+**After.** The same instrument on the final build (test installation
+`wcil`, shared compositor, release, session 0). At 1 s between requests,
+p50 µs after `L.send`:
+
+| hop | before | after |
+|---|---|---|
+| the compositor's request thread has the request | 61.6 | 55.0 |
+| request in the ring, bell written | 389 (the writer thread's wake) | 104.8 (`WriteFile` issued inline) |
+| the compositor sees the answer | 793 | 247.2 |
+| the launcher has it | 859 | 275.0 |
+
+On the host, from the hub's read of the byte to the control thread being
+woken: 71 µs p50 before, 10 µs after; and the thread then ran on the
+other core instead of waiting for the hub's fan-out.
+
+**Measured.** One lease, one guest state, master at the merge base
+(bc19340) against this branch, each deployed in turn to the same test
+installation, hop trace off:
+
+| | master bc19340 | §105.14 |
+|---|---|---|
+| 20 ms between requests (n = 1000): mean / p50 / p99 | 487 ms / 480 ms / 503 ms | 268 / 141 / 363 µs |
+| 1 s between requests (n = 200): mean / p50 / p99 | 57 ms / 405 µs / 685 ms | 317 / 262 / 1341 µs |
+| idle, 60 s with the session up: the guest's compositor / the host's proxy | 0.72 s / 0.32 s CPU | 0.22 s / 0.33 s CPU |
+
+Master's 480 ms is a parked proxy answering on its 500 ms slice: since the
+shared compositor (§107), a byte through the proxy's own doorman no longer
+wakes the control thread. Here the hub wakes it, which is why this branch
+does not show it; the plain path is a separate fix.
+
+The larger runs, with the hop trace on, so that every sample can be placed
+against the GPU's power transitions (`scripts/wc-hop-stats.py`). The statistics
+script converts both ends of each request with the timeline's fitted clock
+offset and drift. It refuses GPU-wake attribution without a clock fit; RTT
+statistics without a wake file still work with guest stamps alone. The
+machine-readable fit is available through `wc-hop-timeline.py RUNDIR
+--clock-json`. Regression checks run with `python3 scripts/test-wc-hop-stats.py`.
+Reanalysis of `final-c` with this conversion leaves the table below unchanged:
+
+
+| gap | n | mean | p50 | p99 | max | within a GPU wake (set apart) |
+|---|---|---|---|---|---|---|
+| none | 2000 | 20.0 µs | 19.4 | 30.1 | 187 | 0 |
+| 20 ms | 2000 | 240.0 µs (257.1 outside the wakes) | 144.7 | 604.7 | 53 ms | 295, mean 140.9 |
+| 20 ms, final configuration | 1000 | 180.2 µs | 158.0 | 352.8 | 8.8 ms | not traced |
+| 1 s | 300 | 306.7 µs | 275.0 | 812.9 | 5.4 ms | 32, mean 309.0 |
+| 1 s, final configuration | 60 + 200 | 298–317 µs | 262–287 | 470–1341 | 5.5 ms | not traced |
+
+The mean target is met back to back and in the 180.2 µs final-configuration
+20 ms run. The larger 20 ms run fails it at 240.0 µs, despite its 144.7 µs
+median. The 1 s mean also fails at about 300 µs. Where it goes is in
+the timeline above: on the guest ~105 µs before the request is in the
+ring (a thread's wake on a halted vCPU and the vioser write), ~140 µs
+through QEMU, the hub and the proxy and back, and ~30 µs for the
+launcher's wake. The means at 20 ms also carry the guest's own scheduling
+outliers (a game in session 1 had them at 2–53 ms, 7 in 2000), which no
+change on our side removed (item 5).
+
+**Idle CPU.** Nothing added spins or polls while idle: every spin is
+bounded by an outstanding request, and the hub's yield runs only when a
+byte rang a parked lane. Host: hub 0.01 s and session service 0.02 s per
+minute, as before.
+
+**What is left on the path, and why it is not software here.** The kick
+reaches the host through QEMU's main loop: its main thread is woken by the
+vCPU's ioeventfd, runs virtio-serial's handler and writes the byte to the
+hub's socket (33 µs of work on an idle P-core, and on a loaded guest that
+loop also runs the guest's audio and display: with a game playing sound the
+byte reached the hub 8–11 ms after the guest wrote it in about 1 request in
+50). The guest's `WriteFile` through vioser costs 20–50 µs. Both go with a
+different doorbell, which needs the VM to restart and is proposed, not done:
+
+* **An ivshmem doorbell** (`ivshmem-doorbell` with an `ivshmem-server`, or
+  `ioeventfd`/`irqfd` registered for the arena device): the guest rings by
+  one MMIO write (the driver's `IOCTL_IVSHMEM_RING_DOORBELL`), KVM signals an
+  eventfd the hub (or the waiter itself) reads, and the host rings back by
+  writing an eventfd KVM turns into the guest's MSI-X, with no QEMU thread
+  and no virtio-serial queue on either way. Expected saving per isolated
+  request: QEMU's wake and work (~35 µs, and the main loop's tail on a busy
+  guest), the hub's socket hop (~12 µs) and most of `WriteFile` (~20–40 µs).
+  It needs the guest's ivshmem driver to bind interrupts (the virtio-win
+  driver does), nix-config's VM definition to add the server and the
+  device's `vectors`, and a VM restart at a time the family does not use it.
+
+**Host power, measured and not taken.** The host's cores clock down when
+idle (`powersave`, EPP `balance_performance`); a wake runs the first
+microseconds slowly. `energy_performance_preference = performance` on every
+core cut the 1 s-gap mean from 536 to 262 µs before the software changes,
+and costs ~10 W more package power on this laptop (turbostat, 30 s each:
+15.2 W as it is, 27.2 W with it). Scoped to the host's two user cores
+(14–15, where the hub and the proxy run) it cost 17.0 W, within this
+machine's run-to-run noise (17.3 W after restoring), and its latency gain
+after the software changes was lost in the guest's own load. Neither is
+proposed: the software changes are, and a host-wide power setting for a
+family laptop is the user's call.
+
+**The teardown bug** (found on wcl-12128, 18:00 on 2026-10-19). A NixOS
+switch re-executed the user's service manager while a session ended.
+`systemctl --user is-active` failed during the re-execution, the service
+read the failure as "the proxy's unit is gone" and ran `down`; every
+`systemctl --user stop` in `down` failed the same way and was silenced;
+`down` removed the session's directory, said "down ok", and the service
+forgot the session. Its PulseAudio and GPU units ran on with nobody left who
+knew their names. Now:
+
+* the service asks `is-active` for the state and ends a session only when
+  the manager says `inactive` or `failed`; no answer is no decision
+  (`sessiond::classify_is_active`);
+* `down` stops each unit and then asks for its state, retrying while the
+  manager does not answer (`WC_LAUNCH_STOP_TRIES` tenths of a second, 10 s),
+  and fails, keeping the directory and naming the units, if any is still
+  running;
+* the service forgets a session only after a `down` that worked, and on the
+  macOS front end releases nothing to the guest before that, since the units
+  may still write into its RAM (§103.15).
+
+Tests: `down_stops_every_unit_even_while_the_manager_re_executes` and
+`down_that_cannot_stop_the_units_fails_and_keeps_the_session` (the real
+script against a stand-in `systemctl` that refuses like a re-executing
+manager), `a_session_is_forgotten_only_after_a_down_that_worked`.
+
+**The cold start.**
+
+* **`up` in the service's own process** (`sessiond_ivshmem::up_inline`,
+  called from `agent::start_session`): the header page read and checked,
+  `arena.run`, `transport` and `session.index` written, the same words
+  back, 0.2–0.5 ms where the script took 58–75 ms. It steps aside to the
+  script whenever a broker hands out the arena (§111) or no hub is
+  running, and `WC_SESSIOND_BASH_UP=1` forces the script.
+  `up_in_process_matches_the_script` runs both on one header and compares
+  their output and files, for a plain and an indexed session.
+* **The `proxy` verb before its unit starts: 74–78 ms to 17 ms.** It
+  scanned the store for PipeWire's node binary in a session whose sound is
+  PulseAudio (25–35 ms), asked systemd for the doorbell twice, and forked
+  some twenty `cat`, `grep`, `id` and `date`. The verb now stamps its
+  stages into `proxy.timing`, which the service puts in its log line.
+* **Tried and put back: not waiting for the session's PulseAudio.** With
+  `proxy` returning before the server listened, the guest's sound ring
+  announced its device first and the proxy made no sink for it
+  (`scripts/wc-no-ssh.sh`, leg 1b). The guest numbers below were measured
+  in that state; the wait is back, and its cost is whatever PulseAudio's
+  start takes beyond the proxy's own (both start together). They are to be
+  measured again.
+
+Measured on the guest (test installation `wcil`, whose application is
+`foot`, so the window's own start is shorter than Firefox's):
+
+| stage | before | after |
+|---|---|---|
+| the service's `up` | 58–75 ms | 0.19–0.34 ms |
+| the service's `proxy` | 163–260 ms | 107–147 ms (script 21–30, unit started 49–78, socket bound 68–109, rings 84–122) |
+| the service's `gpu`, beside `proxy` | 124–217 ms | 112–132 ms |
+| the host's answer, from the record | 226–338 ms | 123–150 ms |
+| the launcher's session up, nothing running | 409–498 ms | 290–321 ms |
+| the launcher's session up, the shared compositor running | — | 137–159 ms |
+| click to window, nothing running | ~850 ms (Firefox) | 435 ms (897 the first time after a deploy, cold disk caches) |
+| click to window, a new session in a running compositor | — | 286–376 ms |
+| click to window, the session up | 532–659 ms (Firefox, 105.9) | 129–165 ms |
+
+What is left is `systemd-run` (~35 ms) and the proxy's own start to its
+socket (~35 ms). Units started ahead of the click, or socket-activated,
+would take both out of the path; that changes how sessions own their
+units, and is not done here.
 
 ## 106. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
 
@@ -34483,6 +35339,7 @@ to wc-proxy. A one-session page is served exactly as before.
 ```text
   boot<TAB>session=ID<TAB>install=NAME<TAB>key=PATH<TAB>control=PATH
       [<TAB>gpu=1][<TAB>audio=VOL][<TAB>nested=1][<TAB>relaunch=DIR]
+      [<TAB>taskbar=NAME[:APP,…]]          (§92.12)
                          -> ok located INDEX MESSAGE  |  err WHY
   wait ID                -> ok ended WHY        (blocks until session ID ends)
   sessions               -> ok INDEX:INSTALL:ID:STATE:MiB/REGIONS ...
@@ -34498,7 +35355,11 @@ locally 0.2–0.95 s each.
 proxy claims with are the session index (`with_session`, `session_of`);
 0 is the one-session proxy, so an older proxy's ids read as session 0. The
 service tag (top byte `0x5C`) and the low bits are unchanged.
-`OWNER_ARENA = SERVICE_TAG | 3` is new: the session's arena slot.
+`OWNER_ARENA = SERVICE_TAG | 4` is new: the session's arena slot. (It was `| 3` until
+the guest showed it: 3 is `OWNER_HOSTINT`'s, reserved since §103.14, so with host
+integration on a session's `grow` was answered with hostint's `hello` and no client
+got a buffer. `SERVICE_OWNERS` lists every service id and a test keeps them apart;
+`wc-multi-install.sh` leg 9 runs the compositor with `--hostint`.)
 
 **The arena slot** (proxy: `wc_proxy::barwin`; compositor:
 `session_svc::serve_arena`), one line each way:
@@ -34538,8 +35399,12 @@ The proxy reads the geometry from the region, so the host side needs no flag.
 * **Nested-compositor globals** (§102): created always on a shared
   compositor and offered only to the sessions whose boot said `nested=1`
   (`smithay::wayland::set_nested_filter`, a `can_view` on the three globals).
-* **The relaunch directory** (§92): one per booted session, searched in
-  boot order (`taskbar::add_relaunch_dir`), removed with the session.
+* **The relaunch directory** (§92): one per booted session, removed with the
+  session. Since §92.12 a window's file is looked up only in the directory of
+  the session whose installation owns its identity
+  (`taskbar::Registry::relaunch_dirs`), not in every directory in boot order.
+* **The taskbar identity** (§92.12): the session's installation's, from the
+  boot's `taskbar=` scope (`taskbar::identity_in`).
 * **The output** is the desktop's work area for every session: one desktop,
   one monitor. A per-session `--output` was not needed by any installation.
 * **The linger**: a session whose last connection left `--exit-when-empty`
@@ -34624,8 +35489,11 @@ Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
      shared compositor with it (the job breakaway).
 * **Sound** is per session: each session's sound ring opens its own waveOut
   device; Windows mixes them. Not heard on the guest yet.
-* **Pins and jump lists** (§92) of two installations that publish the same
-  application id share one taskbar identity, as they did before.
+* **Pins and jump lists** (§92) are per installation since §92.12: the boot
+  line's `taskbar=` scope names the session's installation, and its windows,
+  shortcuts, relaunch files and jump list carry
+  `Waycompose.install.<installation>.<app>`, except where deploy kept the old
+  identity for the one installation whose pin has it.
 * **The output** is one for every session (107.4).
 * **A crashed proxy's windows close.** Its session's clients are disconnected
   when the session ends, as a crashed compositor's always were.
@@ -34697,6 +35565,861 @@ caught it.
   the session ends by its linger ("its last client left 4 s ago"). The race
   that left a feed behind did not happen on this machine in the run without
   the fix either; the unit test is the reproduction.
+
+### 107.11 A session's service threads outlived it and read the next owner's slot
+
+Branch `stale-service-threads`, 2026-10-20, from master `8bdac97`. Found in the
+guest's reopen round of 2026-10-19 (evidence in
+`/mnt/datasets/builds/evidence/multi-install/hostint-stale-bug/`).
+
+**What was seen.** In a reopen round, foot of a new session connected on ring
+slot 18, which had been vkcube's session's hostint slot, and never made a
+window. The compositor never logged `hostint: the channel ended` for any
+session that had ended.
+
+**The cause.** A session's hostint thread read its slot until the proxy wrote
+the end of stream. `end` marks a session's service slots `DEAD` and
+quarantines them, but the proxy of an ended session often writes no end of
+stream, and the hostint reader never looked at the slot's state. When the
+quarantine (10 s) ran out, `RingLink::reap` recycled the slot, the next claim
+made it `Live` again, and the old thread, still reading the same lane, took
+the new owner's bytes. The arena thread had the same shape: it looked at
+`sess.ended()` only after a 100 ms wait. The control channel was safe: `end`
+takes it away (`Ctl::close`). So was sound: `soundring::spawn` ends on `DEAD`.
+
+**The fix.** Every per-session service thread stops when its session ends,
+and a slot is never recycled while one of them may still read it.
+
+1. **A reader registry** (`ringlink::SlotReader`). `session_channel` hands out
+   one with each service channel: control, sound, arena and hostint. The
+   thread holds it until it will touch the ring no more. `RingLink::reap`
+   recycles no slot that has a reader, whatever its quarantine says.
+   `session_channel` also closes a channel found after its session ended, so
+   a service that was still waiting for its slot does not leave it open.
+2. **hostint stops by either signal.** `hostint::RingLink` ends when its owner
+   says stop (the session ended), or when the slot is `DEAD` with nothing left
+   to read, as well as on the end of stream. `serve_windows` and
+   `serve_logging` serve on the session's own thread, so the reader is held
+   until the serving returns. The Windows handlers thread checks once a second
+   whether the channel has ended. The log names the slot:
+   `hostint: the channel ended (slot N)`.
+3. **The arena thread** stops on `DEAD` too (`service_over`).
+
+**Tests.**
+* `hostint::reopen_tests`: a session's hostint thread is served as
+  `session_svc` serves it, and the session ends by the session end, by `DEAD`,
+  or by both. The thread must stop and give up its reader, and the slot then
+  comes back. The next session's client claims it and sends 256 KiB, which
+  must arrive whole and in order. A slot with a reader is not recycled. With
+  the stop and `DEAD` checks taken out, all four fail ("the session's hostint
+  thread is still reading slot 1").
+* `scripts/wc-multi-install.sh` leg 10, the reopen
+  (`WC_MULTI_ONLY_REOPEN=1` runs it alone). Session x stays up the whole leg,
+  sessions y and o open, both close, x opens a client, and session n opens on
+  their old slots: its first client lands on o's old hostint slot. Before the
+  fix: neither ended session's hostint thread said the channel ended, n got
+  no arena region, and its window never mapped. After the fix: both threads
+  stop within about 200 ms of the downs, and n's control, arena, hostint and
+  window all work.
+
+**Also on this branch.**
+* `CLICK-TO-WINDOW never` with a shared compositor. The cold path counted
+  mapped windows in the installation's own compositor log, which has none
+  when the session joined the user's compositor. The launcher now reads the
+  session's log, and with a shared compositor it counts only its own session's
+  toplevels: the compositor logs `xdg_toplevel created (#N) -> window W of
+  session S`, and the state file keeps `session-index` from the `boot`
+  answer (`plan::count_mapped`, `plan::boot_index`).
+* `wc-launch.sh deploy`: the generated `wc-launch.ini` had `` `slots` `` in an
+  unquoted heredoc, which ran `slots` as a command. It is escaped now. The
+  install check also accepts a never-run installation: the icon and the jump
+  list come from the host over a session's control ring, so before the first
+  session they are reported as pending (`no session to ask`, nothing cached)
+  instead of failing. The relaunch file is still required.
+* `scripts/wc-no-ssh.sh` leg 5 ("no ring port at all") raced its own harness.
+  The host end's socat loop, with `unlink-early`, could make `host.sock` again
+  just after the leg removed it. The session then found a doorbell socket,
+  and the proxy never said it polls. This failed twice in a row on this
+  branch, and passed once on master by timing. The leg now stops the loop and
+  its listener first.
+
+**Gates**, after the merge of master. `cargo test --workspace --no-fail-fast`: 115 binaries, 3329 passed,
+0 failed, 9 ignored. `cargo clippy --workspace --all-targets`: no error, no
+warning in a file this section changed. `cargo check --workspace --target
+x86_64-pc-windows-gnu` and the macOS check of `wc-launch` and `wc-compositor`:
+exit 0. `scripts/wc-xref.sh --list`: exit 0. `scripts/wc-multi-install.sh`:
+OK, all ten legs. `scripts/wc-no-ssh.sh`: OK in every run after the leg 5 fix (five).
+
+## 108. Shared memory that grows and shrinks: one region protocol, and a Windows guest that lends its own RAM
+
+Branch `windows-guest-ram`, from master `3955922`, 2026-10-19. The brief
+(user, 2026-10-19): "it's rather important that the shared memory can be
+dynamically allocated and deallocated as needed and that we are not fixed at a
+specific size", and "128 MB are not enough. We need to be able to use the GPU
+properly." Any number of applications must fit together. A client that asks
+for more than exists gets a lazy yes (the proxy backs `wl_shm` pools on
+demand, another branch). §97.3 already showed that the ivshmem devices cannot
+grow at run time without pinning more host RAM, which the host does not have.
+
+This section has two halves:
+
+* **108.1–108.6, the region protocol.** It is substrate-independent: the
+  GPU pool (§97) and the Wayland arena (§107) both grow and shrink through it,
+  whatever backs the memory: a BAR, the Windows guest's RAM, or a real Mac's
+  POSIX shm chunks (§103.17, role (b)).
+* **108.7 onwards, the Windows substrate.** Large-page sections in the guest's
+  RAM, held by a keeper, and located by the host with one probe per 2 MiB.
+
+The protocol was written first so that the other substrates can be built
+against it in parallel. Everything marked *measured* below has a number from a
+run; the rest is the specification.
+
+### 108.1 Words
+
+* **Pool**: an allocator that hands out ranges to sessions. Today there are two:
+  `sv_arena::pool` (the GPU pool, §97) and the compositor's `BarPool` (the
+  Wayland arena, §107). A pool offset is `region << 32 | offset` (§97.4).
+  Region 0 is the **bootstrap**: memory both sides have from the start (an
+  ivshmem BAR on Windows, the arena file in role (b), the guest-RAM window on
+  macOS role (a)).
+* **Region K** (K ≥ 1): memory added to a pool at run time and removed again.
+  One region is one substrate allocation, freed only as a whole.
+* **Provider**: the side that owns the region's memory and frees it. It is
+  always the pool's owner: the guest's GPU process or compositor on Windows,
+  and the Mac's GPU server or main process in role (b).
+* **Peer**: the side that maps the region from across the VM boundary. It is
+  one service per pool, the only writer of the peer half of the table (108.2).
+  Every other process on the peer's side that maps any byte of a region holds a
+  **mapping lease** from that service.
+* **Substrate**: what backs a region, and how the peer finds it. One `kind`
+  per substrate (108.3).
+
+### 108.2 The region table
+
+A 32 KiB block in the pool's bootstrap memory, at an offset each pool
+publishes (108.6). Every field is little-endian. Each half of each entry has
+exactly one writer, so no word is written from both sides of the boundary.
+
+```text
+table header, 128 bytes
+  0   magic "SVRGN001"                       provider, written last at start
+  8   u32 version (1)                        provider
+  12  u32 entries (255)                      provider
+  16  u64 provider run id                    provider; a new owner, a new id
+  24  u64 provider beat                      provider, +1 at least every 250 ms
+  32  u64 peer run id                        peer
+  40  u64 peer beat                          peer, +1 at least every 250 ms
+  48  u64 want bytes                         peer: "a host-side caller is short"
+  56  u64 want seq                           peer, +1 per new want
+  64  u64 budget bytes                       provider: what it may still add
+  72  u64 epoch counter                      provider (the last epoch it used)
+  80  48 bytes reserved, zero
+
+entry i (1..=255), 128 bytes, at 128 * i
+  provider half
+    0   u32 pstate   0 EMPTY, 1 ANNOUNCED, 2 RETIRING      written last
+    4   u32 kind     108.3
+    8   u64 epoch    unique per announce in this provider run, never 0
+    16  u32 region   K, the pool's region index (1..)
+    20  u32 flags    bit 0: an orphan adopted from a dead provider run (108.5)
+    24  u64 len      bytes, a multiple of the kind's unit
+    32  64 bytes     the kind's handle (108.3)
+  peer half
+    96  u32 qstate   0 NONE, 1 MAPPED, 2 REFUSED, 3 UNMAPPED  written last
+    100 u32 reason   a code from 108.4 when REFUSED
+    104 u64 epoch    the provider epoch this answer is for
+    112 u64 peer time of the answer, µs (frametrace::mono_us)
+    120 u64 reserved
+```
+
+A table is valid only while the header's magic, version and provider run id
+match the ones the peer saw at attach. A changed run id is a provider restart
+(108.5).
+
+**Wakes.** Any write that the other side must act on is followed by one bell
+token, `0xFB` `REGION_TOKEN` ("a region table changed"), on the pool's own
+doorbell: `svbell` for the GPU pool and `wcbell` for the Wayland arena. The
+rescan rule of §103.14 applies. Every open, reopen, `RESCAN_TOKEN` and every
+beat timer tick (250 ms) rereads the whole table, so a lost token costs at
+most 250 ms and never a stuck region. The table is 32 KiB, so a reread costs
+microseconds.
+
+### 108.3 Kinds and handles
+
+| kind | substrate | handle (64 bytes) | unit | how the peer finds it |
+|---|---|---|---|---|
+| 1 `BAR` | a range of an ivshmem BAR beyond the bootstrap | u64 offset into the device's file | 1 MiB | opens the device's file by name and maps `offset` (§107's `ivshmem_window`); stamps checked once |
+| 2 `WIN_LARGE` | a Windows large-page section in guest RAM (108.7) | 16-byte nonce, u32 units, u32 keeper id, u64 0 | 2 MiB | **`Locator::Probe`**: reads one 64-byte stamp every 2 MiB of the RAM backend (108.9); every unit found exactly once, or REFUSED |
+| 3 `WIN_AWE` | AWE frames (reserved, not built: 108.8) | u64 offset and u64 length of an out-of-line frame list in the bootstrap | 4 KiB | translates the frames through the flat view (`PfnLocator`) and checks each stamp |
+| 4 `MAC_SHM` | role (b): a POSIX shm object of the Mac, which libkrun maps into the guest as the DAX range of a tag file in the virtio-fs share (xattr `user.krun.shm=/krun.NAME`), cacheable and coherent | 32 bytes: the shm name (`/krun.NAME`, NUL-padded); 32 bytes: the tag file's name in the share (NUL-padded). No window offset: the guest finds the region by path | the object (64 MiB chunks) | the Linux guest opens and maps the tag file; the Mac maps the object by name |
+| 5 `FILE` | a range of a plain shared file (tests; the Linux guest of §71) | u64 offset | 4 KiB | maps the file at `offset` |
+
+A kind the peer does not know is answered `REFUSED`/`KIND`. New substrates
+add a kind; the table does not change.
+
+### 108.4 The life of a region
+
+```text
+ provider                                  peer
+ ────────                                  ────
+ allocate the substrate, stamp it
+ fill the entry, epoch = ++counter,
+ pstate = ANNOUNCED            ── 0xFB ──▶ locate, map, verify the stamps
+                                           qstate = MAPPED (or REFUSED + reason),
+                               ◀── 0xFB ── epoch echoed
+ pool.add_region(K, len)
+ ... leases in K ...
+ K empty for the shrink delay:
+ pool.drain(K); pool.remove_region(K)
+ pstate = RETIRING             ── 0xFB ──▶ every mapping lease of K returned
+                                           (or its process dead), its own view
+                                           unmapped
+                               ◀── 0xFB ── qstate = UNMAPPED, epoch echoed
+ free the substrate
+ pstate = EMPTY
+```
+
+Rules, each one there for a failure it prevents:
+
+1. **Nothing is leased in K before `MAPPED` for K's epoch.** A lease the peer
+   cannot reach would be a session that hangs on its first write.
+2. **A region is retired only when it holds no lease.** The pool's `drain`
+   stops new leases in K first. Nothing live is ever moved: the pool does not
+   copy, so a region that never empties is simply never retired.
+3. **The keeper rule: the provider frees the substrate only after `UNMAPPED`
+   for that epoch.** No timeout replaces the acknowledgement. A peer that never
+   answers keeps the memory allocated, which wastes memory and corrupts
+   nothing. §103.15 shows what a timeout costs: the macOS guest panicked
+   three times out of three when the proxy wrote for its 5 s lease into pages
+   the guest had already reused.
+4. **The peer answers `UNMAPPED` only when no process on its side can touch
+   K.** Every process that maps a byte of K holds a mapping lease from the
+   peer service: a connection whose end means "unmapped or dead". A process
+   that unmaps replaces the range with an inaccessible reservation
+   (`PROT_NONE`), never with nothing, so a stale pointer faults in its own
+   process instead of reaching a page the guest has reused. The peer waits
+   for every lease. If one is held past 30 s, it logs the holder's pid and
+   keeps waiting; it never kills a process to finish a retire.
+5. **Epochs are never reused in a provider run**, and every answer echoes the
+   epoch, so an answer meant for an earlier occupant of entry i (or of region
+   K) is never taken for the current one.
+6. **REFUSED is final for that epoch.** The provider frees the substrate at
+   once (the peer mapped nothing) and may try again with a new epoch. Reasons:
+   1 `KIND`, 2 `NOT_FOUND` (units missing), 3 `DUPLICATE` (a unit found twice),
+   4 `LIMIT` (the peer's own limit, e.g. map count), 5 `MAP` (the mapping
+   failed), 6 `BUDGET` (larger than the peer allows).
+
+The peer never writes the provider half, and the provider never writes the peer
+half. A peer that restarts reads every entry again: it maps `ANNOUNCED`
+entries it has no record of and answers `MAPPED` again with the same epoch,
+and it answers `RETIRING` ones directly with `UNMAPPED` once its previous run's
+mapping leases have ended. It keeps those records in `$XDG_RUNTIME_DIR`, so a
+restart within one boot still knows the old run's leases.
+
+### 108.5 When a side dies
+
+* **The provider dies.** Its memory must outlive it. On Windows the keeper
+  holds it (108.10); on the Mac, whatever holds the chunk's name does. While
+  something holds it, a host write into the region lands in memory the guest
+  has given to no one else, so **the peer does not have to notice the death at
+  all**, and it has no timeout that could fire early on a provider that is only
+  slow. The next provider run of the pool **adopts** the dead run's entries: it
+  publishes its own run id and rewrites every live entry as `RETIRING`, with
+  `flags` bit 0 and the old epoch. The peer then lets go as for any retire, and
+  the new provider frees each region when `UNMAPPED` for its epoch arrives. If
+  no provider of that pool ever starts again, the memory stays held. That
+  costs memory, never correctness. A substrate whose memory the provider's
+  death frees at once (Windows AWE, a private `VirtualAlloc`) cannot satisfy
+  rule 3, so it is not allowed as a region's kind. The provider beat is for
+  the peer's logs and the user's status display only.
+* **The peer dies.** Nothing is freed while its acknowledgements are
+  outstanding. A new peer run reads the table and answers everything (108.4).
+  The provider keeps running and keeps leasing in regions that are `MAPPED`.
+  A host process that still maps them (a proxy) holds them alive, which is
+  correct.
+
+### 108.6 Policy, and the hooks in the two pools
+
+**Grow.**
+* **On demand.** A lease that does not fit in any region asks for a region of
+  `max(request rounded up to the unit, step)`. The lease waits for the answer
+  (one round trip plus the locate, 108.11) instead of failing. It fails with
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` (GPU) or `err` (arena slot) only if the
+  provider is past its budget or the peer refuses.
+* **Ahead of demand (high water).** After any lease, when free bytes across
+  all regions fall below `low_water = max(32 MiB, used / 4)`, one region of
+  `step` is announced in the background. The next lease then usually fits
+  without waiting.
+* **The step** is geometric: `step = clamp(used / 2, 64 MiB, 1 GiB)`. Two
+  small Firefox sessions cost one or two 64 MiB regions, and VulkanMod's
+  several hundred MiB cost two or three regions instead of fifty.
+* **The budget**, set by the provider and published in the header so the
+  peer can show it. On Windows, `min(the configured cap, available guest RAM −
+  reserve)`, with `reserve = max(1 GiB, 15% of guest RAM)`, read from
+  `GlobalMemoryStatusEx` at each grow. Windows itself never runs out because
+  of us. A grow that would cross it is refused, and the pool answers out of
+  memory as §97 does.
+* **The peer's want.** The peer (for example a host-side heap of the ICD, or
+  the proxy's lazy `wl_shm` backing) bumps `want bytes`/`want seq` when it
+  needs room the provider cannot see. The provider treats a new want like a
+  failed lease of that size.
+
+**Shrink.**
+* A region that has held no lease for **30 s** is retired. It must also be
+  that, without it, free bytes stay above `2 × low_water`, so a region is
+  not retired just to be announced again a second later (hysteresis).
+* At most one retire is in flight per pool, and none within 10 s of a grow.
+* **Packing.** New leases go to the lowest-numbered non-draining region with
+  room. Region 0 first, then the oldest regions, so the newest regions empty
+  first and are the ones given back.
+
+**The GPU pool (`sv_arena::pool`, §97).** The table is a 64 KiB lease of
+region 0, the pool's first lease, so it lands at +64 KiB. Its offset is
+published in the pool header's word 32 (`poolhdr::OFF_REGION_TABLE`). The
+header's pages 1–15 are the cold path's mailboxes, so the table cannot sit
+there; this section's first draft said offset 4096, which was wrong. The
+provider is the guest's GPU process (`sv_gpu_server::regions`), and the peer
+is `wc-arena-host ram-peer --table-off auto`.
+* A lease that does not fit grows the pool before it is refused
+  (`PoolServer::take`). A control region never leaves region 0, because the
+  host reads it from the boot device by offset.
+* The ICD gets region K from the broker (`find gpu.K`, 108.18): its
+  udmabufs and a lease, which it holds while it maps any of it (its mapping
+  lease). When its last lease in K is freed it unmaps to `PROT_NONE` and
+  closes the broker lease.
+* `MAX_REGIONS` went from 8 to 64, and only region 0 keeps the 64 KiB
+  header.
+
+**The Wayland arena (§110's one pool).** The shared compositor runs the GPU
+pool in its own process, and the Wayland arena leases from it (§110). So the
+Wayland arena grows through the **same** table: no second table, no second
+provider, and one budget for both.
+* GPU-pool region k ≥ 1 is arena region 1 + k (`GpuRegion::lease_in`,
+  `replace_pool_region`), and a grant in it is answered `ok ID region 1+k
+  OFFSET LEN`.
+* The proxy maps such a window from the parts of `gpu.k` the broker gives
+  it, and holds a broker lease per window (`ProvidedRegion::ram_window`).
+* Wayland leases grow the pool as GPU leases do (`PoolServer::lease_growing`).
+* §110.4's arena table (the arena's first 64 KiB, announced at header byte
+  2048 as `"WCRGNTB1"`) stays reserved and unwritten. It is for a substrate
+  that is not the GPU pool's.
+* The BAR shrinking to a bootstrap is a VM configuration change. It is
+  108.14's, not this branch's.
+
+**Role (b) (the real Mac).** The Mac's process is the provider with kind
+`MAC_SHM`, and the Linux guest's ICD and proxy are peers. The release order
+(corrected by the real-Mac session, 2026-10-19):
+1. the guest munmaps and closes the region;
+2. the guest **unlinks the tag file**, which is required, because virtio-fs
+   otherwise keeps the DAX range cached;
+3. libkrun unmaps the range;
+4. the guest acknowledges `UNMAPPED`;
+5. the Mac calls `shm_unlink` and unmaps for the last time.
+
+**Growth without waiting (built, after the first measurements).** The test
+VM showed large-page allocation tails of 1.6 s for 1 GiB and 3.1 s for 2 GiB
+(108.7): a lease that waits for such a grow stalls an application's frame.
+* The step is now at most **256 MiB** (`max_step`), and the low-water floor
+  is 64 MiB.
+* **Every lease wakes the region manager** (`regiontab::wake`), so it grows
+  ahead of demand at once rather than at its next 250 ms tick.
+* `PoolServer::take` logs each lease that had to wait for a grow.
+
+Measured with `sv-pool-grow-e2e.sh` (the same 1.9 GiB burst of 64 MiB
+blocks):
+
+| policy | regions | leases that waited for a grow | total wait |
+|---|---|---|---|
+| before (1 GiB steps, 32 MiB low water) | 14 | 10 | 31 ms |
+| 256 MiB steps | 21 | 13 | 40 ms |
+| 256 MiB steps + wake on lease | 22 | **2** (the first two, before anything could be ahead) | 5.8 ms |
+
+On Windows a grow is now at most a 256 MiB section: mean 17 ms, one
+outlier of 0.86 s in 754, against 2 GiB's mean of 381 ms and tail of 3.1 s.
+`SV_RAM_MAX_STEP_MIB` and `SV_RAM_LOW_WATER_MIB` override the sizes.
+
+**Shrink, one more rule (built).** A region idle for 5 minutes (`deep_idle_ms`)
+is retired even inside the low-water margin, so an idle pool gives back
+everything it grew. An orderly exit of the GPU process or the shared
+compositor (`regions::retire_all`) retires every empty region and waits up to
+5 s for `UNMAPPED`. Harnesses shorten the times with `SV_RAM_IDLE_MS`,
+`SV_RAM_DEEP_IDLE_MS` and `SV_RAM_CALM_MS`.
+
+### 108.7 The Windows substrate: what was compared
+
+| allocator | frames known to the guest | contiguity (measured) | survives its owner's crash | privilege | verdict |
+|---|---|---|---|---|---|
+| `VirtualAlloc` + `VirtualLock`, 4 KiB | no | ~44 KiB runs | no | none | **refused**: pages move under a lock (§84.5), and the 2026-10-15 hang (§84.7) happened on this path |
+| AWE, `AllocateUserPhysicalPages` | **yes**, raw guest PFNs | 2.8 pages per run, the worst measured (measured-gpu-side.md) | **no**: AWE pages belong to one process and are freed when it dies; no other process can map them | `SeLockMemoryPrivilege` | **refused**, see below |
+| AWE2 with `NONPAGED_LARGE` | yes | 1 page per run; satisfied 3992 of 16384 frames | no | same | refused (measured-gpu-side.md) |
+| `VirtualAlloc(MEM_LARGE_PAGES)`, private | no | 2 MiB pages, often 1 run per GiB on a fresh guest | no: private memory | same | refused for the same reason as AWE |
+| **pagefile section, `SEC_COMMIT \| SEC_LARGE_PAGES`** | no | 2 MiB pages, 2 MiB aligned; on this VM after hours of churn **2.4 runs per 2 MiB unit** (64 MiB → 27.7 runs, 2 GiB → 819) | **yes**: a section lives while any handle or view of it lives, in any process | `SeLockMemoryPrivilege` **in the creating process only**; a view in an unprivileged process works, with 2 MiB translations (`FILE_MAP_LARGE_PAGES` granted, measured) | **chosen** |
+| a KMDF driver (`MmAllocatePagesForMdlEx`, PFNs from the MDL) | yes | anything | yes | a signed driver: test signing is ruled out (hardware-constraints.md), an EV certificate and attestation signing are out of scope | refused |
+
+**Why not AWE, although it reports frames.** The keeper rule (§108.4 rule 3)
+needs the memory to outlive the process that uses it, until the host has let
+go. An AWE page is owned by exactly one process, cannot be mapped by any
+other, and is freed when that process dies. The GPU process is the one that
+must map the pages (it imports them into the Intel driver), and it is the
+process most likely to crash (§86.4, §86.5). An AWE region would be freed
+while the host still writes into it. That is the macOS panic of §103.15,
+with the Windows kernel's memory instead of Console's. Getting frames
+without a scan is worth nothing at that price. The large-page section also
+wins on the second axis: its runs are 2 MiB units and AWE's are 4 KiB frames.
+
+**What the section costs.** Windows assembles 2 MiB pages from free memory,
+which can be slow on a fragmented guest. Measured on the test VM over about
+5000 grows:
+* a mean of 52–66 µs per MiB from 32 to 512 MiB;
+* 120 µs per MiB at 1 GiB and 186 µs per MiB at 2 GiB;
+* tails of 0.86 s (256 MiB), 1.59 s (1 GiB) and 3.13 s (2 GiB), under three
+  sessions churning plus a canary.
+
+The keeper does the allocation, so a slow grow delays one lease and stalls
+nothing else (108.11, jitter). When no 2 MiB page is free, the call fails
+with `ERROR_NO_SYSTEM_RESOURCES` (1450). It never falls back to small pages,
+and the lease is then refused like any full pool.
+
+### 108.8 Locating without a scan: `Locator::Probe`
+
+A large page is 2 MiB aligned in guest-physical memory. QEMU maps guest RAM
+into its backend linearly per RAM block, at 2 MiB aligned offsets (`pc` and
+`q35`, below and above 4 GiB). So each unit of a region is one 2 MiB aligned
+run of the **backend file**.
+* The keeper stamps the first 64 bytes of every unit: magic `SVLP2M01`, the
+  region's 128-bit random nonce, the unit index, the unit count, and an
+  FNV-1a check (`sv_transport::lpstamp`).
+* The peer reads 64 bytes at every 2 MiB of the backend, 3072 reads for a
+  6 GiB guest and 5248 for testhost's 10.25 GiB. It never translates a
+  guest-physical address, so §5.1's flat-view table and R21's silent wrong
+  offset do not arise.
+* Every unit must be found **exactly once**. A unit found twice is refused
+  (`DUPLICATE`), never resolved by picking one: that is what a stale or forged
+  stamp looks like, and what §84.5's relocated pages looked like.
+* The peer then maps the runs (`SharedRegion::stitch`) and checks each stamp
+  again **through its own mapping**, before it answers.
+
+Nothing runs in the guest to locate: no PFN query, no SuperfetchPfnQuery, no
+sweep. The guest only writes 64 bytes per 2 MiB of its own memory.
+
+| region | units | runs (mean) | probe (mean / max) | map + verify (mean) |
+|---|---|---|---|---|
+| 32 MiB | 16 | 14.0 | 1.71 / 18.3 ms | 0.10 ms |
+| 256 MiB | 128 | 108.7 | 2.52 / 11.4 ms | 0.62 ms |
+| 1 GiB | 512 | 418.3 | 2.42 / 15.5 ms | 2.36 ms |
+| 2 GiB | 1024 | 819.2 | 2.35 / 7.4 ms | 4.27 ms |
+
+(Test VM, 6 GiB guest, about 5000 regions over the stress legs; the
+`[peer] MAPPED` lines in the evidence.) The probe is flat in the region's
+size, about 2 ms for the whole guest. That is three orders of magnitude below
+§5.1's 2 s sweep, which read every page.
+
+### 108.9 Announcing, and the round trip
+
+The guest's GPU process writes the entry and rings `0xFB` (on the test VM
+the instrument rang it on its own `svbell` port, with the host's peer
+connected to QEMU's chardev). The peer probes, maps, verifies, answers and
+rings back. The product's GPU process does not yet ring: its port belongs
+to the pool's doorbell (§110.3's per-range bells). Until then, its region
+manager polls the table at 200 µs while it waits, and the peer polls at
+1 ms. A grow is rare and dominated by the keeper's allocation, so this costs
+little. It is listed in 108.15.
+
+| measured (test VM) | value |
+|---|---|
+| announce → `MAPPED`, 32–128 MiB | mean 6.5–8.2 ms (the probe, the map, and the 1 ms poll on each side) |
+| announce → `MAPPED`, 256 MiB–2 GiB | mean 20–112 ms, tails to 3.4 s: queued behind other regions' fills in the instrument's host writer |
+| retire → freed (peer unmaps, answers, the keeper closes the section) | p50 9.8 ms, p90 49 ms, max 1.39 s (Windows zeroing GiBs of large pages), n = 4926 |
+| on Linux (`sv-pool-grow-e2e.sh`, no instrument writer): announce → `MAPPED` | 1.7–4.5 ms |
+
+### 108.10 The keeper
+
+`sv-guest ram keeper`, one per guest, running as **SYSTEM** (on the test VM
+a SYSTEM scheduled task; in a product install a service).
+* **Privilege.** LocalSystem holds `SeLockMemoryPrivilege`, so the user's
+  account needs no new right. Measured: the test user did not hold it, and
+  its views were granted 2 MiB translations anyway.
+* **Requests.** Lines on `\\.\pipe\waycompose-ram` (`hello POOL`, `alloc
+  BYTES`, `free ID`, `stats`), with an SDDL that admits SYSTEM,
+  administrators and every authenticated user. Talking to the keeper gives
+  access to nothing by itself.
+* **Who is asking.** At connect, the keeper reads the client's pid
+  (`GetNamedPipeClientProcessId`) and its token's user SID. A pool is the pair
+  (SID, pool name). Two Windows users with the same pool name have two
+  pools, and neither can adopt or free the other's regions.
+* **What it holds.** Each region is an **unnamed** section. The keeper
+  creates it, stamps it through a short-lived view, and keeps only the
+  handle. It passes the section to the asking process with `DuplicateHandle`
+  (to orphans' new owners too), so while the provider runs the memory has
+  **two holders**. The first build used named `Global\waycompose-ram-*`
+  sections with an SDDL admitting every interactive user. That let any
+  Windows user open another's regions. It was found in review (the shared
+  broker's owner) and replaced.
+* **The budget.** The keeper refuses a region that would leave Windows less
+  than `max(1 GiB, 15% of RAM)` available (`err budget`), or
+  `WC_RAM_RESERVE_MIB`.
+* **When a provider dies.** Its regions become orphans of its pool, still
+  held by the keeper. The next provider of **that user's** pool gets them in
+  `hello`. It adopts the table's entries as retiring (§108.5) and frees each
+  one after `UNMAPPED`. An orphan the table no longer lists has already been
+  let go by the host, so it is freed at once.
+* **A provider of another user** that maps the bootstrap after the owner
+  died finds the owner's entries in the table but gets no orphan from the
+  keeper. It marks them *foreign*: the host lets go, the entries are cleared,
+  and it frees nothing. The owner's next run then frees them at once.
+  Measured: user2 adopted two of `user`'s regions as foreign; the keeper
+  still held both (402 MiB); `user`'s next provider freed them.
+* **What becomes of this program.** The keeper's four operations (allocate,
+  hand over, free after `UNMAPPED`, adopt) become a module of the one
+  privileged Windows service the shared broker crate provides (§111,
+  branch `session-fixes`). This pipe server is the stand-in until then.
+
+
+**What is not covered.** A keeper killed together with every provider of a
+pool, before the host has let go: for example `taskkill /F` on both at
+once by an administrator, or a SYSTEM-level crash of the keeper while the
+provider also dies. Logoff does not end a SYSTEM process; a VM shutdown ends
+the host's interest too. The service install should set restart-on-failure,
+but a restarted keeper does not get its old handles back. This case is the
+one residual risk and is R43's.
+
+### 108.11 The test VM, and what it replicates
+
+| | testhost's guest | the test VM (`winvm` clone `wcram`) |
+|---|---|---|
+| QEMU | `qemu-host-cpu-only-battery-10.2.2` (`55ry51j4…`, testhost's patches 0001–0005) | **the same store path** |
+| guest RAM | `memory-backend-memfd,share=on`, 10496 MiB | `memory-backend-memfd,share=on`, 6 GiB |
+| pinning | vfio pins every page (VmLck = RAM + both BARs); balloon inhibited | `prealloc=on` and **no balloon or free-page reporting** (a user cannot `mlock` 6 GiB here: `ulimit -l` 8 MiB): every page populated, none ever discarded |
+| machine | `pc` (i440fx), 12 vCPUs, the Intel iGPU by vfio | `q35` (the golden image was installed on it), 4 vCPUs, no GPU passthrough, `virtio-vga` |
+| ivshmem | arena 128 MiB, GPU 1 GiB, the Looking Glass B7 signed driver | one 64 MiB bootstrap device, the same driver |
+| doorbells | `svbell`, `wcbell` | the same two ports |
+| Windows | 11, build 26200, the daily user's | 11 24H2 (26100), debloated golden image, a throwaway overlay |
+
+**What differs, and why it does not change the verdicts.**
+* Without vfio, nothing translates guest pages for a device. The pages here
+  are pinned by QEMU, not by the IOMMU, but in both cases they never move in
+  the backend, which is what the host's mapping relies on.
+* `q35` against `pc`: the probe never translates addresses, so the below-4 GiB
+  split and its holes do not enter.
+* The Intel driver's import of a **section view** as a host pointer is
+  **not tested here** (no Intel GPU). §87.3 measured it for an ivshmem view
+  and measured-gpu-side.md for private large pages. A section view is a
+  third kind of VAD and is the first thing to check on the real guest (108.14).
+
+### 108.12 Measured on the test VM: stress
+
+Every leg ran with a 512 MiB **canary** in the guest: ordinary memory, filled
+with a seeded pattern, checked every 2 s and reallocated every 20 s, so that
+frames freed by a region are soon the canary's. A host write into a freed
+frame shows up there as a changed word. A **jitter** monitor ran at
+time-critical priority (a `sleep(1 ms)` loop; only a system-wide stall delays
+it). A host **watchdog** made an ssh round trip into the guest and read
+QEMU's run state every 3 s. The host's peer wrote every mapped region's
+counters every millisecond until told to stop.
+(`scripts/wc-guestram-stress.sh`; logs in
+`/mnt/datasets/builds/evidence/windows-guest-ram/`.)
+
+| leg | what | result |
+|---|---|---|
+| GiB alloc/free/realloc | three sessions cycling 256 MiB, 1 GiB, 2 GiB regions: grow, the host fills every byte, the guest checks every word, the guest writes back, the host checks, retire, free | 16–18 grows, 12–16 GiB per leg; **0 bad words** in either direction, ever |
+| many sessions | 8 and 16 sessions, 32–128 MiB regions, 48 grows per leg | all verified, 0 errors |
+| crash | the provider killed (`TerminateProcess`) 4–9 s into a run, with two regions mapped and the host writing their counters; 5 s of host writes into the keeper-held orphans; a new provider adopts them | every time: 2 orphans held, adopted, freed only after `UNMAPPED`; **canary clean** |
+| memory pressure | for 10 min, a hog in the 6 GiB guest touched 4 GiB three times per round while three sessions cycled 256 MiB–1 GiB regions. Windows paged (pagefile peak 3992 MiB). 599 grows (308 GiB) were filled and checked, 394 were refused by the budget, 1 by `ERROR_NO_SYSTEM_RESOURCES`. Alloc p50 46 ms, max 2.58 s. **0 bad words, canary clean**, worst stall 61.8 ms, ssh 2.6 s during the thrash |
+| long run | 65 min (gib, sessions ×8, crash, pressure in turn): **345 legs, 1035 checks, 0 FAIL**. 5684 grows, 1551 GiB allocated, filled and checked. 86 provider kills under host writes, every one adopted and freed after `UNMAPPED`. Canary 6046 checks, **0 corrupt words**. Watchdog 3341 probes, 0 missed. (The long run's own pressure legs ran one cycle per session, a harness bug that is fixed; the 10-minute leg above is the pressure evidence) |
+| guest health | the watchdog: no missed probe in the whole run; ssh round trip 0.35–1.8 s (the shared host's load was 28–38 on 32 threads) |
+| stalls | idle: the worst `sleep(1 ms)` per minute 1.5–7.4 ms; under the legs: no stall over 20 ms except 54 over 205 minutes, the worst 60–62 ms, all while the host's load was 28–38 on 32 threads (vCPU preemption); idle minutes stayed under 7.4 ms |
+| first run, normal-priority monitor | stalls of 60–94 ms. They came from the instruments' own verify threads saturating 4 vCPUs (a time-critical monitor showed none in the same load), not from the allocator |
+
+**Throughput.** The host filled regions at 5.4 GB/s (mean over 5103 fills,
+a volatile 8-byte store loop). The guest checked them at 23.3 GB/s.
+
+### 108.13 Measured: the GPU pool and the Wayland arena grow past their devices
+
+**`scripts/sv-pool-grow-e2e.sh`** (Linux, lavapipe, a 64 MiB boot pool, a
+3.5 GiB file as guest RAM, scattered stamped 2 MiB units):
+
+| check | result |
+|---|---|
+| a VulkanMod-sized load: 64 MiB host-visible blocks until refused, every block checked | **30 × 64 MiB = 1920 MiB** (the session cap, ¾ of 64 MiB + 2560 MiB), then `VK_ERROR_OUT_OF_DEVICE_MEMORY`, every block intact |
+| the pool's growth | 10 regions, 64 → 542 MiB each (the geometric step), 2.6 GiB in all; probe 0.8–3.7 ms, map + verify 0.06–0.6 ms, announce → `MAPPED` 1.7–4.5 ms |
+| Zink and vulkaninfo beside it | frames good, llvmpipe listed |
+| giving back | 30 s after the load freed everything, **while it still lived** (its ICD had unmapped each region and let go of its lease file), 9 of 10 regions retired one per 250 ms and were freed after `UNMAPPED`; the tenth stayed as the low-water margin until the deep-idle time |
+| a second load | grew the pool again (270–760 MiB regions) |
+| lost devices, refusals | none |
+
+**`scripts/wc-multi-install.sh` leg 8** (one pool, §110):
+* the setup: a 32 MiB BAR and a 64 MiB GPU pool, served by `sv-guest wayland
+  … --with-gpu pool-guest --grow-ram …`, with the peer;
+* three installations' clients took 96 MiB pools; the GPU pool grew by one
+  region, and a Wayland grant landed in it as arena region 2;
+* the proxy mapped that window from the peer's run list, and four windows
+  were mapped;
+* after `down` and the compositor's exit, the region went back after the
+  host's `UNMAPPED`.
+
+### 108.14 testhost: what a guest run would need (proposed, not done)
+
+Nothing in this section has touched testhost. What a run there needs, in
+order:
+
+1. **Only a broker reaches guest RAM (user decision, 2026-10-19).** Today
+   QEMU runs as root, and its memfd is reachable only through
+   `/proc/<qemu>/fd` as root (checked read-only via sudokey: fd 37,
+   `memfd:memory-backend-memfd`, root 0600; VmLck 11927424 kB = RAM + 128 +
+   1024 MiB).
+   * **The plan:** QEMU runs as a dedicated `windows-vm` user. It needs group
+     kvm (for `/dev/kvm` and `/dev/udmabuf`) and `wc-arena`, udev ownership of
+     the vfio group nodes, `LimitMEMLOCK=infinity` (vfio accounts RAM and both
+     BARs, about 11.4 GiB), pre-created tap devices owned by it, and its QMP,
+     chardevs and ivshmem files.
+   * The broker runs as the same user. It is the only party that opens the
+     memfd and `/dev/udmabuf`.
+   * Clients (the ICDs, the proxies, all of them the desktop user) receive
+     udmabufs of exactly their regions over the broker's socket (108.15).
+     They never open the memfd, `/proc/<qemu>` or `/dev/udmabuf`.
+   * `udmabuf.size_limit_mb=4096` on the kernel command line, at the reboot
+     the next kernel needs anyway, makes one udmabuf per region.
+   * A nix-config change and a planned cold restart of the VM. Rollback: the
+     previous generation and a restart.
+   * Not built until the vmhost test passes and the coordinator approves.
+2. **The keeper as a service** (`sv-guest ram keeper`, LocalSystem,
+   restart on failure) in the guest. No change to the guest user's account rights.
+3. **The peer inside the broker daemon** (108.18), with
+   `--guest-ram-qemu-pidfile` and `--guest-ram-user mapped`.
+4. **`--grow-keeper`** on the guest's GPU process (or the compositor's
+   `--with-gpu`), with a budget.
+
+**The first guest run, for the user to decide:**
+* while the guest is idle, under the lease, with the health watchdog;
+* the keeper alone first (one 64 MiB region, located, mapped, retired,
+  freed);
+* then one Intel import of a section view (`vulkaninfo` through a grown
+  pool; the R19-style check of 108.11);
+* then a single Firefox window grown past the device;
+* stop at the first unexpected line.
+
+### 108.15 Per-region handles: udmabuf, and a broker that alone holds guest RAM
+
+**The requirement (user, 2026-10-19).** No client may get a handle that
+reaches beyond its regions. An fd for QEMU's RAM memfd reaches the whole
+guest. A broker running as its own system user (the VM's user) is the only
+party that holds guest RAM, and clients ask it for their regions.
+
+| per-region handle | verdict |
+|---|---|
+| **udmabuf** (`UDMABUF_CREATE_LIST` over the sealed RAM memfd) | **chosen**: a dma-buf of exactly the region's runs. The kernel refuses any mapping beyond them, it is zero-copy, and it costs no host RAM (the pages are the memfd's, already pinned by vfio) |
+| guest RAM split over several QEMU backends or NUMA nodes | refused: Windows decides where a large-page section lands, so no backend is ever one region |
+| virtio-mem | refused for handles: still one backend fd (it works with vfio through `RamDiscardManager`, and Windows has `viomem`; worth keeping in mind for host RAM that is pinned only when plugged) |
+| a hot-plugged ivshmem device per region | refused: new pinned host RAM and root's QMP (§97.3) |
+| per-region copies made by the broker | refused: not zero-copy |
+
+**Measured preconditions.**
+* QEMU's memfd is sealed `F_SEAL_SEAL|SHRINK|GROW`, not `WRITE`, which is
+  what udmabuf requires (checked on the test VM's QEMU, the same build as
+  testhost's).
+* `/dev/udmabuf` exists on vmhost and testhost (root:kvm 0660,
+  `CONFIG_UDMABUF=y`). On both, `list_limit` is 1024 and `size_limit_mb` is 64.
+  `sv_ram::udma::plan` cuts a region into parts within those limits (a 2 GiB
+  region of 1024 scattered units becomes 32 parts), and the client maps them
+  side by side at the region's fixed address.
+
+**Proven** (`sv_ram::udma` tests, run as root and as an ordinary user in a
+minimal VM on vmhost's own kernel: `/mnt/datasets/builds/wcram/initramfs`,
+`evidence/…/udmabuf-vm.log`):
+* as root (the broker's role), a udmabuf of two out-of-order ranges of a
+  sealed memfd maps them in that order;
+* a write through it lands in the memfd;
+* a mapping larger than the udmabuf is refused;
+* as uid 1000 (a client), `/dev/udmabuf` cannot be opened.
+
+**The broker** is the client-side role of the shared broker crate
+(`wc-broker`, branch `session-fixes`), not a daemon of this branch. This
+branch provides the substrate:
+* `sv_ram::peer` reads the table, locates, maps, verifies and answers;
+* `sv_ram::udma` makes the per-region handles.
+
+What the broker exposes to clients:
+* `open_region(pool, k) → {epoch, len, [(fd, offset, len)]}`, checked by
+  `SO_PEERCRED` uid: a region belongs to the host user its pool serves, and
+  root;
+* a lease per (region, epoch), released by message or by the connection
+  closing (liveness by pidfd), which gates `UNMAPPED`;
+* a push of "retiring k" to lease holders.
+
+This is built (108.18). The run lists and lease files the ICD and the proxy
+used before were a stand-in, and they are gone. The clients' mapping code
+stayed as it was: `map_fixed` per part, and `PROT_NONE` on release.
+
+**Revocation** is by lease: a dma-buf cannot be revoked. A process of the
+same uid that keeps a udmabuf past its release can still write the region.
+R43 accepts that: one host user is one trust domain.
+
+**Address stability** (user requirement: the GPU pins this memory).
+* **Guest:** a region is the keeper's large pages, never paged or moved
+  (§84.5: 0 of 16384 moved). A region retires only when it holds no lease,
+  and every Vulkan import is per lease and freed before its range goes back.
+  So no GPU import ever outlives its pages' place.
+* **Host:** every mapper maps region k at a fixed place for the region's
+  whole epoch: the ICD at `k × 4 GiB` of its reserved pool view, the proxy in
+  its window, the peer in its view. Nothing remaps a region.
+* **Tests:**
+  * `pool::tests::regions_stay_put_while_others_come_and_go_and_a_leased_region_cannot_retire`:
+    the base and the lease's bytes stay put across four other regions added
+    and three retired, a retire is refused while the lease lives, and control
+    leases stay in region 0;
+  * `peer::tests::a_mapped_region_stays_at_its_address_while_others_come_and_go`:
+    the host's view of a region keeps its address and content across 15 other
+    regions mapped and retired.
+
+### 108.16 Not done, and not proven
+
+* **The broker**: built and proven in a VM (108.18). One gap remains: a
+  lease taken in the last beat before the daemon crashes is not in its
+  record.
+* **The Intel driver's import of a large-page section view** (108.11).
+* **The GPU process does not ring `0xFB`**; both sides poll while a region
+  is in flight (108.9). Ringing needs §110.3's per-range port lookup to give
+  the region manager the pool's port.
+* **A keeper service install** with restart-on-failure; the test VM used a
+  scheduled task. It becomes a module of the shared Windows service (108.10).
+* **The kept-keeper residual** (108.10): a keeper and every provider of a
+  pool killed together before the host lets go.
+* **The arena BAR shrinking to a bootstrap**: a VM configuration change, for
+  the user.
+* **The peer's own restart** (the broker daemon's): handled by its record
+  of regions and holders (108.18). It answers an inherited region only when
+  every recorded holder has exited. The peer itself never writes into a
+  region, so its own lost views need no record.
+
+### 108.17 Gates
+
+At the commit that adds this subsection (master `f0b85c3` merged in):
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 116 binaries, **3272 passed, 0 failed**, 9 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this section wrote or changed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-xref.sh --list` | every citation resolves |
+| `scripts/sv-pool-grow-e2e.sh` | PASS (108.13) |
+| `scripts/wc-multi-install.sh` (legs 1–8) | `wc-multi-install: OK`; leg 8 is this section's |
+| `scripts/wc-guestram-stress.sh` on the test VM | 65-min long run and the 10-min pressure leg OK (108.12); the cross-user leg by hand (108.10) |
+| `sv_ram::udma` tests as root and as uid 1000 in a minimal VM | pass, and refused, as they should be (108.15) |
+
+Evidence (logs only, outside the repository):
+`/mnt/datasets/builds/evidence/windows-guest-ram/`.
+
+### 108.18 The broker hands out guest RAM: built, and proven in a VM
+
+Branch `windows-guest-ram`, 2026-10-20, with `broker` (§111) and
+`broker-host` (§111.10) merged in. This replaces the stand-in that 108.13's
+harnesses used: run lists (`{device}-{k}.ram`) naming QEMU's whole RAM memfd,
+and lease files.
+
+**Who holds what.**
+* **The broker daemon** (`wc-arena-host sessiond --broker`, broker-host's
+  daemon) runs as its own system account. That account alone may open
+  `/dev/udmabuf` (group `kvm`), and only it shares the QEMU process's uid,
+  so only it reaches the RAM memfd through `/proc/<qemu>/fd`. It embeds the
+  guest-RAM component, `sv_ram::brokered::GuestRamComponent` (a
+  `wc_broker::host::Embedded`), made from its `--guest-ram-*` flags.
+* **The component** runs the peer loop (`sv_ram::peerloop`: the doorbell,
+  the reconnect, the beat). For each region the guest announces:
+  * it locates, maps and verifies the region, as before;
+  * it cuts the region into udmabufs (`sv_ram::udma`) and checks each one
+    against its own view;
+  * it publishes the region in the broker as pool `gpu.<k>` for the pool's
+    one host user (`--guest-ram-user UID`, or the user the live sessions run
+    as);
+  * only then does it answer `MAPPED`.
+* **A client** (the ICD, the proxy) asks `find gpu.<k>` on its process's
+  broker connection. It gets the udmabufs and a lease, maps each part at its
+  fixed place (the ICD at `k × 4 GiB` of its pool view, the proxy in its
+  window), and closes its fds. The mapping keeps the pages. After it unmaps
+  (`PROT_NONE`), it `close`s the lease.
+* **On `RETIRING`** the component retires the region in the broker: no new
+  `find` gets it, and its holders are told. It answers `UNMAPPED` only once
+  the broker reports the region drained (`on_drained`), which needs every
+  lease ended by `close`, by its connection, or by its process's exit. Then
+  the broker's own udmabufs are closed, and the guest frees the region.
+* **A pool may reuse a region index** while the old epoch still waits for a
+  holder. Published regions are keyed by (index, epoch). `find` returns the
+  newest live one, and each epoch is answered on its own.
+* **The daemon's own restart.** The component records every published
+  region in its state directory: its runs, and its holders as (pid, start
+  time), written at publish and in every beat in which they change. A new run
+  publishes the recorded regions the table still holds, so their holders can
+  find them again. It answers one only once the new broker has drained it
+  *and* every recorded holder has exited (`broker::holders`, §111). Not
+  covered: a lease taken in the last beat (250 ms) before a crash. A hook
+  that runs before a lease's fds are sent would close that gap. It has been
+  asked of the broker's owner.
+
+**The daemon needs QEMU's uid and gid.** `/proc/<qemu>/fd` is open only to
+a process that passes the kernel's ptrace access check, which needs the same
+uid *and* gid. The first run of the GPU-pool VM test had the pool's process
+in another group: the daemon found "no memfd" and the pool never grew. So
+testhost's `windows-vm` account runs both QEMU and the daemon, with one
+primary group.
+
+**The client role never touches a raw resource.** It has no group
+membership and no ACL. A udmabuf reaches exactly its region's pages, and
+the kernel refuses a mapping past them. Clients of another uid get nothing:
+`find` is checked by `SO_PEERCRED` uid.
+
+**The NixOS VM test** (`scripts/wc-guestram-vmtest.sh`,
+`nix/vmtest-guest-ram.nix`). It runs on vmhost's KVM and touches nothing of
+testhost.
+* **The machines.** The VM has 1 GiB. Inside it, a nested QEMU guest with
+  320 MiB, 64 hugetlb pages of 2 MiB, and the RAM as a sealed memfd; a 1 MiB
+  ivshmem bootstrap holds the table.
+* **The users.** The nested QEMU and the daemon run as `wcbroker` (group
+  `kvm`). `alice` is the pool's user; `bob` is another client.
+* **The guest's provider** (`sv-ram-vmtest provider`) stamps hugetlb pages
+  exactly as the Windows keeper stamps large pages (`sv_ram::hugesub`, a test
+  substrate). It keeps the GPU pool's lease rules (`sv_arena::pool`). The
+  test driver commands it through a control page in the shared bootstrap,
+  with no network.
+
+| subtest | result |
+|---|---|
+| growth | 32 MiB region found by the probe (105 µs, 2 runs), mapped and verified (56 µs), published as `gpu.1` for uid 1001 as one udmabuf; announce → `MAPPED` 9.2 ms |
+| zero copy | alice's client mapped it, saw the guest's pattern in every unit, wrote its own; the guest saw it in all 16 units |
+| isolation | bob's `find gpu.1` refused; alice cannot open `/dev/udmabuf`, QEMU's memfd through `/proc/<qemu>/fd/N`, `/proc/<qemu>/mem`, the bootstrap file or the daemon's files, nor list `/proc/<qemu>/fd`; she is not in `kvm` |
+| growth and shrink | 64 and 16 MiB more (located in 188 and 109 µs); region 2 mapped by alice, let go, retired, `UNMAPPED`, freed |
+| address stability | alice's mapping of region 1 kept its address and bytes over 80 checks across two more regions mapped and one retired; region 3 over 57 checks across a daemon restart |
+| a retire refused while the guest holds a lease (an import stand-in) in the region | `retire 1: region: still holds leases` |
+| a retire held by a host lease | `retiring` for 3 s and no `UNMAPPED` while alice mapped it; `UNMAPPED` and freed once she unmapped and closed |
+| the daemon restarted while alice mapped region 3 | the new run published it again (her pid and start time from the record), held the retire "for the previous run's holders" although its own broker had no lease, and answered once her process ended |
+| the guest | no region refused, the nested VM alive throughout |
+
+**The GPU pool end to end** (`scripts/sv-pool-grow-e2e.sh`, now a VM test
+too, `nix/vmtest-pool-grow.nix`). The pool-guest runs as `wcbroker` on
+lavapipe and grows from a sealed memfd (`--grow-ram memfd:MIB`). The client
+user's ICD gets every grown region from the broker.
+
+In a 1.5 GiB VM with a 768 MiB budget:
+
+| check | result |
+|---|---|
+| the load: 64 MiB host-visible blocks until refused, every block checked | 9 × 64 MiB at first, then `VK_ERROR_OUT_OF_DEVICE_MEMORY`, every block intact (`ok=1`); the budget, not a failure, ends it |
+| growth | 7 regions (64 → 218 MiB, the geometric step), each one published as udmabufs and found by the ICD with `find gpu.<k>` |
+| Zink (`gl-probe`, software Zink over the ICD) and vulkaninfo beside it | `zink Vulkan 1.4 (llvmpipe)`, PASS; llvmpipe listed |
+| giving back | while the load still lived, the idle regions retired: each answered `UNMAPPED` right after the broker reported it drained, and was freed 250 ms after its retire |
+| a second load | grew the pool again, `ok=1` |
+| lost devices, refusals | none |
+
+Announce → `MAPPED` took 200–630 ms, growing with the region's size (about
+3 ms per MiB). That cost belongs to the stand-in: its memfd's pages are first
+allocated when the udmabuf pins them. A VM's RAM is already populated, and in
+the nested test above a 32 MiB region took 9.2 ms end to end.
+
+
+**What moved where.** `wc-multi-install.sh`'s guest-RAM leg used the stand-in. It
+needs an account that may make udmabufs, which the harness's user never is,
+so its guest-RAM part is the two VM tests now. Not covered end to end in a
+VM: the proxy mapping a window of a grown region (`ProvidedRegion::ram_window`,
+the same `find` + `map_fixed` per part as the ICD).
 
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
@@ -35093,7 +36816,168 @@ trusted party; no new cryptography.
 
 ### 111.8 Windows
 
-(Written by the Windows half's branch.)
+Written 2026-10-20, branch `broker-win`. The code is
+`crates/wc-broker/src/sys/windows/` (the platform half, the service, the
+holder, the devices' security), the Windows `Client` in `client.rs`,
+`sv-guest broker`, and `scripts/wc-broker-install.ps1` run by
+`scripts/wc-launch.sh deploy`.
+
+**The service.** `sv-guest broker` runs under the service control manager as
+`waycompose-broker`, `LocalSystem`, automatic start, restarted 1 s, 5 s and
+30 s after a failure. Its binary is `C:\Program Files\waycompose\sv-guest.exe`,
+which users may read and run but not write: a SYSTEM service that ran a file
+its user could replace would hand that user SYSTEM. `--console` runs the same
+code in a console, for tests. Its log is `C:\ProgramData\waycompose\broker.log`.
+
+**The pipe.** `\\.\pipe\waycompose-broker`, `PIPE_REJECT_REMOTE_CLIENTS`, the
+first instance made with `FILE_FLAG_FIRST_PIPE_INSTANCE` (so whoever made the
+name first makes the broker fail to start, instead of sharing it). The
+descriptor gives SYSTEM and Administrators everything and authenticated users
+`0x12019b`: read, `FILE_WRITE_DATA`, attributes, but not
+`FILE_APPEND_DATA`, which on a pipe is `FILE_CREATE_PIPE_INSTANCE` and would let
+a user answer in the broker's place. A client therefore opens it with
+`GENERIC_READ | FILE_WRITE_DATA` and identification-level impersonation only.
+The first build granted `0x12008b` (no write at all) and its client asked for
+`GENERIC_WRITE`; Wine enforced neither, the test VM refused every user. Every
+authenticated user, not only `INTERACTIVE`, because a process the task
+scheduler or a service starts for a user carries a batch or service logon and
+is that user's all the same.
+
+**Who asks.** Per connection: `GetNamedPipeClientProcessId`; the user SID of
+the client's token by `ImpersonateNamedPipeClient`, `OpenThreadToken`
+(as self) and `RevertToSelf` (a thread that cannot revert ends the process);
+then `OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE |
+PROCESS_QUERY_LIMITED_INFORMATION)` on that pid and the process's own token
+must name the same SID, so a pid reused between the two is refused. The user
+is `sid:S-1-5-21-…`. Only SYSTEM (`S-1-5-18`) is an admin: an administrator's
+process is one more user here, and was refused the arena while u1 held it.
+
+**Liveness.** The process handle opened at connect, waited on by the thread
+pool (`RegisterWaitForSingleObject`, once). Every connection of one process
+shares that handle; the exit is told to the core once per watch, and the wait
+is unregistered outside its own callback.
+
+**Handles.** `DuplicateHandle` into the client's process, values in the
+reply. A device is moved (`DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE`):
+the broker keeps no handle, so the ivshmem driver's release and vioser's
+close run in the holder's process exactly as when it opened the device
+itself. A region is copied (`DUPLICATE_SAME_ACCESS`). If the reply cannot be
+written, the handles just put into the client are closed there again.
+
+**Devices.** `arena` = ivshmem in PCI slot 0x1c, `gpu` = slot 0x1d,
+`wcbell` and `svbell` = the virtio-serial ports by name (`--device
+NAME=ivshmem:SLOT|port:NAME|path:PATH` changes them; `path:` is a stand-in
+for tests). The open is the code the processes used before, split in two:
+`wc_handle::open_ivshmem_slot` + `map_ivshmem_device` (what
+`map_ivshmem_slot` now is), and `sv_transport::winpipe::open_virtio_port_handle`
++ `Pipe::from_port_handle` (what `open_virtio_port` now is). The broker
+calls the first half, the compositor or GPU process the second, so the
+mapping and the port I/O are the same code as before the broker.
+
+**The devices' security, which replaces `wc-port-access.ps1` (§91).** At
+every start the broker gives the four devices `D:P(A;;FA;;;SY)(A;;FA;;;BA)`,
+as the PnP security property (applied at every device start, with nothing of
+ours running) and on the live device object, finding the ports by name as the
+script did. It re-enables a recorded port left disabled (§99.6). What each
+device had before is kept in `C:\ProgramData\waycompose\devices.txt` for
+`sv-guest broker revert-acl`. The baseline on the test VM is worth stating:
+the Looking Glass B7 ivshmem driver leaves its devices
+`(A;;0x1201bf;;;WD)`, read and write for Everyone, and an ordinary user's
+process mapped the GPU device directly before the broker (`direct-opened`,
+`bw ... 4.97 GiB/s` as u1). After it, the same open is access denied. A port
+another process holds cannot be opened to change its descriptor (vioser is
+exclusive); it keeps its live descriptor until it is free, and the property
+takes over at its next start.
+
+**Regions.** Unnamed pagefile sections (`CreateFileMappingW` with no name,
+`SEC_COMMIT`), so no other process can open one by name; `large` adds
+`SEC_LARGE_PAGES` when the broker holds `SeLockMemoryPrivilege` (SYSTEM does)
+and the length is a whole number of large pages, and is refused otherwise.
+The region-init hook (`Windows::with_region_init`) is where §108.8's stamp
+plugs in: `Fn(&mut [u8], region id, page size) -> io::Result<Option<String>>`,
+called once on each new region with the whole region mapped into the broker
+for the call only; the word it returns ends the `ok region` reply (the
+nonce), an error refuses the alloc. The windows-guest-ram keeper's protocol
+maps onto the broker's: `hello POOL` is `hello` + `adopt POOL`, `alloc` and
+`free` are the same, and pools are per SID by construction.
+
+**The holder.** Proposed from the windows-guest-ram side and adopted: the
+broker starts `sv-guest broker holder`, a second SYSTEM process that holds a
+`DuplicateHandle` copy of every region and does nothing else (it never maps
+one). Its pipe, `\\.\pipe\waycompose-broker-holder`, admits SYSTEM and its
+owner; the broker checks that the holder's process runs as its own account.
+`add`, `del`, `list` and `quit` are its protocol. A restarted broker lists
+the holder's regions, duplicates each back out, and serves it as an orphan of
+its user's pool under its old id (`Core::restore_orphan`). A holder that
+died is started again and given every region. So a region the host still
+maps is lost only if the broker, the holder and every provider die together;
+before the holder, the broker's crash while the provider was down was enough.
+An orderly stop of the service leaves the holder running (an upgrade keeps
+the regions); `sv-guest broker holder-quit` ends it, which uninstall does.
+
+**Signing (§111.6).** `Platform::identity` is `os=windows
+user=<LookupAccountSidW name, %XX-escaped to one word> id=<SID>`. The keys are
+`C:\ProgramData\waycompose\keys\<install>.key`, SYSTEM and Administrators
+only. The compositor's boot path asks the broker (`Client::sign`) and
+publishes with `macboot::publish_identity`; without a broker it signs from
+the installation's key file as before, with one log line. `wc-launch` no
+longer refuses to start when the user's key file is gone (deploy moves it).
+The host's sessiond verifies with `verifies_identity` when the identity area
+is present, refuses one that does not parse, and hands the identity on in its
+`Request` for 111.10.
+
+**Integration.** The compositor asks for `arena` (its `--arena-ivshmem`
+device 0) and `wcbell`, the GPU process for `gpu` (its `--ivshmem-slot`) and
+`svbell`, each over one connection per process kept for the process's life
+(`client::process_client`). A missing or refusing broker gives one line,
+`[wc-broker] device NAME: not from the broker (WHY); opening it directly`,
+and the open as before; `WC_BROKER=off` skips it. `wc-launch` needs no
+device.
+
+**Measured**, on a local test VM (the deployment host's QEMU 10.2.2, 3 GiB, 4 vCPUs,
+a 64 MiB ivshmem device at 0x1c and one at 0x1d, the Looking Glass B7
+driver), two local non-admin users u1 and u2 run through the task scheduler;
+evidence in `/mnt/datasets/builds/evidence/session-fixes/broker-win/`:
+
+| what | result |
+|---|---|
+| u1 asks for `arena`, maps the 64 MiB BAR | lent in 1.2 ms (process start excluded), mapped 67108864 |
+| u2 asks for `arena` while u1 holds it | `device arena is held by another user's process` |
+| u2 opens the arena, or `wcbell`, directly | access denied (error 5) |
+| u2 `OpenProcess(PROCESS_DUP_HANDLE)` on u1's region holder | access denied |
+| u2 `open` of u1's region by id; `adopt gpu` | `region 1 is another user's`; 0 adopted |
+| `taskkill /F` of u1's holder | arena lent again 69 ms after taskkill started (taskkill itself 47 ms; one attempt) |
+| u2 after that | lent and mapped |
+| `sign` as u1 and as u2 | `os=windows user=u1 id=…-1001` and `user=u2 id=…-1002`; MAC verifies for its own identity, not for a rewritten one, not with it removed |
+| control RTT (`stats`, u1, 5000) | mean 101 µs, p50 70 µs, p99 911 µs |
+| `alloc` of a 2 MiB region | 207 µs |
+| `sign` | 0.4 to 0.6 ms (reads the key file) |
+| write+read through the GPU BAR, 5 runs each | lent: median 14.1 GiB/s; opened directly: 13.2 GiB/s (the same mapping code; the spread, 9.9 to 17.6, is the VM's) |
+| a port lent | ~101 ms, all of it vioser's: a raw `CreateFileW` on the port takes ~100 ms, and so does its `CloseHandle`, with no Rust code involved (`portopen.ps1`) |
+| u1's process ends with a region of pool `keep`; the service process is killed (`taskkill /F`) | the service manager restarted it, serving 1.6 s after the kill; the holder had kept the region; u2 adopted 0, u1 adopted it and read back what it wrote |
+| `wc-launch.sh broker-uninstall`'s script | service deleted, holder ended, the four devices' PnP property removed and live descriptors restored to the driver's |
+
+So the broker adds one request per device per process start (well under the
+0.2 ms bar of §105 at the median), nothing per frame, and the data path is
+the same code and speed. Under Wine (`tests/windows.rs`, own `WINEPREFIX`, 8
+tests): a stand-in device moved into a child, refused to the parent, free
+0.14 ms after the child was killed; a section mapped in two processes; an
+orphan adopted; `sign`; the holder restoring a region after the broker was
+killed and again after the holder was killed; RTT mean 41 µs, p99 59 µs.
+
+**Deploy.** `WC_LAUNCH_BROKER=install scripts/wc-launch.sh deploy`
+runs `wc-broker-install.ps1 -Action install` over its administrator channel:
+Program Files, the service, failure actions, the §91 task and its files
+removed, the service started. Then `-Action key -Install NAME` with the
+installation's key on stdin, and the user's `session.key` is deleted.
+`WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
+and `broker-uninstall` (service deleted, devices' descriptors restored,
+holder ended, keys kept).
+
+**What remains.** Running the compositor and the GPU process on the VM under
+the broker end to end (the probe exercises the same calls, not the products);
+the stamping hook's implementation (windows-guest-ram's); a run on the deployment guest
+(not touched here).
 
 ### 111.9 macOS
 
@@ -35344,4 +37228,350 @@ serves its users), the peer would change:
 
 ### 111.10 The Linux host: sessions run as the mapped user
 
-(Written by the host half's branch.)
+Written 2026-10-20, branch `broker-host`. Until now the doorbell hub (§99) and
+the session service (§105) were user units of the VM host's admin account,
+and every session's proxy, applications, sound and host integration ran as
+that admin. So the guest's Windows user ran Linux programs with the admin's
+files and keys. On the client role's host now:
+
+* the hub and the session service are **system services** of their own
+  account, `waycompose` (group `wc-arena`). Only they open the arena and GPU
+  BAR files and QEMU's doorbell sockets; desktop users have neither the group
+  nor an ACL;
+* a root-owned table, `/etc/waycompose/users.conf`, maps the boot record's
+  identity (111.6) to a Linux user. A record nobody is mapped for is refused,
+  and the guest reads why in the boot page;
+* a session runs **as that user, in that user's systemd manager**, with their
+  home and groups. Its processes get the BAR files and the hub through the
+  broker the session service embeds.
+
+#### The table
+
+```text
+# SERVER   SERVER-USER    LINUX-USER      [installs=a,b] [id=SID-or-uid]
+vm-guest   <guest-user>   <desktop-user>  installs=wcivs,wcmc,wclinux
+vm-guest   <guest-user>   wctest          installs=wctest1
+vm-guest   -              <desktop-user>  installs=wcivs        # transitional
+```
+
+`SERVER` is the VM a service serves (`--server`); it reads only those lines.
+`SERVER-USER` is matched against the identity's account name, without regard
+to ASCII case when the identity's os is `windows` (Windows' own rule) and
+exactly otherwise; `id=` pins the account's SID or uid as well. `installs=`
+narrows a line to those installations. The first matching line wins. A table
+with one bad line fails whole, and the service does not start: a policy read
+in part would map someone it should not (`wc_broker::usermap`, 5 tests).
+`root` is never a target. The NixOS option `services.waycompose.mappings`
+writes the file.
+
+What the guest is told, verbatim from the tests:
+
+* `<os> user <name> (<id>) is not mapped to any Linux user on this host`;
+* `... may not start installation <name> on this host`: the user is mapped,
+  for other installations;
+* `the boot record of installation <name> carries no identity, and this host
+  requires one`;
+* `the boot record ... does not verify under its key with the identity it
+  carries`: the identity was rewritten (111.6);
+* `the boot record's identity area does not parse`: never read as "none".
+
+**Transitional, and to be removed.** The guest's privileged service (111.8)
+is not deployed yet, so today's records carry no identity. With
+`--accept-unidentified`, a record without one maps through a `-` line, which
+must name its installations, one Linux user per installation. A record that
+has an identity never matches `-`. Remove the flag and the `-` lines
+(`acceptUnidentified`, `unidentified` in the NixOS module) as soon as every
+installation on the guest boots through its service; from then on an
+unsigned record is refused.
+
+#### Who starts the session: the user's own agent
+
+The service runs as `waycompose` and must start processes in another user's
+manager. Three ways were weighed:
+
+* (a) `systemd-run --machine=<user>@.host --user` from the service. It needs a
+  polkit rule letting `waycompose` manage units in other users' managers, and
+  polkit's `manage-units` action cannot be scoped to one target user
+  without matching on unit names it cannot see. Rejected: a rule that broad is
+  more than a session start needs.
+* (b) a socket-activated agent per user. Chosen. `wc-session-agent.socket` is a
+  user unit (`Accept=yes`) at `/run/waycompose-agent/<user>/agent.sock`, in a
+  directory only that user can write. The service connects and checks with
+  `SO_PEERCRED` that the socket is the mapped uid's (the listener is that
+  user's manager). The agent checks that the caller is `waycompose` or root.
+  Then it runs the installation's `wc-session up/proxy/gpu` itself, as the
+  user, so `systemd-run --user` lands in the user's manager as it always did.
+  No polkit, no root helper. The agent stays connected until the session's
+  proxy unit ends, runs `down`, and says `ended`; then the service unpublishes
+  the session's regions.
+* (c) a system service with `User=` per session: not the user's manager, no
+  session environment, and every session a new system unit. Rejected.
+
+The line on the agent's socket is `start INSTALL ID RUNID INDEX GPU
+ARENA-REGION GPU-REGION`. It is parsed as untrusted input; `wc-session`
+validates the words again (§94). The mapped users linger, so their agents
+are there before anybody logs in.
+
+One test, leg 5 of `scripts/wc-broker-host.sh`, maps a user to an account
+whose agent socket is a link to another user's. The service refuses it:
+`... is uid 1000's socket, not uid 65534's`.
+
+#### The session service and the broker: one process
+
+`wc-arena-host sessiond --broker /run/waycompose/broker.sock` serves
+`wc_broker::server::Broker<Unix>` on a thread of its own. One process,
+because:
+
+* what the broker hands out per session is decided by the service. It
+  publishes the BAR files for the uid users.conf just named, when the session
+  starts (`publish(uid, "arena"|"gpu", …)`). It unpublishes them when the
+  session ends. Two processes would need a protocol between them for exactly
+  that, plus a story for when one restarts without the other;
+* a restart of the service (a changed users.conf, `restartTriggers`) costs
+  running sessions nothing they hold. Their fds and mappings are theirs, and
+  the per-process broker connection reconnects lazily.
+
+The hub stays a separate service. Its QEMU connections live in systemd's fd
+store (§99.6), and it must not restart when the mapping changes.
+
+A session's processes reach everything through specs the binaries take
+wherever a path was taken before. `wc-session` writes them when the service
+passes `WC_BROKER` and the region ids (`WC_LAUNCH_BROKER_ARENA`, `_GPU`).
+Without them it writes the old paths, so nothing changes where no broker runs:
+
+| before | through the broker | who |
+|---|---|---|
+| `/run/windows-vm/wc-arena/arena` | `broker:<id>` (`open`) | wc-proxy, `wc-arena-host broker-read` (the header `up` checks) |
+| `/run/windows-vm/wc-arena/gpu` | `broker:<id>` | sv-hostd `--region`, and sv-icd, which opens the name sv-hostd sends it |
+| `~/…/wc-bell/wl.sock`, `sv.sock` | `broker:wl-hub`, `broker:sv-hub` (`connect`) | wc-proxy, sv-hostd `--cold-bell`, sv-icd `SV_BELL` |
+
+`sv_transport::brokered` holds two hooks, a service connector and a region
+opener. `wc_broker::client::install_hooks` fills them with the process's one
+broker connection. So `vdoorbell::PortHandle::open`, `poolcold::HubBell` and
+`region::open_named` understand `broker:` with no broker client in
+sv-transport. The connection is per process and kept for its life: the broker
+watches the process through it, and the leases are its. For leases held for
+one of several clients (the proxy's Wayland clients, §112),
+`client::own_connection` gives a connection whose leases end when it is
+dropped.
+
+**Every fd of one region shares one file offset.** The broker's fd and every
+copy it sends are one open file description. The first run of the harness
+failed on exactly this: `up` read the header with `read`, which moved the
+offset, and the proxy's own `read` then found zeros. Readers of a broker
+region use `mmap` or positional I/O (`read_exact_at`). The header readers do
+now, and `client::open_path`'s comment says so.
+
+The guest-RAM substrate (§108) is embedded the same way.
+`wc_broker::host::Embedded` (`attach(&Broker<Unix>, &SessionsView)` once,
+`session_up`, `session_down`) is the interface. `SessionsView` answers whose
+each live session is. `embedded(GuestRam)` in `sessiond_ivshmem.rs` is where a
+component is constructed, from the `--guest-ram-*` flags: `-boot`, `-qemu-pid`
+/ `-qemu-pidfile` / `--guest-ram`, `-bell`, and `-user UID|mapped`. `mapped` is
+users.conf's mapping of the guest GPU process's user, `UserMap::resolve_any`.
+
+#### Layout
+
+| what | where | whose |
+|---|---|---|
+| the services' binaries (`wc-arena-host`, `sv-hostd`) | `/var/lib/waycompose/bin` | root, 0755 |
+| an installation's definition (`wc-session`, `apps.ini`, `gpu.env`, `bin/`) | `/var/lib/waycompose/installs/<name>` | root, 0755 |
+| its key | `…/<name>/session.key` | `waycompose`, 0600 (the service checks) |
+| sequence numbers (§105) | `/var/lib/waycompose/sessiond` | `waycompose`, 0700 |
+| broker, hub | `/run/waycompose/{broker.sock,hub/}` | `waycompose`; broker socket 0666 (access is per request, by uid), hub 0750 |
+| agents | `/run/waycompose-agent/<user>/agent.sock` | a root tree (systemd-tmpfiles refuses a root directory under the service's), each directory the user's |
+| a session's run directory | `$XDG_RUNTIME_DIR/wc-launch/<id>` of the mapped user | the user, 0700 |
+| per-user state: Firefox profiles, Prism's data | the mapped user's home (`~/.wc-launch/<profile>`, `~/wc-mc`) | the user |
+
+`apps.ini` spells per-user paths `~/…`, which `wc-session` expands to the
+running user's home in `exec`, `profile`, every word of `args`, and `env`
+values. So one definition serves whichever user its guest user is mapped to.
+A definition holds nothing of a user's. Nothing writes into the installation
+directory at run time (checked: every `$BASE` use in `wc-session` reads).
+
+#### The existing installations (the Windows VM host)
+
+`scripts/wc-users-migrate.sh plan|apply|verify|remove-old|rollback ADMIN
+DESKTOP BIN-DIR INSTALL...` moves them, as root, after the switch to the
+generation with `services.waycompose`. For each installation it does this:
+
+* the base its admin link names is copied into `/var/lib/waycompose/installs`,
+  with this branch's binaries over `bin/`, root's, and the key `waycompose`'s.
+  GC roots of `bin/`'s store links are registered again;
+* every path under the admin's home that `apps.ini` names is copied into the
+  desktop user's home: the Firefox profile `wcivs` uses, the Prism data and
+  launcher `wcmc` uses. The copy is chowned. Absolute paths in its text files
+  are rewritten (Prism's config, the recorded launches, Firefox's prefs), and
+  `apps.ini` says `~/`;
+* the sequence numbers move, so an old record cannot be replayed;
+* the admin's user units stop and are kept in a backup. The running VM's ACLs
+  for the admin and the desktop user are dropped and one for `waycompose` is
+  added; the VM is not restarted;
+* `remove-old` deletes the admin's copies only after a session was seen
+  working; `rollback` puts the admin's units and links back.
+
+A dry run under `ROOT=` on a tree shaped like the VM host's (three
+installations, a profile with a lock file, Prism data with absolute paths and
+a binary file) gave the expected tree for plan, apply, rollback, apply again
+and remove-old. Not run on the VM host itself.
+
+**wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
+runs as the desktop user, like his applications. Its seat is still brought up
+as root through win7-desktop.nix's sudo rule. That rule's users are now an
+option, `seatUsers` (default: the owner, unchanged elsewhere). The seat still
+asks for a password at its login screen. The seat now also accepts the GPU
+words a brokered session passes: `SV_BELL=broker:<name>`, and `WC_BROKER`
+only as `/run/waycompose/broker.sock`. So its KWin's sv-icd reaches the GPU
+BAR through the broker as the desktop user, and the desktop user's ACL on the
+GPU file is gone. The nested-session user lingers now. win7-desktop's
+`linger = false` became a default, because the agent must be there before any
+login.
+
+**Test installations** of other agents run as the Linux user `wctest`: name
+them in the host configuration's `wctestInstalls`, which adds
+`<guest-user> -> wctest installs=…` to the table. Deploy them into
+`/var/lib/waycompose/installs/<name>` as the migration script lays them out.
+
+**Deploying onto the system layout.** Once a host runs the system services,
+`scripts/wc-launch.sh deploy` in its old form would write the admin's hub and
+session service units back beside them, and two session services would race
+for every boot record. So it refuses on such a host (`/etc/waycompose/users.conf`
+or a system `wc-sessiond.service` present), and `install_services` refuses too.
+`WC_LAUNCH_HOST_LAYOUT=system` is the form for it:
+
+* the installation is built as before, in a stage in the admin's home
+  (`~/.cache/waycompose-stage/<name>`), GC roots included;
+* `scripts/wc-users-migrate.sh install-staged ADMIN auto STAGE NAME`, as root
+  (`WC_LAUNCH_HOST_ROOT`, default `sudo -n`; `sudokey run --` on the deployment
+  host), replaces `/var/lib/waycompose/installs/<name>` by it. The stage's
+  paths become the installation's, the admin's home becomes `~/` (the mapped
+  user's), the GC roots are registered at their new path, an installed key is
+  kept, and the stage's copy of the key is deleted;
+* the deploy is refused unless `users.conf` maps the installation to a user. A
+  test installation is named in the host's `wctestInstalls`, so it runs as
+  `wctest`, with its profile in that user's home;
+* no unit is written, and the system hub's and session service's binaries are
+  left alone. `WC_LAUNCH_SYSTEM_BINS=install` replaces them and restarts both,
+  which is a doorbell blip of about a second for every session;
+* the debug ssh transport is not available with it.
+
+`scripts/wc-users-migrate-test.sh` runs `install-staged` in a dry tree
+(paths, key kept across a redeploy, the mapped user, refusals) and deploy's
+guard against a stubbed host (the old form refused on a system-services host,
+accepted on a plain one; the system layout refused for an unmapped
+installation and on a plain host).
+
+#### Tests
+
+* `wc_broker::usermap` (5), `wc_broker::host` (1), and in wc-arena-host:
+  `the_identity_is_verified_with_the_record`,
+  `a_verified_record_maps_to_its_linux_user_or_is_refused`, and the agent's
+  `a_start_line_round_trips_and_bad_ones_are_refused`.
+* `scripts/wc-broker-host.sh`, on one machine without root: the service maps
+  and runs the session through the agent. The proxy maps the arena as
+  `broker:1` and holds the BAR file through the broker's fd. An application
+  runs on a ring slot. Leg 1 located in 422 ms (2026-10-20, debug build).
+  Also covered: the lease ends the session and its regions are unpublished; an
+  unmapped identity, an out-of-scope installation, and a record without
+  identity are refused, each with its message; the transitional rule runs; a
+  foreign agent socket is refused. 5 legs, OK.
+* `waycompose-users.nix`, the host configuration's NixOS VM test (
+  1024 MiB): two desktop users, two mapped guest identities and one unmapped.
+  The service runs as `waycompose`. Each session's proxy and application run
+  under the mapped uid (`/proc/<pid>/status`) in `user@<uid>.service`.
+  Neither user can open the BAR file or the hub. One user's broker connection
+  cannot open the other's region. Passed 2026-10-20: 6 subtests, the script
+  in 33.9 s, 282 MiB of the VM's 962 in use at the end.
+* The broker is set-up only, and the data path is unchanged. The control
+  ring's round trip in a brokered session (`wc-broker-host.sh`) was 11.2 us
+  mean, p99 15.9 (10000 round trips). On the plain no-ssh path
+  (`wc-no-ssh.sh`, the same hour) it was 8.4 us, p99 23.3. Both are debug
+  builds on this workstation, and the gap is run-to-run noise: no broker
+  call is on that path.
+
+#### Debt
+
+* **The whole BAR goes to each session's user.** The broker publishes the file
+  for each session's uid; per-session windows (§107's barwin, §108's udmabuf
+  pieces) are what would narrow it.
+* **A restarted service does not answer UNMAPPED for regions its previous run
+  published until it re-watches their holders.** Memory is wasted until the
+  holders exit; nothing is corrupted.
+* `scripts/wc-launch.sh deploy` still writes the old per-admin layout.
+  Deploying into `/var/lib/waycompose` needs root and is the migration
+  script's for now.
+* The services' binaries are deployed files, not a Nix package of this tree.
+* The GPU path through the broker (`--region broker:ID`, sv-icd's
+  `open_named`) is built and unit-tested, but no harness here runs a GPU
+  session; the guest proof is the coordinator's. Pool regions past the first
+  (§110's `region_path` of a `broker:` boot name) are not reachable through
+  the broker yet. That is the guest-RAM continuation's `find("gpu.<k>")`.
+
+## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
+
+**The fault.** On testhost on 2026-10-20 sessions ended twice ("its proxy
+is silent", 08:36 and 09:25). The Windows guest had not crashed: for six to
+ten seconds no vCPU halted while the passed-through iGPU came out of D3. The
+guest's runtime power management wakes it about once a minute. pci.sys then
+restores its config space through `0xcf8/0xcfc`, and every one of those
+exits waits for QEMU's BQL. The other vCPUs spin behind it. The 5 s lease
+(§103.14) then ended the proxy, and the session went down with it. Evidence,
+host traces and the proposal for the stall itself are outside git, in
+/mnt/datasets/builds/evidence/frozen-guest/.
+
+**Three witnesses, and what each decides.**
+
+1. **This session's pings**, every 500 ms, as before.
+2. **The guest's heartbeat.** The compositor beats the owner word of the
+   ring control region every 100 ms on a thread of its own (`ringlink.rs`,
+   `start_guest_beat`). Every session's proxy can read it. If the heartbeat
+   moves while this session's pings have stopped, the guest runs and only
+   this session's side is gone, so the lease ends after 5 s, as before.
+3. **The VM's process on the host.** The proxy finds it through
+   `WC_LAUNCH_VM_PID`, `WC_LAUNCH_VM_PIDFILE` or `WC_LAUNCH_VM_UNIT` (a system
+   unit whose main process is QEMU) and reads `/proc/PID/task/*/stat`. This
+   needs no privilege and touches nothing in the VM. It is asked only while
+   pings and heartbeat have both stopped:
+   - a stopped thread, or at least two threads busy for the whole window
+     (vCPUs that never halt), means the guest is stalled. The lease holds it
+     for up to `WC_LAUNCH_LEASE_FROZEN_SECS` (60).
+   - a process that is gone, or one that is mostly idle, means the guest
+     runs but its compositor does not. The lease ends after 5 s.
+
+Without a VM witness, a silent guest is held for up to
+`WC_LAUNCH_LEASE_BLIND_SECS` (20). A guest build before §113 never beats, so
+it keeps the old 5 s. When the heartbeat comes back after a silence, the
+session's pinger gets a fresh 5 s. A gap in the proxy's own 250 ms ticks is
+the proxy stalling, not the guest, and restarts the clocks. The lease clock
+is monotonic now; it used to be the wall clock. The policy is
+`wc_proxy::lease::Judge`: pure, clocked by its caller, and unit-tested for
+each of these cases.
+
+**The guest's half.** A session's `watch` (§107) probes `rtt` every two
+seconds and ends the session at the second miss. A probe that took longer
+than its own 2 s wait plus a second was stalled in, so it is not a miss. A
+gap of over a second between two 250 ms turns of the loop clears the misses
+before it and is logged.
+
+**What is still slow.** A compositor that crashes on a guest that is itself
+busy (two or more threads running flat out) is taken for a stall and held
+for up to 60 s. Without a VM witness, any compositor crash is held for up to
+20 s. Its memory is safe in the meantime: the arena is the ivshmem BAR, or
+the keeper holds it (§103.15).
+
+**Proved.**
+- `wc_proxy::lease` tests: a session dying while the guest beats; an 8 s
+  freeze ridden out; a fresh lease after the freeze; a dead compositor on an
+  idle VM; a gone VM; the 60 s and 20 s bounds; a guest that never beats; a
+  stall of the proxy itself.
+- `session_svc` `probes_ride_out_a_stall_of_this_process`.
+- `scripts/wc-no-ssh.sh` leg 3a: the compositor is SIGSTOPped for 8 s, the
+  proxy holds, and the session answers afterwards. Leg 3 then kills it with
+  -9, and the lease ends in 5 s ("its VM process is gone").
+- `scripts/wc-multi-install.sh` leg 3b: the same 8 s stall under three
+  sessions of one compositor, and none of them ends.
+
+**Deploying it** needs a guest build (for the heartbeat) and, for the VM
+witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
+on testhost (nix-config). Without the guest build the old lease stands;
+without the unit the 20 s bound applies.

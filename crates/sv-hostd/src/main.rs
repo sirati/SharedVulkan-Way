@@ -17,6 +17,8 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
+    // waycompose-design.md §111.10: `broker:NAME` doorbell specs.
+    wc_broker::client::install_hooks();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -64,7 +66,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
                  sv-hostd ivshmem-serve --region <file> --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n                \
                  (--cold <sock>: the TCP cold path, debug only)\n  \
-                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock> [--port ...]   (§99: one per user, every session shares it)\n  \
+                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock>[,rings=<shm file>] [--port ...]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
@@ -570,11 +572,15 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Read-write for the mailboxes' compare-and-swap and replies; the group
     // bit that lets this user read the file lets it write too (0660).
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(pooled_cold)
-        .open(&region)
-        .map_err(|e| format!("{region}: {e} (is this user in the region's group?)"))?;
+    // waycompose-design.md §111.10: `broker:ID`, the BAR the broker published
+    // for this user, who may not open the file itself.
+    let brokered = wc_broker::client::region_spec(std::path::Path::new(&region)).is_some();
+    let file = if brokered {
+        wc_broker::client::open_path(std::path::Path::new(&region))
+    } else {
+        std::fs::OpenOptions::new().read(true).write(pooled_cold).open(&region)
+    }
+    .map_err(|e| format!("{region}: {e} (is this user in the region's group, or is it published to them?)"))?;
     let region_len = file.metadata()?.len();
 
     let mailboxes = if pooled_cold {
@@ -1418,6 +1424,12 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         let spec = args.get(i + 1).ok_or("--port wants UPSTREAM=HUB")?;
         let (up, at) = spec.split_once('=').ok_or("--port wants UPSTREAM=HUB")?;
+        // §105.14: `,rings=FILE` names the shared-memory file whose rings this
+        // port's bytes ring; the hub then wakes their waiters itself.
+        let (at, rings) = match at.split_once(",rings=") {
+            Some((a, r)) => (a, Some(r)),
+            None => (at, None),
+        };
         let up = sv_hostd::bellhub::Upstream::parse(up);
         let name = up.name();
         let listen_key = format!("{name}-listen");
@@ -1435,7 +1447,12 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         };
         let inherited = kept.remove(&format!("{name}-up"));
         eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
-        hubs.push(sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?);
+        let hub = sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?;
+        if let Some(r) = rings {
+            eprintln!("bell-hub {name}: rings the lanes of the rings in {r} itself (§105.14)");
+            hub.set_direct_rings(r);
+        }
+        hubs.push(hub);
     }
     if hubs.is_empty() {
         return Err("bell-hub needs at least one --port UPSTREAM=HUB".into());

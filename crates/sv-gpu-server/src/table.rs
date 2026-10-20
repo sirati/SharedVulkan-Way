@@ -160,6 +160,8 @@ pub struct Objects {
     /// Driver images created to be bound to a shared section, whose
     /// requirements offer the application type 0 only.
     pub shared_images: std::collections::HashSet<u64>,
+    /// This session's fence record (§104.11), made by the first `svFenceRecord`.
+    pub fence: Option<std::sync::Arc<crate::fence::SessionFence>>,
 }
 
 impl Default for Objects {
@@ -181,6 +183,7 @@ impl Objects {
             video_views: Default::default(),
             shared_imports: HashMap::new(),
             shared_images: Default::default(),
+            fence: None,
         }
     }
 

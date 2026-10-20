@@ -816,16 +816,50 @@ impl Icd for SharedVulkan {
     ///
     /// **The one exception is the dma-buf path** (waycompose-design.md §104):
     /// a shared allocation's fd is not a descriptor of the GPU side at all but
-    /// a sealed memfd token made here, naming the section — a new one each
-    /// call, as the specification requires.
+    /// a sealed memfd token made here, naming the section — a new descriptor
+    /// each call, as the specification requires, for the one token file of
+    /// the allocation.
+    ///
+    /// It is also where §104.11's implicit sync learns which allocation a
+    /// `SYNC_FD` export was for (see `dmabuf::Fences`): right after an export,
+    /// the mark goes to the GPU side naming this memory and its number is
+    /// stored in the token's sync page; with no export in front, a batch is
+    /// about to use the image, and the next submit waits for its producer.
     fn get_memory_fd_khr(&self, args: p::VkGetMemoryFdKHRArgs) -> IcdResult<p::VkGetMemoryFdKHRReply> {
         let refuse = Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None });
         let Some(info) = args.p_get_fd_info.as_ref() else { return refuse };
         if !crate::dmabuf::enabled() || info.handle_type.0 as u32 != crate::dmabuf::DMA_BUF {
             return refuse;
         }
-        let token = self.state().shared_memories.get(&info.memory.0).cloned();
-        match token.as_ref().and_then(crate::dmabuf::token_fd) {
+        let memory = info.memory.0;
+        let (fd, mark) = {
+            let mut s = self.state();
+            let pending = s.fences.take_pending();
+            match s.shared_memories.get(&memory) {
+                Some(m) => {
+                    match pending {
+                        Some((mk, _)) => m.file.mark(mk.seq),
+                        None if m.file.is_own() => {
+                            // Our own buffer: only another session's reads of
+                            // it can be outstanding (the GPU side knows them).
+                            let r = String::new();
+                            s.fences.add_wait(memory, &r, 0);
+                        }
+                        None => {
+                            let (rec, seq) = (m.token.record.clone(), m.file.foreign_seq());
+                            s.fences.add_wait(memory, &rec, seq);
+                        }
+                    }
+                    let m = s.shared_memories.get(&memory).expect("just found");
+                    (m.file.export(), pending.filter(|(_, sent)| !sent).map(|(mk, _)| mk))
+                }
+                None => (None, pending.filter(|(_, sent)| !sent).map(|(mk, _)| mk)),
+            }
+        };
+        if let Some(mk) = mark {
+            self.send_mark(mk, if fd.is_some() { memory } else { 0 })?;
+        }
+        match fd {
             Some(fd) => Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(0), p_fd: Some(fd) }),
             None => {
                 sv_icd_entry::report_always(&format_args!(
@@ -837,11 +871,17 @@ impl Icd for SharedVulkan {
         }
     }
 
-    /// A sync fd on the dma-buf path (§104): the semaphore's pending signal is
-    /// consumed here — a submit on the queue that signalled it, waiting on it,
-    /// with a fence this side then waits for — and the fd is -1, "already
-    /// signalled". That is the implicit sync KWin expects: when Zink's flush
-    /// returns, the frame is finished. Anything else is refused as before.
+    /// A sync fd on the dma-buf path (§104.11): the fd is -1, "already
+    /// signalled", returned at once. The semaphore's pending signal is
+    /// numbered instead: the GPU side, given the number with the memory fd
+    /// Zink asks for next, writes it into the session's fence record when the
+    /// work has completed, and whoever reads the buffer waits for that — the
+    /// compositor in the guest, or another session's submit on the GPU side.
+    /// No thread of this process waits for the GPU here.
+    ///
+    /// Only if the GPU side has no fence record does the export still wait,
+    /// as it did before: a submit on the queue that signalled it, waiting on
+    /// it, with a fence this side waits for. Anything else is refused.
     fn get_semaphore_fd_khr(
         &self,
         args: p::VkGetSemaphoreFdKHRArgs,
@@ -853,7 +893,15 @@ impl Icd for SharedVulkan {
         }
         let sem = info.semaphore.0;
         let queue = self.state().semaphores.get_mut(&sem).and_then(|x| x.signal_queue.take());
-        if let Some(queue) = queue {
+        let Some(queue) = queue else {
+            return Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(0), p_fd: Some(-1) });
+        };
+        if self.fence_record()?.is_some() {
+            let (_, before) = self.state().fences.begin_mark(queue, sem);
+            if let Some(b) = before {
+                self.send_mark(b, 0)?;
+            }
+        } else {
             let r = self.consume_signal(args.device.0, queue, sem)?;
             if r != 0 {
                 return Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(r), p_fd: None });
@@ -1855,6 +1903,7 @@ impl Icd for SharedVulkan {
         };
         let mut args = args;
         if crate::dmabuf::enabled() {
+            self.flush_fences()?;
             self.track_sync_fd_semaphores(args.queue.0, &mut args.p_submits);
         }
         let mut buf = vec![0u8; p::size_cmd_vk_queue_submit(&args)];
@@ -1992,6 +2041,10 @@ impl Icd for SharedVulkan {
     }
 
     fn destroy_semaphore(&self, args: p::VkDestroySemaphoreArgs) -> IcdResult<()> {
+        if crate::dmabuf::enabled() {
+            // A mark still waiting for its memory fd names this semaphore.
+            self.flush_fences()?;
+        }
         self.state().semaphores.remove(&args.semaphore.0);
         forwarded!(self, destroy_semaphore, args, { Ok(()) })
     }
@@ -2227,6 +2280,7 @@ impl Icd for SharedVulkan {
             return Err(LowerError::NotImplemented("vkQueueSubmit2"));
         };
         if crate::dmabuf::enabled() {
+            self.flush_fences()?;
             let mut s = self.state();
             for b in args.p_submits.iter_mut() {
                 b.p_wait_semaphore_infos.retain(|w| {
@@ -2448,7 +2502,7 @@ impl SharedVulkan {
             });
         }
         let id = IcdLocal::mint_id(self);
-        let (token, fd) = match import {
+        let (token, file) = match import {
             Some((ty, fd)) => {
                 if ty != crate::dmabuf::DMA_BUF {
                     return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
@@ -2467,25 +2521,88 @@ impl SharedVulkan {
                 if r != 0 {
                     return refused(r);
                 }
-                (tok, Some(fd))
+                // The specification hands the descriptor to the implementation
+                // on a successful import; it is kept, as the token file a
+                // re-export dups and whose sync page a user of it reads.
+                let file = crate::dmabuf::adopt(fd, &tok);
+                (tok, file)
             }
-            None => match t.alloc_shared(id, info.allocation_size, image)? {
-                Ok(tok) => (tok, None),
-                Err(r) => return refused(r),
-            },
+            None => {
+                // The record goes into the token, so it is known before the
+                // first export of this allocation (§104.11).
+                let record = self.fence_record()?;
+                match t.alloc_shared(id, info.allocation_size, image)? {
+                    Ok(mut tok) => {
+                        tok.record = record.unwrap_or_default();
+                        let file = crate::dmabuf::make_token(&tok);
+                        (tok, file)
+                    }
+                    Err(r) => return refused(r),
+                }
+            }
         };
-        // The specification hands the descriptor to the implementation on a
-        // successful import.
-        if let Some(fd) = fd {
-            crate::dmabuf::close_fd(fd);
-        }
         let size = token.size;
         {
             let mut s = self.state();
             s.memories.insert(id, Memory { memory_type_index: 0, allocation: None, size, mapped: false });
-            s.shared_memories.insert(id, token);
+            s.shared_memories.insert(id, crate::dmabuf::SharedMem { token, file });
         }
         Ok(Some(p::VkAllocateMemoryReply { result: p::VkResult(0), p_memory: Some(p::VkDeviceMemory(id)) }))
+    }
+
+    /// The session's fence record (§104.11), asked of the GPU side once.
+    /// `None`: it has none, and sync-fd exports wait as before.
+    fn fence_record(&self) -> IcdResult<Option<String>> {
+        if let Some(r) = self.state().fences.record.clone() {
+            return Ok(r);
+        }
+        let Some(t) = self.ring_transport() else { return Ok(None) };
+        let r = match t.fence_record()? {
+            Ok(name) if !name.is_empty() => Some(name),
+            Ok(_) => None,
+            Err(code) => {
+                sv_icd_entry::report_always(&format_args!(
+                    "the GPU side has no fence record (VkResult {code}): a sync fd export waits for the GPU"
+                ));
+                None
+            }
+        };
+        self.state().fences.record = Some(r.clone());
+        Ok(r)
+    }
+
+    /// `svFenceMark` for an export, on the queue ring after the submit that
+    /// signalled the semaphore (§104.11). Not answered.
+    fn send_mark(&self, m: crate::dmabuf::Mark, memory: u64) -> IcdResult<()> {
+        let Some(t) = self.wire() else { return Ok(()) };
+        let mut cmd = Vec::new();
+        sv_proto::sv::FenceMark { queue: m.queue, semaphore: m.semaphore, seq: m.seq, memory }
+            .encode(&mut cmd)
+            .map_err(LowerError::Wire)?;
+        t.send(sv_icd_entry::RingClass::Queue, sv_proto::sv::SV_FENCE_MARK, &cmd)
+    }
+
+    /// Before a submit, or anything else that must come after the marks:
+    /// send an export still waiting for its memory fd, and the waits the next
+    /// submit needs (§104.11).
+    fn flush_fences(&self) -> IcdResult<()> {
+        let (pending, waits) = {
+            let mut s = self.state();
+            if s.fences.pending.is_empty() && s.fences.waits.is_empty() {
+                return Ok(());
+            }
+            (s.fences.take_all_pending(), std::mem::take(&mut s.fences.waits))
+        };
+        for m in pending {
+            self.send_mark(m, 0)?;
+        }
+        let Some(t) = self.wire() else { return Ok(()) };
+        for (memory, record, seq) in waits {
+            let mut cmd = Vec::new();
+            sv_proto::sv::FenceWait { memory, seq, record }.encode(&mut cmd).map_err(LowerError::Wire)?;
+            t.send(sv_icd_entry::RingClass::Queue, sv_proto::sv::SV_FENCE_WAIT, &cmd)?;
+        }
+        Ok(())
     }
 
     /// Before a submit on the dma-buf path (§104): drop the waits on

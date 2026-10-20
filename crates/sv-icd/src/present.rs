@@ -65,12 +65,16 @@ impl Target {
     /// refuses to be created because `$DISPLAY` was wrong turns a black window
     /// into an application that will not start, and the first is much easier to
     /// diagnose than the second.
-    pub fn open(target: PresentTarget, width: u32, height: u32) -> Target {
+    /// `premultiplied` is the swapchain's `PRE_MULTIPLIED` composite alpha,
+    /// which only a Wayland surface offers.
+    pub fn open(target: PresentTarget, width: u32, height: u32, premultiplied: bool) -> Target {
         // The size is only consulted by a target that has a window, and on a
         // Windows app side there is not one yet. Said here rather than by
         // renaming the parameters, because the signature is the same on both.
         #[cfg(not(unix))]
         let _ = (width, height);
+        #[cfg(not(target_os = "linux"))]
+        let _ = premultiplied;
         match target {
             PresentTarget::Headless => Target::Headless(Dump::from_env()),
             #[cfg(unix)]
@@ -88,7 +92,7 @@ impl Target {
             PresentTarget::X11 { .. } => Target::Headless(Dump::from_env()),
             #[cfg(target_os = "linux")]
             PresentTarget::Wayland { display, surface } => {
-                match wayland::Surface::open(display, surface, width, height) {
+                match wayland::Surface::open(display, surface, width, height, premultiplied) {
                     Some(s) => Target::Wayland(Box::new(s)),
                     None => {
                         sv_icd_entry::report_transport_failure(&format_args!(
@@ -824,12 +828,18 @@ pub mod wayland {
     /// X in memory order — the byte order `VK_FORMAT_B8G8R8A8_UNORM` already
     /// has, so the copy below is a `memcpy`.
     ///
-    /// Opaque rather than `ARGB8888` because a swapchain image's alpha channel
+    /// Opaque, unless the swapchain asked for premultiplied alpha (below),
+    /// rather than `ARGB8888` because a swapchain image's alpha channel
     /// is whatever the application's last draw left there, and a compositor
     /// that honours it turns an unrelated bug into a see-through window. Both
     /// formats are mandatory for every `wl_shm`, so neither has to be
     /// negotiated.
     const WL_SHM_FORMAT_XRGB8888: u32 = 1;
+    /// `WL_SHM_FORMAT_ARGB8888`, premultiplied: for a swapchain made with
+    /// `VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR`, which asks for exactly
+    /// that. The application has said its alpha means something (GTK4's
+    /// client-side shadow, drawn translucent around the window).
+    const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 
     /// How many `wl_shm` buffers a swapchain cycles through.
     ///
@@ -1105,7 +1115,7 @@ pub mod wayland {
         /// to the headless target rather than failing swapchain creation — the
         /// same choice, for the same reason, that [`super::Target::open`] makes
         /// for X11.
-        pub fn open(display: usize, surface: usize, width: u32, height: u32) -> Option<Surface> {
+        pub fn open(display: usize, surface: usize, width: u32, height: u32, premultiplied: bool) -> Option<Surface> {
             let l = lib()?;
             if width == 0 || height == 0 {
                 return None;
@@ -1266,7 +1276,7 @@ pub mod wayland {
                         arg_i(width as i32),
                         arg_i(height as i32),
                         arg_i(stride as i32),
-                        arg_u(WL_SHM_FORMAT_XRGB8888),
+                        arg_u(if premultiplied { WL_SHM_FORMAT_ARGB8888 } else { WL_SHM_FORMAT_XRGB8888 }),
                     ];
                     let b = (l.proxy_marshal_array_flags)(
                         pool,

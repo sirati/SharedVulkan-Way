@@ -1,0 +1,34 @@
+// §105.14 host-side hop trace. Args: $1 qemu pid, $2 hub pid, $3 proxy pid.
+// Every line: <tag> <nsecs CLOCK_MONOTONIC> ...
+tracepoint:power:cpu_idle {
+  if (args.state == 4294967295) { @exit[cpu] = nsecs; } else { @cst[cpu] = args.state; }
+}
+tracepoint:raw_syscalls:sys_enter /(pid == $1 || pid == $2 || pid == $3) && !@watch[tid]/ { @watch[tid] = 1; printf("T %llu %d %d %s\n", nsecs, pid, tid, comm); }
+tracepoint:sched:sched_wakeup /args.pid != 0/ {
+  $t = args.pid;
+  if (@watch[$t] || @vcpu[$t]) {
+    printf("W %llu %d %d %d %d %s\n", nsecs, $t, args.target_cpu, tid, cpu, comm);
+  }
+}
+tracepoint:sched:sched_switch {
+  $t = args.next_pid;
+  if (@watch[$t] || @vcpu[$t]) {
+    printf("R %llu %d %d %d %llu\n", nsecs, $t, cpu, @cst[cpu], nsecs - @exit[cpu]);
+  }
+}
+tracepoint:kvm:kvm_entry { if (!@vcpu[tid]) { @vcpu[tid] = args.vcpu_id + 1; printf("V %llu %d %d\n", nsecs, tid, args.vcpu_id); } }
+tracepoint:kvm:kvm_vcpu_wakeup { printf("K %llu %d %llu %d %d\n", nsecs, tid, args.ns, args.waited, args.valid); }
+tracepoint:syscalls:sys_enter_sendmsg,tracepoint:syscalls:sys_enter_sendto,tracepoint:syscalls:sys_enter_write
+  /pid == $1 || pid == $2 || pid == $3/ { @fd[tid] = args.fd; @wt[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_sendmsg,tracepoint:syscalls:sys_exit_sendto,tracepoint:syscalls:sys_exit_write
+  /(pid == $1 || pid == $2 || pid == $3) && args.ret >= 1 && args.ret <= 4/ {
+  printf("O %llu %d %d %d %d %llu\n", nsecs, pid, tid, @fd[tid], args.ret, @wt[tid]);
+}
+tracepoint:syscalls:sys_enter_recvmsg,tracepoint:syscalls:sys_enter_recvfrom,tracepoint:syscalls:sys_enter_read
+  /pid == $1 || pid == $2 || pid == $3/ { @fd[tid] = args.fd; }
+tracepoint:syscalls:sys_exit_recvmsg,tracepoint:syscalls:sys_exit_recvfrom,tracepoint:syscalls:sys_exit_read
+  /(pid == $1 || pid == $2 || pid == $3) && args.ret >= 1 && args.ret <= 4/ {
+  printf("I %llu %d %d %d %d\n", nsecs, pid, tid, @fd[tid], args.ret);
+}
+tracepoint:syscalls:sys_exit_futex /pid == $3/ { printf("F %llu %d %d\n", nsecs, tid, args.ret); }
+END { clear(@exit); clear(@cst); clear(@fd); clear(@wt); clear(@vcpu); clear(@watch); }

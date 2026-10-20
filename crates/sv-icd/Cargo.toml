@@ -24,3 +24,5 @@ libc.workspace = true
 # The dma-buf token (waycompose-design.md §104): a sealed memfd, Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]
 sv-drm.workspace = true
+# waycompose-design.md §111.10: `SV_BELL=broker:sv-hub`, the hub through the broker.
+wc-broker.workspace = true

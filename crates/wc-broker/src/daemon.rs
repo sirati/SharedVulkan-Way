@@ -2,7 +2,7 @@
 //! for scripts and tests.
 //!
 //! ```text
-//! wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--no-default-devices]
+//! wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--service NAME=PATH]... [--no-default-devices]
 //!                 [--budget-mib N]
 //! wc-broker ctl [--hold] REQUEST...
 //! wc-broker plist BIN                 (the LaunchDaemon's plist, for the installer)
@@ -59,6 +59,8 @@ pub struct ServeArgs {
     pub socket: String,
     pub keys: PathBuf,
     pub devices: Vec<(String, PathBuf)>,
+    /// `--service NAME=PATH`: a socket `connect NAME` reaches (any user).
+    pub services: Vec<(String, PathBuf)>,
     pub budget: Option<u64>,
 }
 
@@ -67,6 +69,7 @@ pub fn parse_serve(argv: &[String]) -> Result<ServeArgs, String> {
         socket: crate::client::path(),
         keys: DEFAULT_KEYS.into(),
         devices: DEFAULT_DEVICES.iter().map(|(n, p)| (n.to_string(), PathBuf::from(p))).collect(),
+        services: Vec::new(),
         budget: None,
     };
     let mut it = argv.iter();
@@ -84,6 +87,14 @@ pub fn parse_serve(argv: &[String]) -> Result<ServeArgs, String> {
                 }
                 a.devices.retain(|d| d.0 != n);
                 a.devices.push((n.to_string(), p.into()));
+            }
+            "--service" => {
+                let s = v()?;
+                let (n, p) = s.split_once('=').ok_or(format!("--service {s}: NAME=PATH"))?;
+                if crate::proto::Request::parse(&format!("connect {n}")).is_err() {
+                    return Err(format!("--service {s}: {n:?} is not a service name"));
+                }
+                a.services.push((n.to_string(), p.into()));
             }
             "--budget-mib" => a.budget = Some(v()?.parse::<u64>().map_err(|e| format!("--budget-mib: {e}"))? << 20),
             _ => return Err(format!("unknown argument {k}")),
@@ -135,6 +146,7 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
     }
     let paths: Vec<DevicePath> = a.devices.iter().map(|(n, p)| DevicePath { name: n.clone(), path: p.clone() }).collect();
     let mut unix = Unix::bind(&a.socket, paths).map_err(|e| format!("{}: {e}", a.socket))?;
+    unix = unix.with_services(a.services.iter().map(|(n, p)| DevicePath { name: n.clone(), path: p.clone() }).collect());
     if cfg!(target_os = "macos") {
         unix = unix.mac_keeper();
     }
@@ -146,7 +158,7 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
     let run = u64::from_le_bytes(rnd);
     let config = Config {
         devices,
-        services: Vec::new(),
+        services: a.services.iter().map(|(n, _)| DeviceSpec { name: n.clone(), allow: Allow::AnyUser }).collect(),
         keys: Some(a.keys.clone()),
         release: region_release(),
         budget: a.budget,

@@ -551,6 +551,26 @@ fn protocol_command(
             crate::shared::serve_import(&shared, d).encode(reply).map_err(err)?;
             Ok(0)
         }
+        // §104.11: the sync fd export that does not wait. The mark and the
+        // wait are never answered; their failures are the log's.
+        Some(sv_proto::sv::SV_FENCE_RECORD) => {
+            sv_proto::sv::FenceRecord::decode(payload).map_err(err)?;
+            let shared = Arc::clone(&srv.host().shared);
+            crate::fence::serve_record(&shared).encode(reply).map_err(err)?;
+            Ok(0)
+        }
+        Some(sv_proto::sv::SV_FENCE_MARK) => {
+            let d = sv_proto::sv::FenceMark::decode(payload).map_err(err)?;
+            let shared = Arc::clone(&srv.host().shared);
+            crate::fence::serve_mark(&shared, d);
+            Ok(0)
+        }
+        Some(sv_proto::sv::SV_FENCE_WAIT) => {
+            let d = sv_proto::sv::FenceWait::decode(payload).map_err(err)?;
+            let shared = Arc::clone(&srv.host().shared);
+            crate::fence::serve_wait(&shared, d);
+            Ok(0)
+        }
         Some(other) => Err(format!("unknown protocol command {other:#x}")),
         None => Err("a packet too short to carry an opcode".to_string()),
     }

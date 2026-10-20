@@ -4,11 +4,16 @@
 #
 #   scripts/wc-launch.sh deploy    cross-compile, copy both halves, write the ini
 #   scripts/wc-launch.sh install   put the shortcut on the guest's real desktop
+#   scripts/wc-launch.sh taskbar-plan       what deploy would decide for each
+#                                          application's taskbar identity (§92.12)
+#   scripts/wc-launch.sh uninstall-taskbar  this installation's jump lists, shortcuts
+#                                          and relaunch files, never another's
 #   scripts/wc-launch.sh cold      no session; click; time it
 #   scripts/wc-launch.sh warm      session already up; click; time it
 #   scripts/wc-launch.sh native    the same measurement for Windows' own Firefox
 #   scripts/wc-launch.sh shot      photograph the window that is up
 #   scripts/wc-launch.sh stop      end the session
+#   scripts/wc-launch.sh broker-show / broker-uninstall   the §111.8 broker service
 #   scripts/wc-launch.sh all       deploy, install, native, cold, warm, shot
 #
 # Run from inside `nix develop`.
@@ -88,6 +93,25 @@ APPDATA_MSYS="$SITE_GUEST_MSYS_HOME/AppData/Local/waycompose"
 
 # The VM host's half.
 HOSTDIR="${WC_LAUNCH_HOSTDIR:-${SITE_HOST_HOME}/wc-launch}"
+# §111.10: where the host keeps its installations.
+#   user    the admin's home and its user units (wc-bell-hub, wc-sessiond), as
+#           before §111. Refused on a host that runs the system services.
+#   system  the host runs them as system services (`services.waycompose`):
+#           deploy builds the installation in a staging directory in the admin's
+#           home and installs it, as root (WC_LAUNCH_HOST_ROOT), into
+#           /var/lib/waycompose/installs/<name> with scripts/wc-users-migrate.sh
+#           install-staged. No user unit is written; the services' own binaries
+#           are left alone (WC_LAUNCH_SYSTEM_BINS=install replaces them). The
+#           session runs as the Linux user /etc/waycompose/users.conf maps it to:
+#           a test installation is named in the host's `wctestInstalls` and runs
+#           as `wctest`. apps.ini's paths under the admin's home become `~/`,
+#           the mapped user's.
+LAYOUT="${WC_LAUNCH_HOST_LAYOUT:-user}"
+HOST_ROOT="${WC_LAUNCH_HOST_ROOT:-sudo -n}"
+SYSTEM_BASE=/var/lib/waycompose/installs
+if [ "$LAYOUT" = system ]; then
+  HOSTDIR="${WC_LAUNCH_HOSTDIR_STAGE:-${SITE_HOST_HOME}/.cache/waycompose-stage/$SESSION}"
+fi
 # The guest reaches the host over the host-only virtio-net link and nothing
 # else. No developer workstation is in this path.
 HOSTLINK="${WC_LAUNCH_HOSTLINK:-$SITE_HOST_USER@$SITE_HOST_NAT_IP}"
@@ -163,10 +187,28 @@ case "$CLICK_LEVEL" in
   elevated) CLICK_RUNLEVEL=Highest ;;
   *) echo "WC_LAUNCH_CLICK must be medium or elevated, not $CLICK_LEVEL" >&2; exit 2 ;;
 esac
+# WHAT A DEPLOY MAY CHANGE BEYOND ITS OWN INSTALLATION. Each of these is
+# guest-wide or host-wide, shared by every installation, and so only done
+# when asked for by name (`install`); the default `skip`/`keep` leaves it as
+# it is. A test installation (WC_LAUNCH_TEST_HOME, or a `test-home` file in
+# its host directory) is refused any of them (`deploy_scope_check`):
+#   WC_LAUNCH_BROKER=install        the guest's broker service, device ACLs, §91's task
+#   WC_LAUNCH_PORT_ACCESS=install   §91's per-user grant of the doorbell ports, its task
+#   WC_LAUNCH_SERVICES=install      the host's hub and session service (user layout)
+#   WC_LAUNCH_SYSTEM_BINS=install   the system hub's and session service's binaries
+# (2026-10-20: a test installation's deploy with the old default `install`
+# put the broker on the deployment guest under production installations.)
+#
 # §91. `deploy` grants the guest user the two doorbell ports
 # (`scripts/wc-port-access.ps1 install`), which is what lets a medium-integrity
 # launch open them. `skip` leaves the guest's device security alone.
-PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
+PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-skip}"
+# §111.8. `deploy` installs the broker service (`sv-guest broker`, LocalSystem,
+# from Program Files) and gives it this installation's key; the broker opens
+# the devices for the user's processes, so the per-user port grant above is
+# superseded and its task removed. `skip` keeps §91's grant and the key in the
+# user's install directory, as before §111.
+BROKER="${WC_LAUNCH_BROKER:-skip}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-${SITE_GUEST_USER}}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 # §105: the pre-§105 transport (ssh exec, relay, tunnel) as an opt-in debug
@@ -432,6 +474,8 @@ PS3
 # shared memory (no ssh). Each runs its own copy of its binary, so that
 # redeploying one installation never swaps a binary under another.
 install_services() {
+  # §111.10: never beside the system services.
+  if host_system_services; then bad "refusing to install the admin's hub and session service: $HOST runs them as system services"; exit 2; fi
   # §99: THE SHARED DOORBELL HUB. One per user on the VM host, for every
   # installation: it, not a session, holds QEMU's two doorbell sockets.
   # Its own copy of sv-hostd, so that redeploying one installation never
@@ -456,7 +500,7 @@ Type=notify
 NotifyAccess=main
 FileDescriptorStoreMax=8
 FileDescriptorStorePreserve=yes
-ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock
+ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock,rings=/run/windows-vm/wc-arena/arena
 Restart=always
 RestartSec=2
 
@@ -519,9 +563,149 @@ UNIT
 }
 
 # ---------------------------------------------------------------- deploy -----
+# §92.12. Each application's taskbar identity: `Waycompose.install.<name>.<app>`
+# for this installation alone, or the application-wide `Waycompose.app.<app>`
+# where this is the installation whose pin (or, with no pin, whose desktop
+# shortcut) already carries it, so the user's taskbar does not change.
+# `wc-launch.exe --taskbar-ids` decides on the guest from the user's shortcuts
+# and the claim files, keeps any earlier decision (wc-launch.ini.prev), writes
+# `taskbar-id` into the ini, and gives this installation's own unpinned
+# shortcuts its own identity where it does not keep the old one. A test
+# installation (WC_LAUNCH_TEST_HOME set here, or a `test-home` file beside its
+# wc-session on the VM host) and WC_LAUNCH_TASKBAR_ID=install always get their
+# own. `dry` only prints the plan.
+taskbar_ids() {
+  local dry="${1:-}" flags="" why=""
+  if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then why="WC_LAUNCH_TEST_HOME is set"
+  elif [ "${WC_LAUNCH_TASKBAR_ID:-auto}" = install ]; then why="WC_LAUNCH_TASKBAR_ID=install"
+  elif h "test -s $HOSTDIR/test-home"; then why="$HOSTDIR/test-home exists"
+  fi
+  [ -n "$why" ] && flags="--test-install"
+  [ "$dry" = dry ] && flags="$flags --dry-run"
+  local before out
+  # A first deploy has no log yet: the shell's error text is not a count.
+  before=$(g "cat $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null | wc -l" | tr -d '\r ')
+  [[ "$before" =~ ^[0-9]+$ ]] || before=0
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --taskbar-ids $flags" >/dev/null 2>&1
+  out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
+  [ -n "$why" ] && note "a test installation ($why): its applications get its own taskbar identity"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  [ "$dry" = dry ] && return
+  case "$out" in
+    *"taskbar-id: wrote "*)
+      ok "taskbar identities (§92.12): $(printf '%s\n' "$out" | grep -E '^taskbar-id: [^ ]+ (legacy|install) ' | sed 's/^taskbar-id: //; s/:.*//' | paste -sd ';')" ;;
+    *) bad "wc-launch --taskbar-ids did not write the ini" ;;
+  esac
+}
+
+# §92.12. Take this installation off the taskbar: its own jump lists (and the
+# application-wide one only while it holds the claim), its claim, desktop and
+# Start menu shortcuts, relaunch and jump-list files. Never another
+# installation's. Pins are listed for the user to remove.
+do_uninstall_taskbar() {
+  echo "== uninstall-taskbar =="
+  local before out
+  # A first deploy has no log yet: the shell's error text is not a count.
+  before=$(g "cat $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null | wc -l" | tr -d '\r ')
+  [[ "$before" =~ ^[0-9]+$ ]] || before=0
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --uninstall-taskbar ${1:-}" >/dev/null 2>&1
+  out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
+  printf '%s\n' "$out" | sed 's/^/        /'
+  case "$out" in
+    *"relaunch file(s)"*|*"dry run"*) ok "this installation's taskbar presence removed${1:+ (dry run)}" ;;
+    *) bad "wc-launch --uninstall-taskbar said nothing" ;;
+  esac
+}
+
+# §111.10: the host's layout and this deploy's must agree. A host with the
+# system services must never get the admin's user units back beside them (two
+# session services would race for every boot record), so the old form refuses.
+host_system_services() {
+  h "test -e /etc/waycompose/users.conf || systemctl cat wc-sessiond.service >/dev/null 2>&1 && echo yes" | grep -qx yes
+}
+host_layout_check() {
+  case "$LAYOUT" in
+    user)
+      if host_system_services; then
+        echo "error: $HOST runs waycompose as system services (§111.10: /etc/waycompose/users.conf, wc-sessiond.service)."
+        echo "       An old-form deploy would put the admin's hub and session service back beside them."
+        echo "       Re-run with WC_LAUNCH_HOST_LAYOUT=system (and WC_LAUNCH_HOST_ROOT, e.g. 'sudokey run --')."
+        echo "       A test installation must also be named in the host's wctestInstalls, so it runs as wctest."
+        exit 2
+      fi ;;
+    system)
+      host_system_services || { echo "error: WC_LAUNCH_HOST_LAYOUT=system, and $HOST has no waycompose system services"; exit 2; }
+      [ "$DEBUG_SSH" = 1 ] && { echo "error: the debug ssh transport is not available with the system layout"; exit 2; }
+      h "$HOST_ROOT true" >/dev/null 2>&1 || { echo "error: '$HOST_ROOT' does not give root on $HOST (set WC_LAUNCH_HOST_ROOT)"; exit 2; }
+      local who
+      who=$(h "awk -v n=$SESSION '/^#/||NF<3{next} {m=\$3; ok=1; for(i=4;i<=NF;i++) if (\$i ~ /^installs=/) { ok=0; k=split(substr(\$i,10),a,\",\"); for(j=1;j<=k;j++) if (a[j]==n) ok=1 } if (ok) {print \$2\" -> \"m; exit} }' /etc/waycompose/users.conf")
+      if [ -z "$who" ]; then
+        echo "error: /etc/waycompose/users.conf on $HOST maps no user for installation $SESSION;"
+        echo "       a test installation is named in the host's wctestInstalls (it then runs as wctest)"
+        exit 2
+      fi
+      echo "  the host's system layout: $SESSION is staged in $HOSTDIR and installed into $SYSTEM_BASE/$SESSION; its sessions run as $who" ;;
+    *) echo "error: WC_LAUNCH_HOST_LAYOUT is user or system, not $LAYOUT"; exit 2 ;;
+  esac
+}
+
+# The guest-wide and host-wide side effects (see BROKER above): said, and for a
+# test installation refused.
+deploy_scope_check() {
+  local test="" v name val asked=""
+  if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then test="WC_LAUNCH_TEST_HOME is set"
+  elif h "test -s $HOSTDIR/test-home"; then test="$HOSTDIR/test-home exists"
+  fi
+  for v in "WC_LAUNCH_BROKER=$BROKER" "WC_LAUNCH_PORT_ACCESS=$PORT_ACCESS" \
+           "WC_LAUNCH_SERVICES=${WC_LAUNCH_SERVICES:-keep}" "WC_LAUNCH_SYSTEM_BINS=${WC_LAUNCH_SYSTEM_BINS:-keep}"; do
+    name=${v%%=*}; val=${v#*=}
+    case "$val" in
+      install) asked="$asked $name" ;;
+      skip|keep) ;;
+      *) echo "error: $name is install, skip or keep, not $val"; exit 2 ;;
+    esac
+  done
+  if [ -n "$test" ] && [ -n "$asked" ]; then
+    echo "error: a test installation ($test) may not change what every installation shares:$asked=install."
+    echo "       Deploy it with those left at their defaults (skip/keep)."
+    exit 2
+  fi
+  if [ -n "$asked" ]; then
+    echo "  this deploy changes shared state, asked for by name:$asked"
+  else
+    echo "  this deploy changes this installation only (broker, port access, host services: left as they are)"
+  fi
+}
+
+# §111.10: the staged installation into the system layout, as root.
+install_staged() {
+  scp "${SSHOPT[@]}" "$ROOT/scripts/wc-users-migrate.sh" "$HOST:$HOSTDIR/../wc-users-migrate.sh" >/dev/null \
+    || { bad "scp of wc-users-migrate.sh"; exit 1; }
+  local out
+  out=$(h "$HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh install-staged \$(id -un) auto $HOSTDIR $SESSION" 2>&1)
+  echo "$out" | sed 's/^/        /'
+  case "$out" in
+    *"[install-staged] done"*) ok "installed into $SYSTEM_BASE/$SESSION (root's; its key the service's alone)" ;;
+    *) bad "the staged installation did not install"; exit 1 ;;
+  esac
+  if [ "${WC_LAUNCH_SYSTEM_BINS:-keep}" = install ]; then
+    h "mkdir -p $HOSTDIR/../sysbin" >/dev/null
+    scp "${SSHOPT[@]}" "$LINUX_BIN/wc-arena-host" "$REL_LINUX/sv-hostd" "$HOST:$HOSTDIR/../sysbin/" >/dev/null \
+      || { bad "scp of the services' binaries"; exit 1; }
+    h "$HOST_ROOT install -m 0755 $HOSTDIR/../sysbin/wc-arena-host $HOSTDIR/../sysbin/sv-hostd /var/lib/waycompose/bin/ && \
+       $HOST_ROOT systemctl restart wc-bell-hub.service wc-sessiond.service" >/dev/null \
+      && ok "WC_LAUNCH_SYSTEM_BINS=install: the system hub and session service run this build (restarted)" \
+      || bad "the system services' binaries were not replaced"
+  else
+    note "the system hub and session service are left as they are (WC_LAUNCH_SYSTEM_BINS=install replaces them)"
+  fi
+}
+
 do_deploy() {
   echo "== deploy =="
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
+  host_layout_check
+  deploy_scope_check
   # A session from the last run holds both halves' binaries open. Ended through
   # the product's own verb, which kills by the pid in its own state file.
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --session-name $SESSION --stop" >/dev/null 2>&1
@@ -600,7 +784,7 @@ do_deploy() {
     built_ok "${PIPESTATUS[0]}" "sv-hostd and sv-icd" || exit 1
     cp "$REL_WIN/sv-guest.exe" "$stage/sv-guest.exe"
   fi
-  cp "$ROOT/scripts/wc-port-access.ps1" "$stage/"
+  cp "$ROOT/scripts/wc-port-access.ps1" "$ROOT/scripts/wc-broker-install.ps1" "$stage/"
   write_runint "$stage/runint.ps1"
   write_click  "$stage/click.ps1"
   write_native "$stage/native.ps1"
@@ -632,7 +816,7 @@ audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
 gpu-arena-mib = $GPU_ARENA_MIB
 # §97: one pool over the whole GPU device, leased as each session needs it;
-# `slots` is §87's fixed slots of gpu-arena-mib.
+# \`slots\` is §87's fixed slots of gpu-arena-mib.
 gpu-arena  = ${WC_LAUNCH_GPU_ARENA:-pool}
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
@@ -642,6 +826,10 @@ wayland-bell = ${WC_LAUNCH_WAYLAND_BELL-org.sirati.wcbell.0}
 # §102: WC_LAUNCH_NESTED_GLOBALS=1 offers wp_single_pixel_buffer_manager_v1,
 # wp_viewporter and wp_presentation, which a nested compositor (KWin) needs.
 nested-compositor-globals = $([ "${WC_LAUNCH_NESTED_GLOBALS:-0}" = 1 ] && echo on || echo off)
+# §107: one compositor for every installation of the user; off is §105's own
+# compositor per installation (WC_LAUNCH_SHARED_COMPOSITOR=off), for an
+# installation that is not to join the shared one yet.
+shared-compositor = ${WC_LAUNCH_SHARED_COMPOSITOR:-on}
 
 [app.firefox]
 title = $TITLE
@@ -701,6 +889,10 @@ APPS
        ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
     >/dev/null 2>&1
   sleep 1
+  # §92.12: the ini about to be replaced carries each application's taskbar
+  # identity (`taskbar-id`), decided by an earlier deploy; `--taskbar-ids`
+  # below reads it from here, so no decision flips.
+  g "cd $DIR_MSYS && if [ -f wc-launch.ini ]; then cp -f wc-launch.ini wc-launch.ini.prev; else rm -f wc-launch.ini.prev; fi" >/dev/null 2>&1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DIRNAME/" >/dev/null || { echo "error: scp to the guest"; exit 1; }
   echo "  copied wc-launch.exe, sv-guest.exe, wc-desk.exe, probe-relay.exe and the ini to $DIR_WIN"
   # STAGE 42. `sv-guest.exe` is the GPU side, which is the binary the
@@ -711,6 +903,7 @@ APPS
   # run rather than diagnosed from a handshake failure during it.
   deployed_all "$stage" "$DIR_MSYS" g "re-run $0 deploy with nothing of ours running on the guest" \
     wc-launch.exe sv-guest.exe wc-desk.exe || exit 1
+  taskbar_ids
 
   # §91. The doorbell ports for a medium-integrity launch: the two port devices'
   # descriptor gains read and write for $PORT_USER (and nothing else changes),
@@ -719,7 +912,20 @@ APPS
   # descriptor until it is free (opening a held vioser port disconnects its
   # holder); the PnP property, which the next device start applies, is written
   # regardless. `scripts/wc-port-access.ps1 -Action uninstall` undoes all of it.
-  if [ "$PORT_ACCESS" = install ]; then
+  if [ "$BROKER" = install ]; then
+    # §111.8: the broker service. It sets the four devices to SYSTEM and
+    # Administrators only at every start, and lends them to the user's own
+    # processes; §91's task and grant are removed by the same script.
+    local bi
+    bi=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action install -Source '$DIR_WIN'" | tr -d '\r')
+    echo "$bi" | sed 's/^/        /'
+    if echo "$bi" | grep -q 'installed:'; then
+      ok "the broker service runs from Program Files as LocalSystem; the devices are lent by it"
+    else
+      bad "the broker service was not installed; sessions open the devices themselves (and a medium-integrity one is refused)"
+    fi
+  elif [ "$PORT_ACCESS" = install ]; then
     local pa
     pa=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
           -File '$DIR_WIN\\wc-port-access.ps1' -Action install -User $PORT_USER" | tr -d '\r')
@@ -743,19 +949,43 @@ APPS
   # first time, kept across deploys; it crosses to the guest once, over this
   # deploy channel, which is an administrator's and not the session's.
   local key
+  # §111.10: an installed installation's key is the service's; the staging
+  # copy is made from it, and install-staged keeps the installed one.
+  if [ "$LAYOUT" = system ]; then
+    h "mkdir -p $HOSTDIR; k=\$($HOST_ROOT cat $SYSTEM_BASE/$SESSION/session.key 2>/dev/null); \
+       [ -n \"\$k\" ] && (umask 077; printf '%s' \"\$k\" >$HOSTDIR/session.key)" >/dev/null 2>&1
+  fi
   key=$(h "mkdir -p $HOSTDIR; test -s $HOSTDIR/session.key || \
            (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
            chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no installation key on the VM host"; exit 1; }
-  printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
-      icacls '$DIR_WIN\\session.key' /inheritance:r /grant:r '${SITE_GUEST_USER}:R' >/dev/null" >/dev/null
-  key=""
-  local kchk
-  kchk=$(g "export MSYS_NO_PATHCONV=1; icacls '$DIR_WIN\\session.key'" | tr -d '\r' | grep -c ':(R)')
-  [ "$kchk" = 1 ] && ok "the installation key is on the guest, readable by ${SITE_GUEST_USER} alone" \
-    || bad "the installation key's ACL on the guest is not one reader ($kchk)"
+  if [ "$BROKER" = install ]; then
+    # §111.8: the key goes to the broker, which signs the boot record with
+    # it and with the caller's identity; the user cannot read it, so a user
+    # process cannot sign a record that claims another user.
+    local ki
+    ki=$(printf '%s' "$key" | g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action key -Install $SESSION" | tr -d '\r')
+    key=""
+    echo "$ki" | sed 's/^/        /'
+    if echo "$ki" | grep -q 'stored in'; then
+      g "export MSYS_NO_PATHCONV=1; rm -f $DIR_MSYS/session.key" >/dev/null
+      ok "the installation key is the broker's (ProgramData\\waycompose\\keys, SYSTEM and Administrators only); the user's copy is removed"
+    else
+      bad "the installation key did not reach the broker"
+    fi
+  else
+    printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
+        icacls '$DIR_WIN\\session.key' /inheritance:r /grant:r '${SITE_GUEST_USER}:R' >/dev/null" >/dev/null
+    key=""
+    local kchk
+    kchk=$(g "export MSYS_NO_PATHCONV=1; icacls '$DIR_WIN\\session.key'" | tr -d '\r' | grep -c ':(R)')
+    [ "$kchk" = 1 ] && ok "the installation key is on the guest, readable by ${SITE_GUEST_USER} alone" \
+      || bad "the installation key's ACL on the guest is not one reader ($kchk)"
+  fi
   # §105: the installation, registered with the host's session service by name.
-  h "mkdir -p \$HOME/.config/waycompose/installs && ln -sfn $HOSTDIR \$HOME/.config/waycompose/installs/$SESSION" >/dev/null
+  # (§111.10: with the system layout, by its directory under $SYSTEM_BASE.)
+  [ "$LAYOUT" = user ] && h "mkdir -p \$HOME/.config/waycompose/installs && ln -sfn $HOSTDIR \$HOME/.config/waycompose/installs/$SESSION" >/dev/null
 
   # The guest's ssh key for the VM host: only for the opt-in debug transport.
   local pub=""
@@ -873,7 +1103,9 @@ VK_DRIVER_FILES=$icd_json"
   # WC_LAUNCH_SERVICES=keep (a test installation beside production ones):
   # the running hub and session service are left exactly as they are, binary
   # and unit, and only checked.
-  if [ "${WC_LAUNCH_SERVICES:-install}" = keep ]; then
+  if [ "$LAYOUT" = system ]; then
+    : # the system services are the host's (installed after the GC roots below)
+  elif [ "${WC_LAUNCH_SERVICES:-keep}" = keep ]; then
     local ks; ks=$(h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service wc-sessiond.service | tr '\n' ' '")
     case "$ks" in
       "active active "*) ok "WC_LAUNCH_SERVICES=keep: the shared hub and session service run, untouched" ;;
@@ -921,6 +1153,9 @@ VK_DRIVER_FILES=$icd_json"
       bad "$path is not on $HOST, or has no bin/$bin: nix copy it there first"
     fi
   done
+
+  # §111.10: the staged installation, complete with its GC roots, goes in.
+  [ "$LAYOUT" = system ] && install_staged
 
   # And the one end-to-end check of the path that does not need a compositor.
   # Asked of `wc-launch.exe` itself rather than of a hand-built ssh command
@@ -985,15 +1220,42 @@ do_install() {
   # §92. Since the shortcuts are written through IShellLinkW, the install also
   # wrote the icon, the relaunch file, the Start menu entry and the jump list,
   # and logged one `pins:` line per step that went wrong and one for the list.
-  local pins
+  local pins never_run=0
   pins=$(g "tail -30 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep '\] pins: ')
-  if g "test -s $DIR_MSYS/firefox.ico && test -s $DIR_MSYS/apps/Waycompose.app.firefox.relaunch && echo yes" | grep -q yes; then
-    ok "Firefox's own icon and its relaunch file: $DIR_WIN\\firefox.ico, $DIR_WIN\\apps\\Waycompose.app.firefox.relaunch"
+  # §92.12: the identity is this installation's own, or the application-wide
+  # one where deploy found the user's pin of it (`taskbar-id` in the ini).
+  # (A name with capitals also gets a hash suffix, which this check does not
+  # compute; deployed names are lower case.)
+  local tid aumid
+  tid=$(g "awk '/^\\[/{s=\$0} s==\"[app.firefox]\" && /^taskbar-id/{print \$3}' $DIR_MSYS/wc-launch.ini" | tr -d '\r')
+  if [ "$tid" = legacy ]; then aumid=Waycompose.app.firefox
+  else aumid="Waycompose.install.$(printf '%s' "$SESSION" | tr 'A-Z' 'a-z').firefox"; fi
+  # §107.11: the icon and the jump list are the host's answer about the
+  # application, and since §105 that answer comes over a session's control
+  # ring. An installation no session has run yet has nothing to ask and
+  # nothing cached; the first session's refresh writes both. That is not a
+  # failure; any other reason for a missing icon or list still is.
+  if printf '%s\n' "$pins" | grep -q 'no session to ask' \
+    && ! g "test -s $DIR_MSYS/apps/firefox.meta && echo cached" | grep -q cached; then
+    never_run=1
+  fi
+  if g "test -s $DIR_MSYS/apps/$aumid.relaunch && echo yes" | grep -q yes; then
+    ok "Firefox's relaunch file: $DIR_WIN\\apps\\$aumid.relaunch"
   else
-    bad "no icon or no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
+    bad "no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
+  fi
+  if g "test -s $DIR_MSYS/firefox.ico && echo yes" | grep -q yes; then
+    ok "Firefox's own icon: $DIR_WIN\\firefox.ico"
+  elif [ "$never_run" = 1 ]; then
+    ok "no icon yet: no session of $SESSION has run, so there is no host to ask; the first session writes it"
+  else
+    bad "no icon"; printf '%s\n' "$pins" | sed 's/^/        /'
   fi
   case "$pins" in
     *"jump list "*" task(s)"*) ok "$(printf '%s\n' "$pins" | grep 'jump list ' | tail -1 | sed 's/^.*pins: //')" ;;
+    *"no desktop entry known yet"*) [ "$never_run" = 1 ] \
+      && ok "no jump list yet: no session of $SESSION has run; the first session commits it" \
+      || bad "no jump list: $(printf '%s\n' "$pins" | tail -2)" ;;
     *) bad "no jump list: $(printf '%s\n' "$pins" | tail -2)" ;;
   esac
 }
@@ -1433,6 +1695,13 @@ do_verify() {
 n=""; warms=""; i=""
 case "$MODE" in
   deploy)  do_deploy ;;
+  broker-show)
+    g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$DIR_WIN\\wc-broker-install.ps1' -Action show" | tr -d '\r' ;;
+  broker-uninstall)
+    # §111.8's revert: the service goes, the devices get their descriptors
+    # from before, and the keys stay (re-deploy with WC_LAUNCH_BROKER=skip
+    # puts a key back in the user's directory).
+    g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$DIR_WIN\\wc-broker-install.ps1' -Action uninstall" | tr -d '\r' ;;
   bench)   do_bench ;;
   warmbench)
     n="${WC_LAUNCH_RUNS:-4}"; warms=""
@@ -1455,6 +1724,8 @@ case "$MODE" in
        done' | sed 's/^/        /' ;;
   verify)  do_verify ;;
   install) do_install ;;
+  taskbar-plan) echo "== taskbar-plan (dry run) =="; taskbar_ids dry ;;
+  uninstall-taskbar) do_uninstall_taskbar "${WC_LAUNCH_DRY_RUN:+--dry-run}" ;;
   cold)    do_cold ;;
   warm)    do_warm ;;
   native)  do_native ;;
@@ -1462,7 +1733,7 @@ case "$MODE" in
   stop)    do_stop ;;
   clock)   read_clock ;;
   all)     do_deploy; echo; do_install; echo; do_native; echo; do_cold; echo; do_warm; echo; do_shot ;;
-  *) echo "usage: $0 deploy|install|cold|warm|bench|native|verify|shot|stop|clock|all"; exit 2 ;;
+  *) echo "usage: $0 deploy|install|taskbar-plan|uninstall-taskbar|cold|warm|bench|native|verify|shot|stop|clock|all"; exit 2 ;;
 esac
 
 echo

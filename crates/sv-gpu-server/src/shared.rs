@@ -11,7 +11,13 @@
 //!
 //! The registry is per process: a name is importable only if this process
 //! created it and the nonce matches, so a token cannot make the GPU side open
-//! an arbitrary section or file.
+//! an arbitrary section or file. It is shared by **every session** of the
+//! process, which is what lets a Plasma client's buffer (its own ICD session)
+//! be imported into KWin's session: the importer maps a view of its own, the
+//! entry counts the views of all sessions, and the section outlives its
+//! creator's free for as long as any session holds a view. On Windows each
+//! view holds its own section handle, so the kernel keeps the section exactly
+//! that long; on Linux the file is unlinked with the last view.
 
 use crate::driver::Driver;
 use ash::vk;
@@ -31,8 +37,13 @@ const PAGE: u64 = 4096;
 struct Entry {
     nonce: [u8; 16],
     size: u64,
-    /// Views of it this process holds: the creator's and every import's.
+    /// Views of it this process holds: the creator's and every import's, of
+    /// every session. The name (and on Linux the file) goes with the last.
     refs: usize,
+    /// The last `svFenceMark` each session's fence record has seen on the
+    /// section, by record name (§104.11): what a later user of the section
+    /// from another session waits for.
+    marks: HashMap<String, u64>,
 }
 
 static REGISTRY: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
@@ -88,6 +99,97 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Note that GPU work `seq` of fence record `record` used the section `name`
+/// (§104.11). Ignored for a name this process does not have.
+pub fn note_mark(name: &str, record: &str, seq: u64) {
+    registry(|r| {
+        if let Some(e) = r.get_mut(name) {
+            let m = e.marks.entry(record.to_string()).or_insert(0);
+            *m = (*m).max(seq);
+        }
+    });
+}
+
+/// Every mark noted on section `name`, by record.
+pub fn marks_of(name: &str) -> Vec<(String, u64)> {
+    registry(|r| r.get(name).map(|e| e.marks.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default())
+}
+
+/// A file name this process makes under `/dev/shm`, as `(kind, pid)`:
+/// `sv-shared-<pid>-<n>-<16 hex>` or `sv-fence-<pid>-<n>-<16 hex>`, nothing
+/// else.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_ours(file: &str) -> Option<(&'static str, u32)> {
+    let (kind, rest) = if let Some(r) = file.strip_prefix("sv-shared-") {
+        ("shared", r)
+    } else {
+        ("fence", file.strip_prefix("sv-fence-")?)
+    };
+    let mut it = rest.split('-');
+    let pid = it.next()?;
+    let n = it.next()?;
+    let tag = it.next()?;
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    if it.next().is_some() || !digits(pid) || !digits(n) || tag.len() != 16 || !tag.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((kind, pid.parse().ok()?))
+}
+
+/// Remove what a GPU process that died without cleaning up left in
+/// `/dev/shm` (§104.10 item 5): files named exactly as [`new_name`] makes them,
+/// owned by this user, whose pid is no longer a process. Once per process,
+/// before its first section. A pid that was reused by another process keeps
+/// its files: deleting a live process's section would be worse than leaking a
+/// dead one's.
+///
+/// On Windows there is nothing to do: a section is a kernel object that dies
+/// with the last handle to it, and a crashed process's handles are closed by
+/// the kernel.
+pub fn sweep_stale_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(target_os = "linux")]
+        sweep_stale(std::path::Path::new("/dev/shm"));
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn sweep_stale(dir: &std::path::Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    // SAFETY: plain syscall.
+    let uid = unsafe { libc::geteuid() };
+    let me = std::process::id();
+    let mut n = 0;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some((_, pid)) = name.to_str().and_then(parse_ours) else { continue };
+        if pid == me || pid == 0 || pid > i32::MAX as u32 {
+            continue;
+        }
+        // Not followed: a symlink is not a file this code made.
+        let Ok(m) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !m.file_type().is_file() || m.uid() != uid {
+            continue;
+        }
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if alive {
+            continue;
+        }
+        if std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        eprintln!("[gpu] removed {n} shared section file(s) of GPU processes that are gone");
+    }
+    n
+}
+
 /// A mapped view of a section this process holds.
 pub struct View {
     #[cfg(target_os = "linux")]
@@ -101,25 +203,26 @@ pub struct View {
 // (I3 of `SharedRegion`).
 impl View {
     #[cfg(target_os = "linux")]
-    fn base(&self) -> *mut u8 {
+    pub(crate) fn base(&self) -> *mut u8 {
         // SAFETY: as above.
         unsafe { self.region.base_ptr() }
     }
 
     #[cfg(windows)]
-    fn base(&self) -> *mut u8 {
+    pub(crate) fn base(&self) -> *mut u8 {
         // SAFETY: as above.
         unsafe { self.section.base_ptr() }
     }
 
     #[cfg(not(any(target_os = "linux", windows)))]
-    fn base(&self) -> *mut u8 {
+    pub(crate) fn base(&self) -> *mut u8 {
         std::ptr::null_mut()
     }
 }
 
 #[cfg(target_os = "linux")]
-fn create_section(name: &str, len: u64) -> Result<View, String> {
+pub(crate) fn create_section(name: &str, len: u64) -> Result<View, String> {
+    sweep_stale_once();
     use std::os::fd::AsFd;
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new()
@@ -155,7 +258,7 @@ fn open_section(name: &str, len: u64) -> Result<View, String> {
 }
 
 #[cfg(windows)]
-fn create_section(name: &str, len: u64) -> Result<View, String> {
+pub(crate) fn create_section(name: &str, len: u64) -> Result<View, String> {
     let section = sv_transport::winshm::Section::create(name, len).map_err(|e| format!("{name}: {e:?}"))?;
     Ok(View { section, len })
 }
@@ -167,7 +270,7 @@ fn open_section(name: &str, len: u64) -> Result<View, String> {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn create_section(_name: &str, _len: u64) -> Result<View, String> {
+pub(crate) fn create_section(_name: &str, _len: u64) -> Result<View, String> {
     Err("no shared sections on this system".into())
 }
 
@@ -177,13 +280,18 @@ fn open_section(_name: &str, _len: u64) -> Result<View, String> {
 }
 
 fn new_name() -> String {
+    named("shared")
+}
+
+/// `Local\sv-<kind>-<pid>-<n>-<16 hex>`, or the same under `/dev/shm` on Linux.
+pub(crate) fn named(kind: &str) -> String {
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tag = hex(&random_bytes::<8>());
     let pid = std::process::id();
     if cfg!(windows) {
-        format!("Local\\sv-shared-{pid}-{n}-{tag}")
+        format!("Local\\sv-{kind}-{pid}-{n}-{tag}")
     } else {
-        format!("/dev/shm/sv-shared-{pid}-{n}-{tag}")
+        format!("/dev/shm/sv-{kind}-{pid}-{n}-{tag}")
     }
 }
 
@@ -309,7 +417,7 @@ pub fn alloc(driver: &Driver, size: u64, image: Option<vk::Image>) -> Result<(Sh
     }
     let nonce = random_bytes::<16>();
     // Registered before the import so that the drop of a failed one finds it.
-    registry(|r| r.insert(name.clone(), Entry { nonce, size: len, refs: 1 }));
+    registry(|r| r.insert(name.clone(), Entry { nonce, size: len, refs: 1, marks: HashMap::new() }));
     match import(driver, &view, want) {
         Ok((memory, memory_type)) => Ok((SharedImport { name, memory, memory_type, view }, nonce)),
         Err(e) => {
@@ -507,13 +615,58 @@ mod tests {
     }
 
     #[test]
+    fn only_exact_names_are_ours() {
+        assert_eq!(parse_ours("sv-shared-12-3-0011223344556677"), Some(("shared", 12)));
+        assert_eq!(parse_ours("sv-fence-7-0-aabbccddeeff0011"), Some(("fence", 7)));
+        for bad in [
+            "sv-shared-12-3-00112233445566",
+            "sv-shared-12-3-0011223344556677-x",
+            "sv-shared-x-3-0011223344556677",
+            "sv-shared--3-0011223344556677",
+            "sv-other-1-2-0011223344556677",
+            "sv-shared-1-2-001122334455667g",
+            "xsv-shared-1-2-0011223344556677",
+        ] {
+            assert_eq!(parse_ours(bad), None, "{bad}");
+        }
+        let a = named("fence");
+        let base = a.rsplit(['/', '\\']).next().unwrap();
+        assert_eq!(parse_ours(base), Some(("fence", std::process::id())));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sweep_removes_only_a_dead_pids_files() {
+        let dir = std::env::temp_dir().join(format!("sv-sweep-{}-{}", std::process::id(), hex(&random_bytes::<4>())));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pid that cannot be alive: above the kernel's pid_max limit (4M).
+        let dead = 4_194_305u32;
+        let me = std::process::id();
+        let files = [
+            (format!("sv-shared-{dead}-0-0011223344556677"), false),
+            (format!("sv-fence-{dead}-1-0011223344556677"), false),
+            (format!("sv-shared-{me}-0-0011223344556677"), true),
+            (format!("sv-shared-{dead}-0-0011"), true),
+            (format!("other-{dead}"), true),
+        ];
+        for (f, _) in &files {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert_eq!(sweep_stale(&dir), 2);
+        for (f, stays) in &files {
+            assert_eq!(dir.join(f).exists(), *stays, "{f}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn nonces_differ() {
         assert_ne!(random_bytes::<16>(), random_bytes::<16>());
     }
 
     #[test]
     fn an_unknown_name_or_a_wrong_nonce_is_refused_before_anything_is_opened() {
-        registry(|r| r.insert("/dev/shm/sv-shared-test-x".into(), Entry { nonce: [1; 16], size: 8192, refs: 1 }));
+        registry(|r| r.insert("/dev/shm/sv-shared-test-x".into(), Entry { nonce: [1; 16], size: 8192, refs: 1, marks: HashMap::new() }));
         let check = |name: &str, nonce: [u8; 16], size: u64| {
             registry(|r| match r.get(name) {
                 None => Err("unknown"),

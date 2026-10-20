@@ -185,6 +185,137 @@ fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::re
     result
 }
 
+/// A doorbell writer that issues each write from the caller's own thread and
+/// never waits for it (waycompose-design.md §105.14).
+///
+/// The detached writer it replaces handed every bell byte to a thread of its
+/// own, which then waited for the write's completion. On an idle guest that
+/// hand-off is a wake of a second thread, usually on a halted vCPU, and it
+/// sat on the critical path of every request that found the host parked.
+/// Here the caller issues the overlapped `WriteFile` itself (the virtqueue
+/// kick happens inside that call) and returns; the record and its byte live
+/// in a slot of a fixed pool until the write completes, which the next write
+/// notices. Nothing blocks: a pool whose writes all still pend (a host end
+/// that stopped draining, §99.5) has them cancelled and the byte refused,
+/// which the bell counts as dropped, as it did a full queue.
+#[cfg(windows)]
+pub struct AsyncWriter {
+    pipe: std::sync::Arc<Pipe>,
+    slots: Box<[AsyncSlot]>,
+}
+
+#[cfg(windows)]
+struct AsyncSlot {
+    ov: sys::Overlapped,
+    buf: [u8; 16],
+    busy: bool,
+}
+
+#[cfg(windows)]
+unsafe impl Send for AsyncWriter {}
+
+#[cfg(windows)]
+impl AsyncWriter {
+    const SLOTS: usize = 32;
+    /// `STATUS_PENDING`: what `Internal` holds while a request is in flight
+    /// (the `HasOverlappedIoCompleted` macro).
+    const PENDING: usize = 0x103;
+
+    pub fn new(pipe: std::sync::Arc<Pipe>) -> std::io::Result<AsyncWriter> {
+        let mut slots = Vec::with_capacity(Self::SLOTS);
+        for _ in 0..Self::SLOTS {
+            // SAFETY: a fresh manual-reset event, closed in `drop`.
+            let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+            if event == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            slots.push(AsyncSlot {
+                ov: sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event },
+                buf: [0; 16],
+                busy: false,
+            });
+        }
+        Ok(AsyncWriter { pipe, slots: slots.into_boxed_slice() })
+    }
+
+    fn reap(&mut self) {
+        for s in self.slots.iter_mut().filter(|s| s.busy) {
+            // SAFETY: a volatile read of a field the I/O manager writes when
+            // the request completes; the slot does not move (boxed slice).
+            if unsafe { core::ptr::read_volatile(&s.ov.internal) } != Self::PENDING {
+                s.busy = false;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::io::Write for AsyncWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.reap();
+        let handle = self.pipe.handle;
+        let Some(s) = self.slots.iter_mut().find(|s| !s.busy) else {
+            // Every write still pends: the host end stopped draining. Cancel
+            // them so the pool frees itself, and refuse this byte.
+            for s in self.slots.iter_mut() {
+                // SAFETY: the record of a request on this handle.
+                unsafe { sys::CancelIoEx(handle, &mut s.ov) };
+            }
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        };
+        let n = buf.len().min(s.buf.len());
+        s.buf[..n].copy_from_slice(&buf[..n]);
+        s.ov.internal = Self::PENDING;
+        s.ov.internal_high = 0;
+        let mut done = 0u32;
+        // SAFETY: the slot's buffer and record live in a boxed slice this
+        // writer owns, and `drop` cancels and waits for every request still
+        // in flight before they are freed.
+        let ok = unsafe {
+            sys::WriteFile(handle, s.buf.as_ptr(), n as u32, &mut done, (&raw mut s.ov).cast::<core::ffi::c_void>())
+        };
+        if ok == 0 {
+            let e = unsafe { sys::GetLastError() };
+            if e != sys::ERROR_IO_PENDING {
+                s.ov.internal = 0;
+                const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
+                return Err(if e == ERROR_NO_SYSTEM_RESOURCES {
+                    std::io::ErrorKind::WouldBlock.into()
+                } else {
+                    std::io::Error::from_raw_os_error(e as i32)
+                });
+            }
+        }
+        s.busy = true;
+        crate::frametrace::hop("bell.issued");
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AsyncWriter {
+    fn drop(&mut self) {
+        let handle = self.pipe.handle;
+        for s in self.slots.iter_mut() {
+            if s.busy {
+                let mut n = 0u32;
+                // SAFETY: the record of a request on this handle; waited for
+                // so the record outlives it.
+                unsafe {
+                    sys::CancelIoEx(handle, &mut s.ov);
+                    sys::GetOverlappedResult(handle, &mut s.ov, &mut n, 1);
+                }
+            }
+            // SAFETY: the slot's own event, closed once.
+            unsafe { sys::CloseHandle(s.ov.event) };
+        }
+    }
+}
+
 #[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
@@ -237,6 +368,16 @@ unsafe impl Send for Pipe {}
 /// through the one handle this returns.
 #[cfg(windows)]
 pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
+    // SAFETY: a handle this process just opened on a port, owned by nobody else.
+    open_virtio_port_handle(name, timeout_ms).map(|h| unsafe { Pipe::from_port_handle(h) })
+}
+
+/// The open half of [`open_virtio_port`]: the raw handle, opened overlapped,
+/// owned by the caller (§111.8: the broker opens the port, moves the handle
+/// into the process that rings it, and that process wraps it with
+/// [`Pipe::from_port_handle`]).
+#[cfg(windows)]
+pub fn open_virtio_port_handle(name: &str, timeout_ms: u32) -> Result<isize> {
     // **Two spellings, tried in order, and the second is not a guess.**
     //
     // `\\.\Global\<name>` is the one to want: the session-0 namespace, reachable
@@ -277,7 +418,7 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
     // is what the ten seconds are for. ERROR_ACCESS_DENIED is one of two
     // things: the port's descriptor refuses this token (vioser's default admits
     // only SYSTEM and Administrators, so a medium-integrity launch from Explorer
-    // is refused until `scripts/wc-port-access.ps1` has run), or another process
+    // is refused; since §111.8 the broker opens it and moves the handle), or another process
     // holds it (a port has one opener). Neither goes away in ten seconds, and
     // retrying for ten made every such launch ten seconds slower: §90.3's
     // `gpu ok … (10378 ms)`. One second covers a previous session that is still
@@ -300,7 +441,7 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
                 )
             };
             if handle != sys::INVALID_HANDLE_VALUE {
-                return Ok(Pipe { handle, server: false, overlapped: true });
+                return Ok(handle);
             }
             last = unsafe { sys::GetLastError() } as i32;
         }
@@ -309,8 +450,8 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
         if last == ERROR_ACCESS_DENIED && now >= denied_deadline.min(deadline) {
             return Err(Error::Os {
                 call: "CreateFileW (virtio-serial port: access denied, so either this token may \
-                       not open it -- vioser admits only Administrators until \
-                       scripts/wc-port-access.ps1 has granted the user, waycompose-design.md §91 -- \
+                       not open it -- the ports admit only SYSTEM and Administrators, and the \
+                       broker (sv-guest broker, waycompose-design.md §111.8) opens them for users -- \
                        or another process holds it)",
                 errno: last,
             });
@@ -324,6 +465,17 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
 
 #[cfg(windows)]
 impl Pipe {
+    /// Wrap a virtio-serial port handle opened overlapped, as
+    /// [`open_virtio_port_handle`] opens one (in this process, or in the
+    /// broker that moved it here, §111.8).
+    ///
+    /// # Safety
+    /// `handle` must be an open port handle opened with
+    /// `FILE_FLAG_OVERLAPPED`, owned by the caller and closed by nobody else.
+    pub unsafe fn from_port_handle(handle: isize) -> Pipe {
+        Pipe { handle, server: false, overlapped: true }
+    }
+
     /// Create the pipe and block until a client connects.
     ///
     /// One instance, because one session has one peer. `PIPE_REJECT_REMOTE_

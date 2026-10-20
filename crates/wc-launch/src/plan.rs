@@ -166,6 +166,41 @@ pub fn shared_compositor_argv(cfg: &Config, log: &str, user_ctl: &str) -> Vec<St
     a
 }
 
+/// §107: the shared compositor's pid from its answer to `ping`
+/// (`compositor <pid>`); 0 when the answer does not name one.
+pub fn compositor_pid(answer: &str) -> u32 {
+    answer.trim().strip_prefix("compositor ").and_then(|p| p.trim().parse().ok()).unwrap_or(0)
+}
+
+/// §107: the session index in the user's compositor's answer to `boot`
+/// (`located INDEX MESSAGE`, its `ok` taken off); 0 when it names none.
+pub fn boot_index(answer: &str) -> u8 {
+    answer.trim().strip_prefix("located ").and_then(|r| r.split_whitespace().next()).and_then(|i| i.parse().ok()).unwrap_or(0)
+}
+
+/// The windows a compositor's log says are mapped. `session` 0 counts every
+/// `mapped` line (a compositor of this installation's own); otherwise only
+/// the toplevels the shared compositor made for that session (§107.11:
+/// `xdg_toplevel created (#N) -> window W of session S`), so another
+/// installation's window opening meanwhile is not taken for this one's.
+pub fn count_mapped(log: &str, session: u8) -> usize {
+    if session == 0 {
+        return log.lines().filter(|l| l.contains(" mapped ")).count();
+    }
+    let tag = format!(" of session {session}");
+    let mine: std::collections::HashSet<&str> = log
+        .lines()
+        .filter_map(|l| l.split_once("-> window ").map(|(_, r)| r))
+        .filter_map(|r| r.strip_suffix(tag.as_str()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    log.lines()
+        .filter_map(|l| l.split_once("wc-compositor: window ").map(|(_, r)| r))
+        .filter_map(|r| r.split_once(" mapped "))
+        .filter(|(id, _)| mine.contains(id) && seen.insert(*id))
+        .count()
+}
+
 /// §110: whether the shared compositor runs the GPU pool itself.
 pub fn one_pool_gpu(cfg: &Config) -> bool {
     cfg.shared_compositor && cfg.one_pool && cfg.gpu_sessions > 0 && cfg.gpu_pool
@@ -175,7 +210,7 @@ pub fn one_pool_gpu(cfg: &Config) -> bool {
 /// (a Windows path may hold spaces and never a tab). The compositor's
 /// `session_svc::Config::parse_request` reads it; the test below pins the
 /// line both sides agree on.
-pub fn boot_request(cfg: &Config, id: &str, key_file: &str, control: &str, gpu: bool, relaunch: &str) -> String {
+pub fn boot_request(cfg: &Config, id: &str, key_file: &str, control: &str, gpu: bool, relaunch: &str, taskbar: Option<&str>) -> String {
     let mut f = vec![
         "boot".to_string(),
         format!("session={id}"),
@@ -193,6 +228,11 @@ pub fn boot_request(cfg: &Config, id: &str, key_file: &str, control: &str, gpu: 
         f.push("nested=1".into());
     }
     f.push(format!("relaunch={relaunch}"));
+    // §92.12: the installation's taskbar scope. `None` only for the retry
+    // against a running compositor from before §92.12, which refuses the field.
+    if let Some(t) = taskbar {
+        f.push(format!("taskbar={t}"));
+    }
     f.join("\t")
 }
 
@@ -216,6 +256,30 @@ pub fn without_id(verb: &[String]) -> Vec<String> {
 
 pub fn relaunch_argv(dir: &str) -> Vec<String> {
     vec!["--relaunch-dir".into(), dir.into()]
+}
+
+/// §92.12. The one-session compositor's `--taskbar-scope`: this installation,
+/// so its windows carry this installation's taskbar identity.
+pub fn taskbar_argv(spec: &str) -> Vec<String> {
+    vec!["--taskbar-scope".into(), spec.into()]
+}
+
+/// §92.12. This installation's taskbar scope: its name, and the window app
+/// ids of the applications whose `taskbar-id` is `legacy`. `window_id` gives
+/// an application's window app id from its section and block (the launcher
+/// reads the host's cached answer for `StartupWMClass`). An id the scope
+/// cannot carry could not match a window either, and is left out.
+pub fn taskbar_scope(cfg: &Config, window_id: impl Fn(&str, &crate::config::App) -> String) -> crate::taskbar::Scope {
+    let mut legacy: Vec<String> = Vec::new();
+    for (section, app) in &cfg.apps {
+        if app.taskbar_id == crate::config::TaskbarId::Legacy {
+            let id = window_id(section, app);
+            if crate::taskbar::app_id_ok(&id) && !legacy.contains(&id) {
+                legacy.push(id);
+            }
+        }
+    }
+    crate::taskbar::Scope { install: cfg.installation().to_string(), legacy }
 }
 
 /// The byte pipe from the guest's loopback into the compositor's AF_UNIX
@@ -703,6 +767,40 @@ pub fn unb64(text: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_shared_compositors_pid_comes_from_its_ping() {
+        assert_eq!(super::compositor_pid("compositor 4321"), 4321);
+        assert_eq!(super::compositor_pid(" compositor 7\n"), 7);
+        assert_eq!(super::compositor_pid("session up"), 0);
+        assert_eq!(super::compositor_pid("compositor x"), 0);
+    }
+
+    #[test]
+    fn the_session_index_comes_from_the_boot_answer() {
+        assert_eq!(super::boot_index("located 4 ivshmem run 0x1 generation 59"), 4);
+        assert_eq!(super::boot_index(" located 12\n"), 12);
+        assert_eq!(super::boot_index("REFUSED"), 0);
+    }
+
+    /// §107.11: with a shared compositor the click measures its own
+    /// session's window, in the shared log, and nobody else's.
+    #[test]
+    fn a_shared_compositors_log_counts_this_sessions_windows_only() {
+        let log = "\
+wc-compositor: xdg_toplevel created (#1) -> window 1 of session 2
+wc-compositor: window 1 mapped 800x600
+wc-compositor: xdg_toplevel created (#2) -> window 3 of session 5
+wc-compositor: window 3 mapped 640x480
+wc-compositor: window 4 mapped 100x50 as a popup at 3,4
+wc-compositor: window 1 mapped 900x600
+";
+        assert_eq!(super::count_mapped(log, 0), 4, "a compositor of its own: every line");
+        assert_eq!(super::count_mapped(log, 2), 1, "session 2's window, once, however often it maps");
+        assert_eq!(super::count_mapped(log, 5), 1);
+        assert_eq!(super::count_mapped(log, 7), 0);
+        assert_eq!(super::count_mapped(&log.replace(" of session 2", ""), 2), 0, "an untagged toplevel is no session's");
+    }
+
     use super::*;
     use crate::config::{Config, EXAMPLE};
 
@@ -741,12 +839,14 @@ mod tests {
         assert_eq!(after("--arena-ivshmem"), Some("0"));
         // The line the compositor's `Config::parse_request` reads (its test
         // pins the same shape): tabs between fields, spaces kept in paths.
-        let line = boot_request(&c, "wcl-42", r"C:\U\First Last\session.key", r"C:\L\wc-launch-wcl.ctl", true, r"C:\U\First Last\apps");
+        let line = boot_request(&c, "wcl-42", r"C:\U\First Last\session.key", r"C:\L\wc-launch-wcl.ctl", true, r"C:\U\First Last\apps", Some("wcl:firefox"));
         let f: Vec<&str> = line.split('\t').collect();
         assert_eq!(f[0], "boot");
         assert!(f.contains(&"session=wcl-42") && f.contains(&r"key=C:\U\First Last\session.key"));
         assert!(f.contains(&"gpu=1") && f.contains(&"nested=1") && f.contains(&r"relaunch=C:\U\First Last\apps"));
         assert!(f.iter().any(|x| x.starts_with("install=")));
+        assert!(f.contains(&"taskbar=wcl:firefox"));
+        assert!(!boot_request(&c, "i", "k", "c", false, "r", None).contains("taskbar="), "the retry for an older compositor");
         assert!(!line.contains('\n'));
         let g = shared_gpu_argv(&c);
         let after = |k: &str| g.iter().position(|x| x == k).map(|i| g[i + 1].as_str());
@@ -1211,5 +1311,41 @@ mod boot_tests {
         assert_eq!(w[0], "run");
         assert!(!w.iter().any(|x| x == "wcns-42"));
         assert_eq!(&w[1..], &v[2..]);
+    }
+}
+
+#[cfg(test)]
+mod taskbar_scope_tests {
+    use super::*;
+    use crate::config::TaskbarId;
+
+    fn cfg() -> Config {
+        Config::parse(
+            "[session]\ncompositor=C\ninstallation=wcivs\n[app.firefox]\ntaskbar-id = legacy\n\
+             [app.tb]\ndesktop = thunderbird\n[app.ff2]\ndesktop = firefox\ntaskbar-id = legacy\n",
+        )
+        .unwrap()
+    }
+
+    /// §92.12: the boot carries the installation and its legacy app ids, in
+    /// the form the compositor's `Scope::parse` reads, and only those.
+    #[test]
+    fn the_scope_names_the_installation_and_its_legacy_window_ids() {
+        let c = cfg();
+        let s = taskbar_scope(&c, |_, a| a.desktop.clone());
+        assert_eq!(s.install, "wcivs");
+        assert_eq!(s.legacy, ["firefox"], "two sections of one window id are one entry");
+        assert_eq!(crate::taskbar::Scope::parse(&s.render()).unwrap(), s);
+        // The window app id is the launcher's, StartupWMClass included.
+        let s = taskbar_scope(&c, |sec, _| if sec == "firefox" { "Navigator".into() } else { "firefox".into() });
+        assert_eq!(s.legacy, ["firefox", "Navigator"]);
+        // An id the scope could not carry is left out rather than refused.
+        assert!(taskbar_scope(&c, |_, _| "a b".into()).legacy.is_empty());
+        let mut none = c.clone();
+        for a in none.apps.values_mut() {
+            a.taskbar_id = TaskbarId::Install;
+        }
+        assert_eq!(taskbar_scope(&none, |_, a| a.desktop.clone()).render(), "wcivs");
+        assert_eq!(taskbar_argv("wcivs:firefox"), ["--taskbar-scope", "wcivs:firefox"]);
     }
 }

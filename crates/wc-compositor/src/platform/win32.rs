@@ -46,6 +46,12 @@
 //! to GDI. That is the known cost, it is a constant factor on an already-CPU
 //! path, and the fix is the DIB section — which is worth doing when there is a
 //! measurement saying it matters, and not before.
+//!
+//! §104's follow-up narrowed the third without giving up the unambiguous form:
+//! the image handed over is the band of rows the update region spans, as an
+//! image of its own (`WindowState::blit`). And a window whose picture is one
+//! client buffer in a section is drawn with `BitBlt` from a DIB section made
+//! over that buffer (`DirectDib`), which is the fix this paragraph named.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -61,9 +67,9 @@ mod hold;
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, ExcludeClipRect, FillRect,
+    BeginPaint, BitBlt, CreateSolidBrush, DeleteObject, EndPaint, ExcludeClipRect, FillRect,
     InvalidateRect, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HBRUSH, HDC, PAINTSTRUCT,
+    HBRUSH, HDC, PAINTSTRUCT, SRCCOPY,
     // ADDED FOR STAGE 9. `ClientToScreen` is filed under GDI rather than under
     // WindowsAndMessaging, which is where one would look for it.
     ClientToScreen,
@@ -364,6 +370,11 @@ struct WindowState {
     /// The first `Present` not yet painted, for `WC_FRAME_TRACE`
     /// (docs/waycompose-design.md §88): how long a frame waits for `WM_PAINT`.
     unpainted_since: Cell<Option<std::time::Instant>>,
+    /// §104's follow-up: DIB sections over client buffers this window has been
+    /// told to draw from directly (`ToUi::Direct`), newest last, and the key
+    /// of the one it draws from now; `None` is the shadow.
+    dibs: RefCell<Vec<DirectDib>>,
+    direct_on: Cell<Option<u64>>,
     /// Set while we are the ones calling `ShowWindow`, so the `WM_SIZE` it
     /// provokes is not reported back to the client as a user action. Without
     /// it, a client asking to be maximised receives its own request as an
@@ -490,7 +501,12 @@ impl WindowState {
         let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
         if !hdc.is_null() {
             let blit_started = std::time::Instant::now();
-            self.blit(hdc);
+            // §104's follow-up: from the client's buffer when the window has
+            // been told to, else from the shadow.
+            let direct = self.blit_direct(hdc, &ps.rcPaint);
+            if !direct {
+                self.blit(hdc, &ps.rcPaint);
+            }
             if let Some(since) = self.unpainted_since.take()
                 && sv_transport::frametrace::enabled()
             {
@@ -500,21 +516,26 @@ impl WindowState {
                     ft::at_us(blit_started),
                     "wc.paint",
                     format_args!(
-                        "win={} wait_us={} blit_us={} rect={}x{}",
+                        "win={} wait_us={} blit_us={} rect={}x{} direct={}",
                         self.id,
                         ft::us(blit_started - since),
                         ft::us(blit_started.elapsed()),
                         r.right - r.left,
                         r.bottom - r.top,
+                        u8::from(direct),
                     ),
                 );
             }
             // After the blit and inside the paint, because it reads the same
             // buffer the blit just used and must not disagree with what is on
             // the screen. It is a no-op on every frame where the client's title
-            // bar has not changed colour, which is almost all of them.
-            self.match_caption_colour();
-            self.check_corner();
+            // bar has not changed colour, which is almost all of them. Not when
+            // drawing directly: the shadow is not the picture then (and a
+            // window with a folded caption is never drawn directly).
+            if !direct {
+                self.match_caption_colour();
+                self.check_corner();
+            }
         }
         // SAFETY: paired with the `BeginPaint` above, same `ps`.
         unsafe {
@@ -522,7 +543,35 @@ impl WindowState {
         }
     }
 
-    fn blit(&self, hdc: HDC) {
+    /// Draw the update region from the client buffer this window is drawn from
+    /// directly, if it is; `false` when it is drawn from its shadow.
+    ///
+    /// §104's follow-up. A `BitBlt` from a memory DC holding a DIB section made
+    /// over the client's own section (`DirectDib`): nothing of the client's
+    /// frame has been read by this process, GDI reads the rows it draws, and
+    /// only those of the update region. Outside the buffer nothing is drawn,
+    /// exactly as `blit` does for a shadow smaller than the window.
+    fn blit_direct(&self, hdc: HDC, paint: &RECT) -> bool {
+        let Some(key) = self.direct_on.get() else { return false };
+        let dibs = self.dibs.borrow();
+        let Some(dib) = dibs.iter().find(|d| d.key == key) else { return false };
+        let left = paint.left.clamp(0, dib.width);
+        let top = paint.top.clamp(0, dib.height);
+        let right = paint.right.clamp(left, dib.width);
+        let bottom = paint.bottom.clamp(top, dib.height);
+        if right > left && bottom > top {
+            // SAFETY: `hdc` is the paint DC and `dib.dc` a live memory DC with
+            // the DIB selected; the rectangle is inside both.
+            unsafe {
+                BitBlt(hdc, left, top, right - left, bottom - top, dib.dc, left, top, SRCCOPY);
+            }
+        }
+        drop(dibs);
+        self.uncover_caption_buttons(hdc);
+        true
+    }
+
+    fn blit(&self, hdc: HDC, paint: &RECT) {
         let shadow = match self.shadow.lock() {
             Ok(s) => s,
             // A poisoned lock means the Wayland thread panicked mid-blit. The
@@ -535,6 +584,18 @@ impl WindowState {
             return;
         }
         let (w, h) = (shadow.width(), shadow.height());
+        // §104's follow-up: only the rows the update region spans are handed
+        // to GDI, as an image of their own — still the whole-image form this
+        // module's header argues for (zero source origin, every line), so the
+        // band is unambiguous; the clip `BeginPaint` installed still decides
+        // the columns. A 64x64 change in a 1280x720 window hands GDI 64 rows
+        // instead of 720.
+        let top = paint.top.clamp(0, h);
+        let rows = paint.bottom.clamp(top, h) - top;
+        if rows == 0 {
+            self.uncover_caption_buttons(hdc);
+            return;
+        }
 
         let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -542,34 +603,36 @@ impl WindowState {
             biWidth: w,
             // Negative height means top-down, which is Wayland's origin. A
             // positive value here is the classic upside-down window.
-            biHeight: -h,
+            biHeight: -rows,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
-            biSizeImage: (w as u32) * (h as u32) * 4,
+            biSizeImage: (w as u32) * (rows as u32) * 4,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,
             biClrUsed: 0,
             biClrImportant: 0,
         };
+        let band = &shadow.pixels()[top as usize * w as usize * 4..];
 
-        // SAFETY: `bmi` describes exactly `w * h * 4` bytes and the shadow is
-        // packed to that size by `Shadow::blit`; the pointer is valid for the
-        // duration of the call because the lock is still held. The whole image
-        // is passed with a zero source origin, which is the unambiguous form —
-        // see this module's header.
+        // SAFETY: `bmi` describes exactly `w * rows * 4` bytes, and `band`
+        // starts at row `top` of a shadow packed to `w * h * 4` bytes with
+        // `top + rows <= h`; the pointer is valid for the duration of the call
+        // because the lock is still held. The whole band is passed with a zero
+        // source origin, which is the unambiguous form — see this module's
+        // header.
         unsafe {
             SetDIBitsToDevice(
                 hdc,
                 0,
-                0,
+                top,
                 w as u32,
-                h as u32,
+                rows as u32,
                 0,
                 0,
                 0,
-                h as u32,
-                shadow.pixels().as_ptr().cast::<c_void>(),
+                rows as u32,
+                band.as_ptr().cast::<c_void>(),
                 &bmi,
                 DIB_RGB_COLORS,
             );
@@ -2813,6 +2876,16 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 dump_frame(ui, &w);
             }
         }
+        // §104's follow-up.
+        ToUi::Direct { id, frame, damage, serial } => {
+            if let Some(w) = window(ui, id) {
+                direct(ui, &w, frame, &damage, serial);
+            } else {
+                // Gone already: nothing draws from anything, and the Wayland
+                // side is waiting on this answer to release the buffers.
+                let _ = ui.events.send(FromUi::DirectShown { id, serial, ok: true });
+            }
+        }
         ToUi::Cursor { spec } => set_cursor(ui, spec),
         ToUi::SetWindowState {
             id,
@@ -3148,6 +3221,8 @@ fn create_window(
         minimized: Cell::new(false),
         mapped: Cell::new(false),
         unpainted_since: Cell::new(None),
+        dibs: RefCell::new(Vec::new()),
+        direct_on: Cell::new(None),
         self_driven: Cell::new(false),
         placing: Cell::new(false),
         maximize_at_map: Cell::new(false),
@@ -4557,8 +4632,23 @@ fn dump_frame(ui: &Rc<Ui>, w: &Rc<WindowState>) {
     let n = w.frames.get();
     w.frames.set(n + 1);
     let path = dir.join(format!("window{}-{n:04}.ppm", w.id));
-    let shadow = w.shadow.lock().unwrap_or_else(|e| e.into_inner());
-    match crate::surface::write_ppm(&path, &shadow) {
+    // §104's follow-up: a window drawn from its client's buffer is dumped from
+    // that buffer, which is what it shows.
+    let dibs = w.dibs.borrow();
+    let written = match w.direct_on.get().and_then(|k| dibs.iter().find(|d| d.key == k)) {
+        Some(d) => {
+            let len = (d.height as usize - 1) * d.stride as usize + d.width as usize * 4;
+            // SAFETY: the DIB's bits are `stride * height` bytes and live as
+            // long as `d`, which the borrow holds.
+            let bytes = unsafe { std::slice::from_raw_parts(d.bits, len) };
+            crate::surface::write_ppm_bgra(&path, d.width, d.height, d.stride, bytes)
+        }
+        None => {
+            let shadow = w.shadow.lock().unwrap_or_else(|e| e.into_inner());
+            crate::surface::write_ppm(&path, &shadow)
+        }
+    };
+    match written {
         Ok(()) => {
             // Only the first, or an animating client fills the log with one
             // line per frame and buries everything the harness greps for.
@@ -4742,6 +4832,151 @@ fn lock_on(vk: u16) -> bool {
 
 fn is_layered(w: &Rc<WindowState>) -> bool {
     matches!(w.kind, WindowKind::Popup { .. })
+}
+
+/// §104's follow-up: a DIB section over one client buffer, selected into a
+/// memory DC, which is what `WindowState::blit_direct` draws from.
+///
+/// # Why a DIB section over the client's section is sound
+///
+/// `CreateDIBSection` with a section handle makes a bitmap whose bits *are*
+/// the section's bytes at `offset`: GDI maps the object itself, and nothing is
+/// copied. The client may not write a buffer between committing it and its
+/// `wl_buffer.release`, and the Wayland side releases a buffer drawn this way
+/// only after this thread has said (`FromUi::DirectShown`) that it draws from
+/// a newer one, so every `BitBlt` from it reads a finished frame. The bitmap
+/// is the *source* of a blit and is never drawn into.
+///
+/// A DIB's rows are its width times four bytes, DWORD-aligned; the client's
+/// stride may be larger (Intel's LINEAR images pad rows), so the bitmap is
+/// `stride / 4` pixels wide and only the client's `width` columns are ever
+/// blitted. `offset` must be a multiple of four, which the Wayland side checks.
+struct DirectDib {
+    key: u64,
+    dc: HDC,
+    bitmap: windows_sys::Win32::Graphics::Gdi::HBITMAP,
+    old: windows_sys::Win32::Graphics::Gdi::HGDIOBJ,
+    /// The bitmap's bits, for `dump_frame`.
+    bits: *const u8,
+    width: i32,
+    height: i32,
+    stride: i32,
+}
+
+impl DirectDib {
+    fn new(frame: &super::DirectFrame) -> Result<DirectDib, String> {
+        use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleDC, CreateDIBSection, SelectObject};
+        let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: frame.stride / 4,
+            biHeight: -frame.height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: (frame.stride as u32) * (frame.height as u32),
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `bmi` is a complete 32-bit header; the section handle is
+        // live for the call (the `Arc` in `frame`), and GDI holds its own
+        // reference to the object from here on. No DC is needed for
+        // `DIB_RGB_COLORS`.
+        let bitmap = unsafe {
+            CreateDIBSection(
+                std::ptr::null_mut(),
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                frame.section.raw(),
+                frame.offset,
+            )
+        };
+        if bitmap.is_null() || bits.is_null() {
+            return Err(format!("CreateDIBSection failed: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: a memory DC compatible with the screen; the bitmap is ours.
+        let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
+        if dc.is_null() {
+            // SAFETY: the bitmap was just made and is selected nowhere.
+            unsafe { DeleteObject(bitmap as _) };
+            return Err(format!("CreateCompatibleDC failed: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: both live; the old object is put back before either goes.
+        let old = unsafe { SelectObject(dc, bitmap as _) };
+        Ok(DirectDib {
+            key: frame.key,
+            dc,
+            bitmap,
+            old,
+            bits: bits.cast_const().cast(),
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+        })
+    }
+}
+
+impl Drop for DirectDib {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Graphics::Gdi::{DeleteDC, SelectObject};
+        // SAFETY: made in `new` and released once, the bitmap deselected
+        // before it is deleted.
+        unsafe {
+            SelectObject(self.dc, self.old);
+            DeleteDC(self.dc);
+            DeleteObject(self.bitmap as _);
+        }
+    }
+}
+
+/// How many buffers' DIBs a window keeps: KWin's swapchain is two or three,
+/// and a buffer the client stopped using ages out.
+const DIBS_KEPT: usize = 4;
+
+/// `ToUi::Direct`: draw `w` from this buffer from now on, or from its shadow
+/// again; then say so, which is what lets the Wayland side release the buffer
+/// drawn from before.
+fn direct(ui: &Rc<Ui>, w: &Rc<WindowState>, frame: Option<super::DirectFrame>, damage: &[Rect], serial: u64) {
+    // A window going away is told with no damage (`State::drop_direct`), and
+    // its shadow was never brought up to date: there is no frame to dump.
+    let shows = frame.is_some() || !damage.is_empty();
+    let ok = match frame {
+        Some(frame) => {
+            let have = w.dibs.borrow().iter().any(|d| d.key == frame.key);
+            let made = if have { Ok(()) } else { DirectDib::new(&frame).map(|d| w.dibs.borrow_mut().push(d)) };
+            match made {
+                Ok(()) => {
+                    w.direct_on.set(Some(frame.key));
+                    let mut dibs = w.dibs.borrow_mut();
+                    while dibs.len() > DIBS_KEPT {
+                        let Some(i) = dibs.iter().position(|d| d.key != frame.key) else { break };
+                        dibs.remove(i);
+                    }
+                    drop(dibs);
+                    present(w, damage);
+                    true
+                }
+                Err(e) => {
+                    eprintln!("wc-compositor: window {} cannot be drawn from its client's buffer: {e}", w.id);
+                    false
+                }
+            }
+        }
+        None => {
+            w.direct_on.set(None);
+            w.dibs.borrow_mut().clear();
+            present(w, damage);
+            true
+        }
+    };
+    if ok && shows {
+        dump_frame(ui, w);
+    }
+    let _ = w.events.send(FromUi::DirectShown { id: w.id, serial, ok });
 }
 
 fn present(w: &Rc<WindowState>, damage: &[Rect]) {
