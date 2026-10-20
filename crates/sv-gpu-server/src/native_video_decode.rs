@@ -1,11 +1,16 @@
 //! Serialized, resolved native decode execution. This staging runtime requires
-//! an actual IDR after reset. It does not advertise readiness or emulate MMCO.
+//! a validated independent picture after reset. It does not advertise readiness or emulate MMCO.
 use crate::{
     native_video::{Decode, H264Reference, Picture, Reference, Session},
     native_video_image::Image,
     video_nv12::videotoolbox::{CompressedBytes, Decoder},
 };
 use std::{collections::HashMap, ops::Range, sync::Arc};
+
+#[path = "native_video_h264.rs"]
+mod h264;
+// Enable only after the fresh hardware non-IDR I fixture is proven natively.
+const NON_IDR_INTRA_BOOTSTRAP_VALIDATED: bool = false;
 
 pub(crate) struct Resources {
     pub source: Arc<dyn CompressedBytes>,
@@ -75,6 +80,7 @@ fn validate_reference(
 }
 // Inspect only original framing/header bytes. Stock Zink does not populate
 // IdrPicFlag/is_intra, so those optional declarations cannot bootstrap VT.
+#[cfg(test)]
 fn actual_idr(bytes: &[u8], range: &Range<usize>, offsets: &[u32]) -> Result<bool, String> {
     let bytes = bytes
         .get(range.clone())
@@ -135,7 +141,13 @@ impl Runtime {
         if source_range.len() as u64 != job.source_range {
             return Err("resolved compressed range length mismatch".into());
         }
-        let idr = actual_idr(source.bytes(), &source_range, &job.slice_offsets)?;
+        let actual = h264::summary(source.bytes(), &source_range, &job.slice_offsets)?;
+        let idr = actual.idr;
+        if actual.reference != job.h264.is_reference || (job.h264.is_intra && !actual.intra) {
+            return Err(
+                "declared picture reference/intra flags disagree with original slice".into(),
+            );
+        }
         if job.h264.idr_pic_flag && !idr {
             return Err("declared IDR is not an IDR NAL".into());
         }
@@ -162,7 +174,21 @@ impl Runtime {
         }
         let reset = job.reset_before || state.decoder.is_none();
         if reset && !idr {
-            return Err("native decoder reset requires actual IDR bootstrap".into());
+            if !actual.intra || !job.references.is_empty() {
+                return Err("native decoder reset requires an independent intra picture".into());
+            }
+            h264::independent_intra(
+                source.bytes(),
+                &source_range,
+                &job.slice_offsets,
+                &job.configuration.sps,
+                &job.configuration.pps,
+                job.h264.frame_num,
+                job.h264.pic_order_cnt,
+            )?;
+            if !NON_IDR_INTRA_BOOTSTRAP_VALIDATED {
+                return Err("native non-IDR intra bootstrap awaits hardware validation".into());
+            }
         }
         let mut slots = state.slots.clone();
         if reset || idr {
@@ -182,7 +208,7 @@ impl Runtime {
         for (reference, image) in job.references.iter().zip(&references) {
             validate_reference(&slots, reference, image, state.generation)?;
         }
-        if !idr && !job.h264.is_intra && job.references.is_empty() {
+        if !actual.intra && job.references.is_empty() {
             return Err("dependent native decode requires explicit validated references".into());
         }
         if let Some(reference) = &job.setup {

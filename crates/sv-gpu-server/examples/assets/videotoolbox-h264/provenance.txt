@@ -99,3 +99,17 @@ convert according to the target allocation's fourcc. Stream range remains
 separate metadata. The fixture also rechecks every retained decoder picture
 and the final target after compressed-source overwrite. This does not claim
 KK/Vulkan sampling or native target-copy success until the coordinated run.
+
+Independent non-IDR intra bootstrap fixture:
+  non-idr-intra-64x50.h264, 156 bytes
+  SHA256 b6dd041390c9e023b739a78b8ac912b52a819f2a86a734d704b0ee6b38dad4c6
+Recreate with generate.py FFMPEG --intra-bootstrap. Same eight source frames,
+Main profile and x264 bframes=2:open-gop=1 replace Baseline/bframes=0. Extract
+only the unchanged SPS/PPS NALs and unchanged original non-IDR I NAL for source
+frame4. No compressed slice bytes are rewritten. The new fixture has one VCL
+NAL type1, slice_type7 (I), frame_num3, POC8 and default nonadaptive marking.
+devhost FFmpeg independently decodes it to 4800 visible YUV bytes, maximum error0
+against the frame4 pattern. Native --intra-bootstrap starts a fresh required-
+hardware VT decoder and uses source frame4 for every raw-pixel oracle. Coded,
+copy-target and joined-target modes remain available. Native proof is required
+before the production runtime enables non-IDR intra reset/bootstrap.

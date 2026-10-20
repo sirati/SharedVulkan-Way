@@ -189,7 +189,13 @@ mod integration {
     }
     fn resources(dst: Arc<Image>, setup: Option<Arc<Image>>, idr: bool) -> Resources {
         Resources {
-            source: Arc::new(Bytes(vec![0, 0, 1, if idr { 0x65 } else { 0x41 }, 9])),
+            source: Arc::new(Bytes(vec![
+                0,
+                0,
+                1,
+                if idr { 0x65 } else { 0x41 },
+                if idr { 0xb8 } else { 0xe0 },
+            ])),
             source_range: 0..5,
             destination: dst,
             setup,
@@ -262,7 +268,7 @@ mod integration {
                 )
             }
             .unwrap_err()
-            .contains("actual IDR")
+            .contains("independent intra")
         );
     }
     #[test]
@@ -275,11 +281,14 @@ mod integration {
         let previous = j.setup.clone().unwrap();
         j.h264.is_reference = false;
         j.h264.is_intra = true;
-        unsafe { rt.execute(&j, resources(target.clone(), Some(target.clone()), false)) }.unwrap();
+        let mut nonreference = resources(target.clone(), Some(target.clone()), false);
+        nonreference.source = Arc::new(Bytes(vec![0, 0, 1, 0x01, 0xb8]));
+        unsafe { rt.execute(&j, nonreference) }.unwrap();
         j.setup = None;
         j.references.push(previous);
         let mut r = resources(target.clone(), None, false);
         r.references.push(target);
+        r.source = Arc::new(Bytes(vec![0, 0, 1, 0x01, 0xb8]));
         assert!(
             unsafe { rt.execute(&j, r) }
                 .unwrap_err()

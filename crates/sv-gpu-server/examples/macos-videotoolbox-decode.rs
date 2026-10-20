@@ -31,6 +31,7 @@ mod fixture {
     const FULL_STREAM: &[u8] = include_bytes!("assets/videotoolbox-h264/full-range-64x50.h264");
     const WIDTH: usize = 64;
     const HEIGHT: usize = 50;
+    const INTRA_STREAM: &[u8] = include_bytes!("assets/videotoolbox-h264/non-idr-intra-64x50.h264");
     const FRAMES: usize = 8;
     #[link(name = "CoreVideo", kind = "framework")]
     unsafe extern "C" {
@@ -210,6 +211,7 @@ mod fixture {
         Ok(())
     }
     pub fn run() -> Result<(), String> {
+        let mut intra_bootstrap = false;
         let mut full_range = false;
         let mut coded_output = false;
         let mut copy_target = false;
@@ -218,6 +220,7 @@ mod fixture {
         for argument in std::env::args().skip(1) {
             match argument.as_str() {
                 "--full-range" => full_range = true,
+                "--intra-bootstrap" => intra_bootstrap = true,
                 "--coded-output" => coded_output = true,
                 "--copy-target" => copy_target = true,
                 #[cfg(sv_nv12_sampling_fixture)]
@@ -227,17 +230,22 @@ mod fixture {
                 }
                 _ => {
                     return Err(
-                        "usage: macos-videotoolbox-decode [--full-range] [--coded-output] [--copy-target]".into(),
+                        "usage: macos-videotoolbox-decode [--full-range] [--coded-output] [--copy-target] [--intra-bootstrap]".into(),
                     );
                 }
             }
+        }
+        if intra_bootstrap && full_range {
+            return Err("intra bootstrap fixture is video-range only".into());
         }
         let expected_range = if full_range {
             PixelRange::Full
         } else {
             PixelRange::Video
         };
-        let stream = if full_range {
+        let stream = if intra_bootstrap {
+            INTRA_STREAM
+        } else if full_range {
             FULL_STREAM
         } else {
             VIDEO_STREAM
@@ -266,7 +274,11 @@ mod fixture {
             }
         }
         let slices: Vec<_> = parsed.iter().filter(|n| matches!(n.0, 1 | 5)).collect();
-        if slices.len() != FRAMES || slices.iter().filter(|n| n.0 == 5).count() != 2 {
+        if intra_bootstrap {
+            if slices.len() != 1 || slices[0].0 != 1 {
+                return Err("bootstrap fixture must contain one non-IDR I picture".into());
+            }
+        } else if slices.len() != FRAMES || slices.iter().filter(|n| n.0 == 5).count() != 2 {
             return Err("fixture must contain two IDR and six P pictures".into());
         }
         eprintln!("fixture stage=map shared source");
@@ -322,7 +334,8 @@ mod fixture {
             ));
         }
         let mut pictures = Vec::new();
-        for (frame, slice) in slices.iter().enumerate() {
+        for (index, slice) in slices.iter().enumerate() {
+            let frame = if intra_bootstrap { 4 } else { index };
             decoder.update_parameters(&stream[sps.2.clone()], &stream[pps.2.clone()])?;
             eprintln!("fixture stage=submit frame={frame} nal_type={}", slice.0);
             let completion =
@@ -400,7 +413,8 @@ mod fixture {
         if source.bytes().iter().any(|b| *b != 0) {
             return Err("source mutation did not reach mapping".into());
         }
-        for (frame, picture) in pictures.iter().enumerate() {
+        for (index, picture) in pictures.iter().enumerate() {
+            let frame = if intra_bootstrap { 4 } else { index };
             verify(
                 picture,
                 frame,
@@ -415,21 +429,27 @@ mod fixture {
             );
             verify(
                 target,
-                FRAMES - 1,
+                if intra_bootstrap { 4 } else { FRAMES - 1 },
                 PixelRange::Video,
                 coded_output,
                 "retained-fixed-target",
             )?;
             println!(
-                "PASS one preallocated NV12 target reused for all {FRAMES} GPU copies without sample-range conversion; stream_range={expected_range:?} target_storage_range=Video"
+                "PASS preallocated NV12 target completed GPU copies without sample-range conversion; stream_range={expected_range:?} target_storage_range=Video"
             );
         }
         unsafe {
             libc::alarm(0);
         }
-        println!(
-            "PASS hardware-required VideoToolbox decoded 2 IDR + 6 P; shared mmap released; retained NV12 pictures unchanged after source overwrite"
-        );
+        if intra_bootstrap {
+            println!(
+                "PASS hardware-required VideoToolbox independently decoded original non-IDR I frame4 after fresh decoder creation; shared mmap released; retained NV12 unchanged after source overwrite"
+            );
+        } else {
+            println!(
+                "PASS hardware-required VideoToolbox decoded 2 IDR + 6 P; shared mmap released; retained NV12 pictures unchanged after source overwrite"
+            );
+        }
         Ok(())
     }
 }
