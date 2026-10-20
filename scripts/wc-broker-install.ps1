@@ -77,6 +77,14 @@ switch ($Action) {
     Secure-Dir $Data $false
     Secure-Dir $Keys $false
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    $baseline = Join-Path $Data "devices.txt"
+    if (-not (Test-Path $baseline)) {
+      if ($svc -or (Test-Path (Join-Path $Before "complete")) -or (Test-Path (Join-Path $Data "devices.secured"))) {
+        throw "lost device baseline; trusted recovery required before changing the service"
+      }
+      [IO.File]::WriteAllBytes($baseline, [byte[]]@())
+      Secure-Path $baseline $false $false
+    }
     if ($svc -and $svc.Status -ne "Stopped") {
       Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
       (Get-Service -Name $Name).WaitForStatus("Stopped", (New-TimeSpan -Seconds 15))

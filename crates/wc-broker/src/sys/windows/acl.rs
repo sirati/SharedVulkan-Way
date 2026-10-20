@@ -348,8 +348,32 @@ fn write_state(dir: &Path, rows: &[SavedDevice]) -> io::Result<()> {
     let text: String = rows.iter().map(|(a, b, c, d, e)| format!("{a}\t{b}\t{c}\t{d}\t{}\n", e.as_deref().unwrap_or(""))).collect();
     std::fs::create_dir_all(dir)?;
     let pending = dir.join("devices.txt.pending");
-    std::fs::write(&pending, text)?;
-    std::fs::rename(pending, state_file(dir))
+    use std::io::Write;
+    let mut file = std::fs::File::create(&pending)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(pending, state_file(dir))?;
+    std::fs::File::open(state_file(dir))?.sync_all()?;
+    let checkpoint = dir.join("devices.secured.pending");
+    let mut file = std::fs::File::create(&checkpoint)?;
+    writeln!(file, "{}", rows.len())?;
+    file.sync_all()?;
+    std::fs::rename(checkpoint, dir.join("devices.secured"))?;
+    std::fs::File::open(dir.join("devices.secured"))?.sync_all()
+}
+
+fn check_baseline(state: &Path) -> Result<Vec<SavedDevice>, String> {
+    if !state_file(state).is_file() {
+        return Err("missing device baseline; trusted recovery required".into());
+    }
+    let rows = read_state(state).map_err(|e| format!("cannot read baseline: {e}"))?;
+    match std::fs::read_to_string(state.join("devices.secured")) {
+        Ok(count) if count.trim().parse::<usize>().ok() == Some(rows.len()) => {},
+        Ok(_) => return Err("incomplete device baseline/checkpoint; trusted recovery required".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}, // retained pre-checkpoint baseline
+        Err(e) => return Err(format!("unreadable device baseline checkpoint: {e}")),
+    }
+    Ok(rows)
 }
 
 /// At the broker's start: every device of ours gets [`DEVICE_SDDL`], as PnP
@@ -357,10 +381,23 @@ fn write_state(dir: &Path, rows: &[SavedDevice]) -> io::Result<()> {
 /// each device's descriptor from before the first run is kept for
 /// [`revert`]. Returns one line per device for the log.
 pub fn secure(devices: &[DeviceAt], state: &Path) -> Vec<String> {
-    let mut rows = match read_state(state) {
+    if !state_file(state).exists() {
+        if state.join("devices.secured").exists() || state.join("pre-broker/complete").exists() {
+            return vec!["devices not secured: lost baseline; trusted recovery required".into()];
+        }
+        // Explicitly record a fresh no-device state too. A missing snapshot
+        // after any mutation must never masquerade as a fresh installation.
+        if let Err(e) = write_state(state, &[]) {
+            return vec![format!("devices not secured: cannot establish baseline: {e}")];
+        }
+    }
+    let mut rows = match check_baseline(state) {
         Ok(rows) => rows,
-        Err(e) => return vec![format!("devices not secured: cannot read baseline: {e}")],
+        Err(e) => return vec![format!("devices not secured: {e}")],
     };
+    if let Err(e) = write_state(state, &rows) {
+        return vec![format!("devices not secured: cannot checkpoint baseline: {e}")];
+    }
     let mut out = Vec::new();
     for (name, instance, _, _, _) in &rows {
         if devices.iter().any(|d| d.name == *name && matches!(d.loc, DeviceLoc::Port(_))) {
@@ -420,7 +457,7 @@ pub fn secure(devices: &[DeviceAt], state: &Path) -> Vec<String> {
 /// direct device open. A persisted SID binding cannot police a reverted
 /// kernel DACL. There is no independently attested drain/reset boundary yet.
 pub fn revert_check(state: &Path) -> Result<(), String> {
-    let rows = read_state(state).map_err(|e| format!("cannot read baseline: {e}"))?;
+    let rows = check_baseline(state)?;
     for (_, instance, path, original, property) in rows {
         let raw = instance.to_ascii_lowercase().starts_with(r"pci\ven_1af4&dev_1110")
             || path.to_ascii_lowercase().contains("df576976-569d-4672-95a0-f57e4ea0b210");
