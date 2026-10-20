@@ -143,8 +143,9 @@ void hl_wc_atomic_end(hl_wc_atomic_scope *scope) {
     scope->active = 0; current_scope = NULL;
 }
 int hl_wc_atomic_begin(hl_wc_atomic_scope *scope) {
+    if (current_scope) return -1; /* Never erase a live nested same-pointer scope. */
     memset(scope, 0, sizeof(*scope));
-    if (current_scope || pthread_once(&once, initialize) != 0 || init_error) return -1;
+    if (pthread_once(&once, initialize) != 0 || init_error) return -1;
     scope->thread = mach_thread_self();
     scope->count = EXC_TYPES_COUNT;
     if (thread_swap_exception_ports(scope->thread, EXC_MASK_BAD_ACCESS, fault_port,
