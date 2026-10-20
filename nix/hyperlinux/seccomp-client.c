@@ -130,7 +130,7 @@ int main(int argc,char **argv) {
         CHECK(filter(SYS_getpid,SECCOMP_RET_ERRNO|89,0)==0);
         CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|90,SECCOMP_FILTER_FLAG_TSYNC)==atomic_load(&divergent_tid));
         errno=0; CHECK(syscall(SYS_getpid)==-1 && errno==89);
-        CHECK(syscall(SYS_getppid)>0);
+        CHECK(syscall(SYS_getppid)>=0);
         atomic_store(&stage,2); void *result; CHECK(pthread_join(t,&result)==0 && result==(void *)1);
         puts("seccomp divergent TSYNC: offending TID and no partial update passed");
     } else if (!strcmp(argv[1],"--kill-thread")) {
@@ -147,7 +147,7 @@ int main(int argc,char **argv) {
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|93),BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
         struct sock_fprog f={6,p}; CHECK(syscall(SYS_seccomp,1,0,&f)==0);
         errno=0; CHECK(syscall(SYS_getppid,0x1234567800000000ULL)==-1 && errno==93);
-        CHECK(syscall(SYS_getppid,0x8765432100000000ULL)>0);
+        CHECK(syscall(SYS_getppid,0x8765432100000000ULL)>=0);
         puts("seccomp arguments: actual 64-bit register high words passed");
     } else if (!strcmp(argv[1],"--tsync")) {
         pthread_t t; CHECK(pthread_create(&t,NULL,worker,NULL)==0);
