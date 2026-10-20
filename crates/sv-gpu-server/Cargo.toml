@@ -65,3 +65,11 @@ wc-broker.workspace = true
 # but a test binary can link both and check they agree.
 sv-icd = { path = "../sv-icd" }
 sv-hostd = { path = "../sv-hostd" }
+
+[features]
+# Isolated native hardware fixture only. Never enables product readiness.
+native-video-fixture = []
+
+[[example]]
+name = "macos-native-video-queue"
+required-features = ["native-video-fixture"]
