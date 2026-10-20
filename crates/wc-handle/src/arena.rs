@@ -185,7 +185,7 @@ pub fn attach_host_bar_leases(id: u32, file: &std::fs::File, expected_run: u64, 
     use std::os::unix::fs::FileExt;
     let mut bytes = [0u8; ENCODED_LEN];
     file.read_exact_at(&mut bytes, 0)?;
-    let header = Header::decode(&bytes)?;
+    let header = Header::decode_for_leases(&bytes)?;
     if header.run_id != expected_run || header.arena_id != id || header.region_len != file.metadata()?.len() || header.outbound.1 == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "BAR run/arena/backend size identity differs"));
     }

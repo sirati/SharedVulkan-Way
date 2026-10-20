@@ -8,6 +8,8 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Lease control dialect, distinct from legacy descriptor-free registry wire 1.
+pub const CONTROL_WIRE_VERSION: u32 = 2;
 pub const SLOTS: usize = 1024;
 pub const DIRECTORY_BYTES: usize = 128 * 1024;
 const MAGIC: u64 = 0x31455341454c4357;
@@ -616,6 +618,22 @@ mod tests {
             )
         }
         .unwrap()
+    }
+    #[test]
+    fn allocation_control_rejects_legacy_wire_version() {
+        use sv_transport::control::{Control, Geometry, ProtocolIds};
+        use sv_transport::region::SharedRegion;
+        let geometry = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(geometry.control_size as usize).unwrap());
+        let _owner = Control::create(
+            region.clone(),
+            geometry,
+            ProtocolIds::new(CONTROL_WIRE_VERSION, 42),
+            1,
+        )
+        .unwrap();
+        assert!(Control::attach(region.clone(), ProtocolIds::new(1, 42)).is_err());
+        assert!(Control::attach(region, ProtocolIds::new(CONTROL_WIRE_VERSION, 42)).is_ok());
     }
     #[test]
     fn producer_drop_never_reclaims_pending_or_consumed_extent() {
