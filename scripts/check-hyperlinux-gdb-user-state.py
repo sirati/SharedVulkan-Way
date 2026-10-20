@@ -26,7 +26,11 @@ with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5) as cha
             reply += value
         checksum = byte() + byte()
         assert int(checksum, 16) == sum(reply) & 255
-        channel.sendall(b"+")
+        try:
+            channel.sendall(b"+")
+        except BrokenPipeError:
+            if payload != "D":
+                raise
         return reply.decode()
     assert packet("?").startswith(("T", "S"))
     original = bytes.fromhex(packet("g"))
