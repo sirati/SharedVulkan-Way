@@ -1553,9 +1553,11 @@ lent and will reuse. What can go wrong, and what holds it:
   by §108.4's rules and nothing else:
   * the provider frees a region only after the peer's `UNMAPPED` for that
     region's epoch, never on a timeout;
-  * the peer answers only after its own mapping is gone and no host process
-    holds the region's lease file (`flock`, released by the kernel when a
-    process dies);
+  * the peer answers only after its own mapping is gone and the broker says
+    every lease on the region has ended (by `close`, by its connection, or
+    by its process's exit, which the kernel reports through a pidfd). After a
+    restart of the daemon, it also waits for every holder its record names
+    (pid and start time);
   * every host mapper unmaps to `PROT_NONE`, so a stale pointer faults in its
     own process;
   * the memory has two holders in the guest (the keeper's handle and the
@@ -1582,9 +1584,13 @@ lent and will reuse. What can go wrong, and what holds it:
     write the region after the guest has reused it, because a dma-buf cannot
     be revoked. Revocation is cooperative (the lease); only a process's death
     is enforced by the kernel.
-  * **Until the broker exists** (it is the shared crate's client role),
-    clients open the whole backend by path (`.ram` run lists, lease files).
-    That is the development stand-in and must not be deployed.
+  * **Built (§108.18).** The broker daemon (`wc-arena-host sessiond
+    --broker`) runs as its own system account with its guest-RAM component.
+    The ICD and the proxy get regions only by `find gpu.<k>`. The run lists
+    and lease files that named the whole backend are gone. A NixOS VM test
+    proves the rules with a nested QEMU guest: a client user cannot open
+    `/dev/udmabuf`, the memfd or `/proc/<qemu>`, and another user's `find`
+    is refused.
 * **A forged or stale stamp points the host at the wrong pages.** The nonce
   is 128 random bits per region and comes from the keeper (a guest process
   can only stamp its own memory, which is its own business). The peer

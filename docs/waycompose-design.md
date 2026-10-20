@@ -34928,10 +34928,10 @@ is `wc-arena-host ram-peer --table-off auto`.
 * A lease that does not fit grows the pool before it is refused
   (`PoolServer::take`). A control region never leaves region 0, because the
   host reads it from the boot device by offset.
-* The ICD maps region K from the run list the peer publishes
-  (`{device}-{K}.ram`). It holds `{device}-{K}-{epoch}.lease` with a shared
-  `flock` while it maps any of it (its mapping lease). When its last lease in
-  K is freed it unmaps to `PROT_NONE` and closes the file.
+* The ICD gets region K from the broker (`find gpu.K`, 108.18): its
+  udmabufs and a lease, which it holds while it maps any of it (its mapping
+  lease). When its last lease in K is freed it unmaps to `PROT_NONE` and
+  closes the broker lease.
 * `MAX_REGIONS` went from 8 to 64, and only region 0 keeps the 64 KiB
   header.
 
@@ -34942,8 +34942,8 @@ provider, and one budget for both.
 * GPU-pool region k ≥ 1 is arena region 1 + k (`GpuRegion::lease_in`,
   `replace_pool_region`), and a grant in it is answered `ok ID region 1+k
   OFFSET LEN`.
-* The proxy maps such a window from `{device}-{k}.ram` and holds the same
-  lease file (`ProvidedRegion::ram_window`).
+* The proxy maps such a window from the parts of `gpu.k` the broker gives
+  it, and holds a broker lease per window (`ProvidedRegion::ram_window`).
 * Wayland leases grow the pool as GPU leases do (`PoolServer::lease_growing`).
 * §110.4's arena table (the arena's first 64 KiB, announced at header byte
   2048 as `"WCRGNTB1"`) stays reserved and unwritten. It is for a substrate
@@ -35138,7 +35138,7 @@ one residual risk and is R43's.
 | machine | `pc` (i440fx), 12 vCPUs, the Intel iGPU by vfio | `q35` (the golden image was installed on it), 4 vCPUs, no GPU passthrough, `virtio-vga` |
 | ivshmem | arena 128 MiB, GPU 1 GiB, the Looking Glass B7 signed driver | one 64 MiB bootstrap device, the same driver |
 | doorbells | `svbell`, `wcbell` | the same two ports |
-| Windows | 11, build 26200, <guest-user>'s | 11 24H2 (26100), debloated golden image, a throwaway overlay |
+| Windows | 11, build 26200, the daily user's | 11 24H2 (26100), debloated golden image, a throwaway overlay |
 
 **What differs, and why it does not change the verdicts.**
 * Without vfio, nothing translates guest pages for a device. The pages here
@@ -35228,8 +35228,9 @@ order:
      previous generation and a restart.
    * Not built until the vmhost test passes and the coordinator approves.
 2. **The keeper as a service** (`sv-guest ram keeper`, LocalSystem,
-   restart on failure) in the guest. No change to <guest-user>'s account rights.
-3. **The peer as a host user unit** beside the bell hub, with `--publish`.
+   restart on failure) in the guest. No change to the guest user's account rights.
+3. **The peer inside the broker daemon** (108.18), with
+   `--guest-ram-qemu-pidfile` and `--guest-ram-user mapped`.
 4. **`--grow-keeper`** on the guest's GPU process (or the compositor's
    `--with-gpu`), with a budget.
 
@@ -35290,9 +35291,9 @@ What the broker exposes to clients:
   closing (liveness by pidfd), which gates `UNMAPPED`;
 * a push of "retiring k" to lease holders.
 
-The lease files and the `.ram` run lists that the ICD and the proxy use today
-are the stand-in. They replace them, and the clients' mapping code stays as
-it is (`map_fixed` per part, `PROT_NONE` on release).
+This is built (108.18). The run lists and lease files the ICD and the proxy
+used before were a stand-in, and they are gone. The clients' mapping code
+stayed as it was: `map_fixed` per part, and `PROT_NONE` on release.
 
 **Revocation** is by lease: a dma-buf cannot be revoked. A process of the
 same uid that keeps a udmabuf past its release can still write the region.
@@ -35317,10 +35318,9 @@ R43 accepts that: one host user is one trust domain.
 
 ### 108.16 Not done, and not proven
 
-* **The broker** (108.15): waiting for the shared crate's first API. Then a
-  NixOS VM test on vmhost: the broker as its own user under systemd, a nested
-  QEMU guest providing the memfd with minimal RAM, clients as an ordinary
-  user that get only their own regions.
+* **The broker**: built and proven in a VM (108.18). One gap remains: a
+  lease taken in the last beat before the daemon crashes is not in its
+  record.
 * **The Intel driver's import of a large-page section view** (108.11).
 * **The GPU process does not ring `0xFB`**; both sides poll while a region
   is in flight (108.9). Ringing needs §110.3's per-range port lookup to give
@@ -35331,11 +35331,10 @@ R43 accepts that: one host user is one trust domain.
   pool killed together before the host lets go.
 * **The arena BAR shrinking to a bootstrap**: a VM configuration change, for
   the user.
-* **The peer's own restart** loses its record of which host processes map
-  which region. The leases make that safe (it waits for them), but regions it
-  mapped itself are answered from state it no longer has: it answers
-  `UNMAPPED` once their leases are free, which is correct only because the
-  peer itself never writes into a region.
+* **The peer's own restart** (the broker daemon's): handled by its record
+  of regions and holders (108.18). It answers an inherited region only when
+  every recorded holder has exited. The peer itself never writes into a
+  region, so its own lost views need no record.
 
 ### 108.17 Gates
 
@@ -35354,6 +35353,95 @@ At the commit that adds this subsection (master `f0b85c3` merged in):
 
 Evidence (logs only, outside the repository):
 `/mnt/datasets/builds/evidence/windows-guest-ram/`.
+
+### 108.18 The broker hands out guest RAM: built, and proven in a VM
+
+Branch `windows-guest-ram`, 2026-10-20, with `broker` (§111) and
+`broker-host` (§111.10) merged in. This replaces the stand-in that 108.13's
+harnesses used: run lists (`{device}-{k}.ram`) naming QEMU's whole RAM memfd,
+and lease files.
+
+**Who holds what.**
+* **The broker daemon** (`wc-arena-host sessiond --broker`, broker-host's
+  daemon) runs as its own system account. That account alone may open
+  `/dev/udmabuf` (group `kvm`), and only it shares the QEMU process's uid,
+  so only it reaches the RAM memfd through `/proc/<qemu>/fd`. It embeds the
+  guest-RAM component, `sv_ram::brokered::GuestRamComponent` (a
+  `wc_broker::host::Embedded`), made from its `--guest-ram-*` flags.
+* **The component** runs the peer loop (`sv_ram::peerloop`: the doorbell,
+  the reconnect, the beat). For each region the guest announces:
+  * it locates, maps and verifies the region, as before;
+  * it cuts the region into udmabufs (`sv_ram::udma`) and checks each one
+    against its own view;
+  * it publishes the region in the broker as pool `gpu.<k>` for the pool's
+    one host user (`--guest-ram-user UID`, or the user the live sessions run
+    as);
+  * only then does it answer `MAPPED`.
+* **A client** (the ICD, the proxy) asks `find gpu.<k>` on its process's
+  broker connection. It gets the udmabufs and a lease, maps each part at its
+  fixed place (the ICD at `k × 4 GiB` of its pool view, the proxy in its
+  window), and closes its fds. The mapping keeps the pages. After it unmaps
+  (`PROT_NONE`), it `close`s the lease.
+* **On `RETIRING`** the component retires the region in the broker: no new
+  `find` gets it, and its holders are told. It answers `UNMAPPED` only once
+  the broker reports the region drained (`on_drained`), which needs every
+  lease ended by `close`, by its connection, or by its process's exit. Then
+  the broker's own udmabufs are closed, and the guest frees the region.
+* **A pool may reuse a region index** while the old epoch still waits for a
+  holder. Published regions are keyed by (index, epoch). `find` returns the
+  newest live one, and each epoch is answered on its own.
+* **The daemon's own restart.** The component records every published
+  region in its state directory: its runs, and its holders as (pid, start
+  time), written at publish and in every beat in which they change. A new run
+  publishes the recorded regions the table still holds, so their holders can
+  find them again. It answers one only once the new broker has drained it
+  *and* every recorded holder has exited (`broker::holders`, §111). Not
+  covered: a lease taken in the last beat (250 ms) before a crash. A hook
+  that runs before a lease's fds are sent would close that gap. It has been
+  asked of the broker's owner.
+
+**The client role never touches a raw resource.** It has no group
+membership and no ACL. A udmabuf reaches exactly its region's pages, and
+the kernel refuses a mapping past them. Clients of another uid get nothing:
+`find` is checked by `SO_PEERCRED` uid.
+
+**The NixOS VM test** (`scripts/wc-guestram-vmtest.sh`,
+`nix/vmtest-guest-ram.nix`). It runs on vmhost's KVM and touches nothing of
+testhost.
+* **The machines.** The VM has 1 GiB. Inside it, a nested QEMU guest with
+  320 MiB, 64 hugetlb pages of 2 MiB, and the RAM as a sealed memfd; a 1 MiB
+  ivshmem bootstrap holds the table.
+* **The users.** The nested QEMU and the daemon run as `wcbroker` (group
+  `kvm`). `alice` is the pool's user; `bob` is another client.
+* **The guest's provider** (`sv-ram-vmtest provider`) stamps hugetlb pages
+  exactly as the Windows keeper stamps large pages (`sv_ram::hugesub`, a test
+  substrate). It keeps the GPU pool's lease rules (`sv_arena::pool`). The
+  test driver commands it through a control page in the shared bootstrap,
+  with no network.
+
+| subtest | result |
+|---|---|
+| growth | 32 MiB region found by the probe (105 µs, 2 runs), mapped and verified (56 µs), published as `gpu.1` for uid 1001 as one udmabuf; announce → `MAPPED` 9.2 ms |
+| zero copy | alice's client mapped it, saw the guest's pattern in every unit, wrote its own; the guest saw it in all 16 units |
+| isolation | bob's `find gpu.1` refused; alice cannot open `/dev/udmabuf`, QEMU's memfd through `/proc/<qemu>/fd/N`, `/proc/<qemu>/mem`, the bootstrap file or the daemon's files, nor list `/proc/<qemu>/fd`; she is not in `kvm` |
+| growth and shrink | 64 and 16 MiB more (located in 188 and 109 µs); region 2 mapped by alice, let go, retired, `UNMAPPED`, freed |
+| address stability | alice's mapping of region 1 kept its address and bytes over 80 checks across two more regions mapped and one retired; region 3 over 57 checks across a daemon restart |
+| a retire refused while the guest holds a lease (an import stand-in) in the region | `retire 1: region: still holds leases` |
+| a retire held by a host lease | `retiring` for 3 s and no `UNMAPPED` while alice mapped it; `UNMAPPED` and freed once she unmapped and closed |
+| the daemon restarted while alice mapped region 3 | the new run published it again (her pid and start time from the record), held the retire "for the previous run's holders" although its own broker had no lease, and answered once her process ended |
+| the guest | no region refused, the nested VM alive throughout |
+
+**The GPU pool end to end** (`scripts/sv-pool-grow-e2e.sh`, now a VM test
+too, `nix/vmtest-pool-grow.nix`). The pool-guest runs as `wcbroker` on
+lavapipe and grows from a sealed memfd (`--grow-ram memfd:MIB`). The client
+user's ICD gets every grown region from the broker. Results: POOLGROW_RESULTS.
+
+**What moved where.** `wc-multi-install.sh` leg 9 used the stand-in. It
+needs an account that may make udmabufs, which the harness's user never is,
+so its guest-RAM part is the two VM tests now. Not covered end to end in a
+VM: the proxy mapping a window of a grown region (`ProvidedRegion::ram_window`,
+the same `find` + `map_fixed` per part as the ICD).
+
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
 Written 2026-10-19, branch `lazy-shm-pools`, from master `3955922`. The same
