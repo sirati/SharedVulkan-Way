@@ -568,6 +568,11 @@ pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option
     if drop_external {
         ci.p_next.retain(|l| !matches!(l, p::PNextLink::VkExternalMemoryImageCreateInfo(x) if x.handle_types.0 != HOST_ALLOCATION));
     }
+    // This adapter binds one complete backing allocation. Plane-specific
+    // requirements and VkBindImagePlaneMemoryInfo are not implemented.
+    if ours && ci.flags.0 & 0x0000_0200 != 0 { // VK_IMAGE_CREATE_DISJOINT_BIT
+        return Err(VK_ERROR_FORMAT_NOT_SUPPORTED);
+    }
     Ok(ours.then_some(img))
 }
 
@@ -583,6 +588,7 @@ pub struct FormatQuery {
 /// for what this path will actually create. `Err` is the answer itself.
 pub fn rewrite_image_format_info(info: &mut p::VkPhysicalDeviceImageFormatInfo2) -> Result<FormatQuery, i32> {
     let mut q = FormatQuery::default();
+    let modifier = info.tiling.0 == TILING_DRM_FORMAT_MODIFIER;
     if info.tiling.0 == TILING_DRM_FORMAT_MODIFIER {
         let m = info.p_next.iter().find_map(|l| match l {
             p::PNextLink::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(x) => Some(x.drm_format_modifier),
@@ -610,6 +616,9 @@ pub fn rewrite_image_format_info(info: &mut p::VkPhysicalDeviceImageFormatInfo2)
     }
     if strip {
         info.p_next.retain(|l| !matches!(l, p::PNextLink::VkPhysicalDeviceExternalImageFormatInfo(_)));
+    }
+    if (modifier || q.dma_buf) && info.flags.0 & 0x0000_0200 != 0 {
+        return Err(VK_ERROR_FORMAT_NOT_SUPPORTED);
     }
     Ok(q)
 }
@@ -844,6 +853,32 @@ mod tests {
         assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT));
         let mut ci = image(TILING_DRM_FORMAT_MODIFIER, vec![list(&[7])]);
         assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn disjoint_adapter_images_and_format_queries_are_refused() {
+        for tiling in [TILING_DRM_FORMAT_MODIFIER, TILING_LINEAR] {
+            let mut ci = image(tiling, vec![list(&[DRM_FORMAT_MOD_LINEAR]), external(DMA_BUF)]);
+            ci.flags = p::VkImageCreateFlags(0x0000_0200);
+            assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
+        }
+        let mut ci = image(TILING_LINEAR, vec![]);
+        ci.flags = p::VkImageCreateFlags(0x0000_0200);
+        assert!(rewrite_image_create_info(&mut ci).unwrap().is_none());
+
+        let mut info = p::VkPhysicalDeviceImageFormatInfo2::default();
+        info.tiling = p::VkImageTiling(TILING_LINEAR);
+        info.flags = p::VkImageCreateFlags(0x0000_0200);
+        let mut external = p::VkPhysicalDeviceExternalImageFormatInfo::default();
+        external.handle_type = p::VkExternalMemoryHandleTypeFlagBits(DMA_BUF as i32);
+        info.p_next.push(p::PNextLink::VkPhysicalDeviceExternalImageFormatInfo(Box::new(external)));
+        assert_eq!(rewrite_image_format_info(&mut info), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
+
+        let mut info = p::VkPhysicalDeviceImageFormatInfo2::default();
+        info.tiling = p::VkImageTiling(TILING_DRM_FORMAT_MODIFIER);
+        info.flags = p::VkImageCreateFlags(0x0000_0200);
+        info.p_next.push(p::PNextLink::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(Box::default()));
+        assert_eq!(rewrite_image_format_info(&mut info), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
     }
 
     #[test]
