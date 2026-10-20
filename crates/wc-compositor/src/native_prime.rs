@@ -75,7 +75,6 @@ pub struct Buffer {
     surface: Arc<wc_handle::iosection::Surface>,
     spec: BufferSpec,
     sync: Option<SyncPage>,
-    mapping: wc_handle::Mapping,
 }
 fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
@@ -127,17 +126,11 @@ impl Parameters {
             return Err(invalid("allocation extent mismatch"));
         }
         let sync = SyncPage::open(plane.imported.clone())?;
-        let handle = wc_handle::Handle::from_descriptor(wc_handle::Descriptor::SharedFile {
-            path: token.name.clone(),
-            size: token.size,
-        });
-        let mapping = handle.map()?;
         Ok(Buffer {
             imported: plane.imported,
             surface: Arc::new(surface),
             spec,
             sync,
-            mapping,
         })
     }
 }
@@ -184,13 +177,19 @@ impl PixelSource for Source {
             .spec
             .required_len()
             .ok_or_else(|| PixelError::Unreadable("buffer extent".into()))?;
-        let bytes = source
-            .mapping
-            .as_slice()
-            .get(..need)
-            .ok_or_else(|| PixelError::Unreadable("allocation extent".into()))?;
-        f(bytes, source.spec);
-        Ok(())
+        // SAFETY: producer work completed above. Wayland buffer ownership
+        // forbids producer reuse until release. The retained exact IOSurface
+        // and its read lock cover this closure; no namespace is reopened.
+        unsafe {
+            source.surface.read_snapshot(|bytes, _, _, _| {
+                let bytes = bytes
+                    .get(..need)
+                    .ok_or_else(|| PixelError::Unreadable("allocation extent".into()))?;
+                f(bytes, source.spec);
+                Ok(())
+            })
+        }
+        .unwrap_or_else(|| Err(PixelError::Unreadable("IOSurface read lock".into())))
     }
 }
 
