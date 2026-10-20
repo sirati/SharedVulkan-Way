@@ -62,6 +62,8 @@ pub enum Phase {
     TransferCancelled = 7,
     GrantRetired = 8,
     Resize = 9,
+    RegisterProducer = 10,
+    RegisterConsumer = 11,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Payload {
@@ -134,6 +136,20 @@ impl Message {
         let no_extent = p.offset == 0 && p.capacity == 0 && p.length == 0;
         let shape = match self.phase {
             Phase::Grant | Phase::GrantRetired => p == Payload::default(),
+            Phase::RegisterProducer => {
+                p.producer_registration != 0
+                    && p == Payload {
+                        producer_registration: p.producer_registration,
+                        ..Payload::default()
+                    }
+            }
+            Phase::RegisterConsumer => {
+                p.recipient_registration != 0
+                    && p == Payload {
+                        recipient_registration: p.recipient_registration,
+                        ..Payload::default()
+                    }
+            }
             Phase::Allocate | Phase::Resize => {
                 p.producer_registration != 0
                     && p.recipient_registration == 0
@@ -258,6 +274,8 @@ impl Message {
             7 => Phase::TransferCancelled,
             8 => Phase::GrantRetired,
             9 => Phase::Resize,
+            10 => Phase::RegisterProducer,
+            11 => Phase::RegisterConsumer,
             _ => return Err(bad("unknown service control phase")),
         };
         let sequence = r.u64()?;
@@ -480,5 +498,51 @@ mod tests {
         m = fixture();
         m.binding.linux_run = 0;
         assert!(m.encode().is_err());
+    }
+}
+
+#[cfg(test)]
+mod registration_phase_tests {
+    use super::*;
+    #[test]
+    fn registrations_require_only_exact_corresponding_id_after_full_grant_binding() {
+        for (phase, producer) in [
+            (Phase::RegisterProducer, true),
+            (Phase::RegisterConsumer, false),
+        ] {
+            let mut message = fixture();
+            message.phase = phase;
+            message.payload = if producer {
+                Payload {
+                    producer_registration: 41,
+                    ..Payload::default()
+                }
+            } else {
+                Payload {
+                    recipient_registration: 52,
+                    ..Payload::default()
+                }
+            };
+            assert_eq!(
+                Message::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+            for field in 0..8 {
+                let mut wrong = message.clone();
+                match field {
+                    0 => wrong.payload.producer_registration = if producer { 0 } else { 41 },
+                    1 => wrong.payload.recipient_registration = if producer { 52 } else { 0 },
+                    2 => wrong.payload.allocation = 42,
+                    3 => wrong.payload.transfer = 61,
+                    4 => wrong.payload.consumer = 71,
+                    5 => wrong.payload.offset = 4096,
+                    6 => wrong.payload.capacity = 4096,
+                    _ => wrong.payload.length = 1,
+                }
+                assert!(wrong.encode().is_err());
+            }
+            message.binding.grant = 0;
+            assert!(message.encode().is_err());
+        }
     }
 }

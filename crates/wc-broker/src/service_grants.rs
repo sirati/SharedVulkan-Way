@@ -23,6 +23,11 @@ use std::{
     },
 };
 
+mod remote;
+pub use remote::{
+    RemoteAllocationId, RemoteApplied, RemoteConsumerId, RemotePending, RemoteRegistration,
+};
+
 const PAGE: u64 = 4096;
 fn denied(s: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, s)
@@ -75,7 +80,7 @@ pub struct GrantId {
     id: u64,
     owner: Arc<()>,
 }
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProcessRole {
     Producer,
     Consumer,
@@ -151,6 +156,7 @@ pub unsafe trait ProjectionBackend<B: OriginalBacking> {
     ) -> io::Result<Self::Projection>;
 }
 struct NativeProcess {
+    role: ProcessRole,
     process: Arc<dyn ServiceProcess>,
     revoked: AtomicBool,
 }
@@ -176,6 +182,7 @@ struct Record<B: OriginalBacking> {
     producers: BTreeMap<Key, Process>,
     consumers: BTreeMap<(Key, Consumer), Process>,
     quarantined: bool,
+    remote: remote::State,
 }
 /// Owns all categories and all sessions in one physical free list. Construction
 /// claims the context exactly once; dropping it cannot start a parallel owner.
@@ -446,6 +453,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 producers: BTreeMap::new(),
                 consumers: BTreeMap::new(),
                 quarantined: false,
+                remote: remote::State::default(),
             },
         );
         Ok(GrantId {
@@ -515,6 +523,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             return Err(denied("process user differs from canonical grant"));
         }
         let native = NativeProcess {
+            role,
             process,
             revoked: AtomicBool::new(false),
         };
@@ -1275,5 +1284,296 @@ mod tests {
             let (c, _) = context(Origin::Windows, Store::default(), false);
             assert!(unsafe { ProtectedGrants::start(c, bad) }.is_err());
         }
+    }
+    fn remote_setup() -> (
+        Owner,
+        Owner,
+        Life,
+        Life,
+        GrantId,
+        GrantId,
+        RegisteredProcess,
+        RegisteredProcess,
+        Arc<Watch>,
+    ) {
+        let (w, watch) = context(Origin::Windows, Store::default(), false);
+        let (l, _) = context(Origin::Linux, Store::default(), false);
+        let mut enrolled = binding();
+        enrolled.roles.consumer = Origin::Linux;
+        let mut wl = unsafe {
+            Lifecycle::start(
+                w.clone(),
+                "test-install",
+                KEY,
+                enrolled.clone(),
+                BootstrapRole::Initiator,
+            )
+            .unwrap()
+        };
+        let mut ll = unsafe {
+            Lifecycle::start(
+                l.clone(),
+                "test-install",
+                KEY,
+                enrolled,
+                BootstrapRole::Responder,
+            )
+            .unwrap()
+        };
+        let h = wl.hello().unwrap();
+        let c = ll.receive(&h).unwrap().unwrap();
+        let f = wl.receive(&c).unwrap().unwrap();
+        ll.receive(&f).unwrap();
+        let (mut a, mut b) = (owner(&w), owner(&l));
+        let ga = a.grant(&mut wl, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let frame = a.grant_frame(&wl, &ga).unwrap();
+        let gb = b.accept_grant(&mut ll, &frame).unwrap();
+        let (p, _) = process(&mut a, &wl, &ga);
+        let native = Arc::new(Watch(AtomicU8::new(0)));
+        let c = unsafe {
+            b.register_consumer(&ll, &gb, User::uid(binding().linux_uid), native)
+                .unwrap()
+        };
+        (a, b, wl, ll, ga, gb, p, c, watch)
+    }
+    #[test]
+    fn remote_registration_allocation_pending_accept_are_current_typed_and_one_shot() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        assert!(matches!(
+            b.apply_remote(&ll, &gb, &frame).unwrap(),
+            RemoteApplied::Registered(_)
+        ));
+        assert!(b.apply_remote(&ll, &gb, &frame).is_err());
+        assert!(a.announce_registration(&wl, &p).is_err());
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote_consumer = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(reg) => reg,
+            _ => panic!("registration"),
+        };
+        let (allocation, extent) = a.allocate(&wl, &p, 1, 2 * PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        let mirrored = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Allocated(id, e) => {
+                assert_eq!(e, extent);
+                id
+            }
+            _ => panic!("allocation"),
+        };
+        assert!(a.announce_allocation(&wl, &p, &allocation).is_err());
+        let frame = a
+            .resize_and_announce(&wl, &p, &allocation, 2 * PAGE)
+            .unwrap();
+        assert!(
+            matches!(b.apply_remote(&ll,&gb,&frame).unwrap(),RemoteApplied::Resized(_,e) if e.offset==extent.offset&&e.capacity==extent.capacity&&e.length==2*PAGE)
+        );
+        let frame = a
+            .prepare_remote(&wl, &p, &allocation, &remote_consumer)
+            .unwrap();
+        let pending = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Prepared(pending) => pending,
+            _ => panic!("pending"),
+        };
+        let (consumer, frame) = b.accept_remote(&ll, &c, &pending).unwrap();
+        assert!(b.accept_remote(&ll, &c, &pending).is_err());
+        assert!(matches!(
+            a.apply_remote(&wl, &ga, &frame).unwrap(),
+            RemoteApplied::Accepted
+        ));
+        assert!(a.apply_remote(&wl, &ga, &frame).is_err());
+        let target = b.records[&gb.id].processes[&c.process].process.clone();
+        let mut backend = Backend {
+            target,
+            calls: 0,
+            fail: false,
+        };
+        let (guard, e, access) = b
+            .project_remote_consumer(&ll, &c, &consumer, &mut backend)
+            .unwrap();
+        assert_eq!(
+            (e.offset, e.capacity, e.length),
+            (extent.offset, 2 * PAGE, 2 * PAGE)
+        );
+        assert_eq!(access, ProjectionAccess::ReadOnly);
+        assert_eq!(guard.binding().grant_offset, extent.offset);
+        let _ = mirrored; // opaque ID cannot authorize native producer operations.
+    }
+    // Test-only malicious privileged peer signer. Production owner has no
+    // arbitrary-payload signing API, and native adapters cannot call this.
+    fn forge_next(
+        owner: &mut Owner,
+        life: &Life,
+        grant: &GrantId,
+        phase: Phase,
+        payload: Payload,
+    ) -> Frame {
+        life.seal(
+            &mut owner.records.get_mut(&grant.id).unwrap().channel,
+            phase,
+            payload,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn remote_apply_rejects_unknown_duplicate_foreign_and_overlapping_resource_records() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let pid = p.process.registration();
+        let duplicate = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::RegisterProducer,
+            Payload {
+                producer_registration: pid,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &duplicate).is_err());
+        let (allocation, extent) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let unknown = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Allocate,
+            Payload {
+                producer_registration: pid + 999,
+                allocation: 99,
+                offset: extent.offset,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &unknown).is_err());
+        let good = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &good).unwrap();
+        let overlap = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Allocate,
+            Payload {
+                producer_registration: pid,
+                allocation: 999,
+                offset: extent.offset,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &overlap).is_err());
+        let moved = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Resize,
+            Payload {
+                producer_registration: pid,
+                allocation: allocation.key.allocation,
+                offset: extent.offset + PAGE,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &moved).is_err());
+        let unaligned = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Allocate,
+            Payload {
+                producer_registration: pid,
+                allocation: 998,
+                offset: extent.offset + PAGE + 1,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &unaligned).is_err());
+        let missing = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Prepare,
+            Payload {
+                producer_registration: pid,
+                allocation: allocation.key.allocation,
+                recipient_registration: c.process.registration(),
+                transfer: 123,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &missing).is_err()); // local watch not yet announced to peer
+        let cframe = b.announce_registration(&ll, &c).unwrap();
+        a.apply_remote(&wl, &ga, &cframe).unwrap();
+        let wrong = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Prepare,
+            Payload {
+                producer_registration: pid,
+                allocation: allocation.key.allocation,
+                recipient_registration: c.process.registration() + 1,
+                transfer: 124,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &wrong).is_err());
+    }
+    #[test]
+    fn remote_apply_checks_live_context_and_native_consumer_at_actual_mutation() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, watch) = remote_setup();
+        let pframe = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &pframe).unwrap();
+        let cframe = b.announce_registration(&ll, &c).unwrap();
+        let recipient = match a.apply_remote(&wl, &ga, &cframe).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let aframe = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &aframe).unwrap();
+        let prepared = a.prepare_remote(&wl, &p, &allocation, &recipient).unwrap();
+        // Endpoint failure blocks apply despite a cryptographically valid frame.
+        watch.0.store(2, Ordering::SeqCst);
+        assert!(a.apply_remote(&wl, &ga, &cframe).is_err());
+        watch.0.store(0, Ordering::SeqCst);
+        assert!(a.prepare_remote(&wl, &p, &allocation, &recipient).is_err());
+        let _ = b.apply_remote(&ll, &gb, &prepared).unwrap(); // already-created remote pending remains valid
+    }
+    #[test]
+    fn remote_pending_apply_refuses_dead_exact_local_consumer_and_never_reuses_ids() {
+        let (mut a, mut b, wl, ll, ga, gb, p, _c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let native = Arc::new(Watch(AtomicU8::new(0)));
+        let c = unsafe {
+            b.register_consumer(&ll, &gb, User::uid(binding().linux_uid), native.clone())
+                .unwrap()
+        };
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = a.prepare_remote(&wl, &p, &allocation, &remote).unwrap();
+        native.0.store(1, Ordering::SeqCst);
+        assert!(b.apply_remote(&ll, &gb, &frame).is_err());
+        native.0.store(0, Ordering::SeqCst);
+        let next = a.prepare_remote(&wl, &p, &allocation, &remote).unwrap();
+        assert!(b.apply_remote(&ll, &gb, &next).is_err()); // native revocation persists
+        // No native death/failed apply removes canonical capacity or allows a
+        // producer to choose that same physical allocation under another key.
+        let (other, extent) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        assert_ne!(other.key, allocation.key);
+        assert_eq!(extent.offset, 2 * PAGE);
     }
 }
