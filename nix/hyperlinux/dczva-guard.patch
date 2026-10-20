@@ -20,7 +20,33 @@
  5:  hvc #12
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
-@@ -1484,6 +1484,57 @@
+@@ -833,6 +833,8 @@
+                   guest_t *g, int verbose, int timeout_sec, int is_main) {
+     int exit_code = 0;
+     int running = 1;
++    int dc_fault_kind = 0;
++    uint64_t dc_fault_addr = 0;
+     int iter = 0;
+     /* The watchdog is now OPT-IN and covers the main vCPU only: it fires when
+      * the guest runs `timeout_sec` seconds without a VM exit (a coarse hang
+@@ -1365,6 +1367,16 @@
+                 }
+ 
+                 case 11: {
++                    if (dc_fault_kind) {
++                        uint64_t fault_addr = dc_fault_addr;
++                        dc_fault_kind = 0;
++                        if (signal_force_fault(vcpu, g, &exit_code,
++                                                LINUX_SIGBUS, LINUX_BUS_ADRERR,
++                                                fault_addr,
++                                                (UINT64_C(0x24) << 26) | 0x4f) < 0)
++                            running = 0;
++                        break;
++                    }
+                     /* HVC #11: EL0 fault → deliver signal.
+                      *
+                      * The shim forwards EL0 faults here for signal delivery.
+@@ -1484,6 +1496,59 @@
                      break;
                  }
  
@@ -64,6 +90,8 @@
 +                    }
 +                    pthread_mutex_unlock(&mmap_lock);
 +                    if (!copy_ok) {
++                        dc_fault_kind = 1;
++                        dc_fault_addr = original & UINT64_C(0x00ffffffffffffff);
 +                        uint64_t far = original & UINT64_C(0x00ffffffffffffff);
 +                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, far);
 +                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ESR_EL1,
