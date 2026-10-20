@@ -84,6 +84,8 @@ pub mod locate;
 pub mod qemu;
 #[cfg(target_os = "linux")]
 pub mod qemu_bar;
+#[cfg(target_os = "linux")]
+pub mod unix_peer;
 
 /// How the daemon obtained the extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
