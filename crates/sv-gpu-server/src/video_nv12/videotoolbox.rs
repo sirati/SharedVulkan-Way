@@ -380,8 +380,17 @@ impl Decoder {
                 ),
                 "H.264 format",
             )?;
-            let output_range = format_range(&format)?;
-            trace(format_args!("format output range={output_range:?}"));
+            let described_range = format_range(&format)?;
+            // The explicit H.264 VUI bit is authoritative even when a platform
+            // format description omits its optional FullRangeVideo extension.
+            let output_range = if extent.full_range {
+                PixelRange::Full
+            } else {
+                PixelRange::Video
+            };
+            trace(format_args!(
+                "format described range={described_range:?}; SPS output range={output_range:?}"
+            ));
             let specification = dictionary(
                 &[kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder],
                 &[kCFBooleanTrue],
@@ -483,7 +492,16 @@ impl Decoder {
                 "updated H.264 format",
             )?;
         }
-        if format_range(&candidate)? != self.output_range {
+        let described_range = format_range(&candidate)?;
+        let candidate_range = if geometry.full_range {
+            PixelRange::Full
+        } else {
+            PixelRange::Video
+        };
+        trace(format_args!(
+            "updated format described range={described_range:?}; SPS output range={candidate_range:?}"
+        ));
+        if candidate_range != self.output_range {
             return Err(
                 "VideoToolbox NV12 range change requires explicit reset/IDR boundary".into(),
             );
@@ -894,6 +912,7 @@ struct Geometry {
     display_extent: [u32; 2],
     crop_origin: [u32; 2],
     crop_bits: Range<usize>,
+    full_range: bool,
 }
 fn validate_sps(sps: &[u8]) -> Result<Geometry, String> {
     if sps.first().map(|x| x & 0x9f) != Some(7) {
@@ -1000,6 +1019,27 @@ fn validate_sps(sps: &[u8]) -> Result<Geometry, String> {
         .checked_sub(crop[2].checked_add(crop[3]).ok_or("SPS crop overflow")?)
         .filter(|n| *n != 0)
         .ok_or("invalid SPS vertical crop")?;
+    // VUI begins immediately after cropping. Only fields preceding the range
+    // bit need parsing; HRD/color metadata after it stays in the original SPS.
+    let mut full_range = false;
+    if b.read(1)? != 0 {
+        // vui_parameters_present_flag
+        if b.read(1)? != 0 {
+            // aspect_ratio_info_present_flag
+            if b.read(8)? == 255 {
+                b.read(16)?;
+                b.read(16)?;
+            }
+        }
+        if b.read(1)? != 0 {
+            b.read(1)?;
+        } // overscan_info/appropriate
+        if b.read(1)? != 0 {
+            // video_signal_type_present_flag
+            b.read(3)?; // video_format
+            full_range = b.read(1)? != 0;
+        }
+    }
     if width > 8192 || height > 8192 {
         return Err("H.264 coded extent exceeds decoder limit".into());
     }
@@ -1008,6 +1048,7 @@ fn validate_sps(sps: &[u8]) -> Result<Geometry, String> {
         display_extent: [display_width, display_height],
         crop_origin: [crop[0], crop[2]],
         crop_bits: crop_start..crop_end,
+        full_range,
     })
 }
 
@@ -1265,5 +1306,24 @@ mod normalization_tests {
             normalize_sps_crop(&normalized, &normalized_metadata).unwrap(),
             normalized
         );
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    #[test]
+    fn reads_explicit_full_range_vui_and_preserves_it_when_uncropping() {
+        let sps = [
+            0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9f, 0x88, 0x9b, 0x20, 0, 0, 3, 0, 0x20, 0, 0, 6,
+            0x41, 0xe2, 0x44, 0xd4,
+        ];
+        let original = validate_sps(&sps).unwrap();
+        assert!(original.full_range);
+        assert_eq!(original.display_extent, [64, 50]);
+        let coded = normalize_sps_crop(&sps, &original).unwrap();
+        let normalized = validate_sps(&coded).unwrap();
+        assert!(normalized.full_range);
+        assert_eq!(normalized.display_extent, [64, 64]);
     }
 }
