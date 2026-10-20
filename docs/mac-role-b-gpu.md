@@ -39,6 +39,11 @@ queries for BGRA8 and RGBA8, with and without MUTABLE_FORMAT, both plain
 LINEAR and LINEAR DRM modifier chains when advertised. Build it on the
 build host for the guest architecture, then run with the same render-node
 namespace and ICD environment as the app. It creates no windows or allocations.
+`scripts/probe-vk-gpu.nix` packages both probes. Pass the guest nixpkgs
+`pkgsCross.aarch64-multiplatform` package set to its `pkgs` argument to build on
+the build host with the guest loader and C runtime. Copy the result to the
+guest without building there.
+
 A successful external query paired with a failed plain color query isolates the
 preflight disagreement. Keep the result distinct from an allocation proof.
 
