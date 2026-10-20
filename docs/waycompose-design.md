@@ -34016,6 +34016,206 @@ with full suites alongside as load.
   `soundring::spawn`'s thread keeps the `Control` alive as long as it runs: 24
   parallel suite runs, 0 failures.
 
+### 105.14 An isolated request: the hop timeline, and what each hop cost
+
+105.13's numbers were for requests that followed each other. The user's bound
+is for every request, and the common one is the opposite: a click after the
+machine sat idle, which finds every thread on both sides parked and every
+core in an idle state. Measured on the guest before this section
+(installation `wcivs`, session 0, release build, `rtt`):
+
+| gap between requests | mean | p50 | p90 | p99 |
+|---|---|---|---|---|
+| none (back to back) | 21.3 µs | 18.6 | 21.6 | 40.2 |
+| 20 ms | 694.9 µs | 418.8 | 1496.3 | 1943.3 |
+| 1 s | 1061.5 µs | 922.1 | 1683.0 | 3614.2 |
+
+**The instrument.** `WC_HOP_TRACE=FILE` (`%p` is the pid) makes a process
+stamp each hop of a request with the machine's monotonic counter in
+nanoseconds (`frametrace::hop`: a counter read and a push under an
+uncontended lock; a thread of its own writes the file every half second).
+The guest's stamps are `QueryPerformanceCounter`, the host's
+`CLOCK_MONOTONIC`, which is also what bpftrace's `nsecs` reads, so the
+proxy's stamps line up with a kernel trace of the same run
+(`scripts/wc-hop-host.bt`: wakeups, the C-state each woken thread's CPU
+came out of, KVM's halt wakeups, and the one-byte bell reads and writes of
+QEMU, the hub and the proxy). The two machines' clocks are fitted from the
+back-to-back runs before and after each measurement, where both sides spin:
+per request the guest writes the ring (g1), the proxy reads it (h1) and
+answers (h2), and the guest sees the answer (g2); the fastest tenth gives
+the offset to 0.2 µs, and the line through two such runs follows the drift,
+which was 40–100 ppm between QPC and the host's slewed monotonic clock.
+`scripts/wc-hop-timeline.py` and `scripts/wc-hop-host.py` print the tables
+below. The harness that drives the guest (session 0 only, one lease per run)
+and every run's raw data are kept out of the repository, with the evidence.
+
+Stamps, in order: `L.send`/`L.recv` (the launcher around one request),
+`C.line` (the compositor has read the request from the launcher's socket),
+`C.ringtx0`/`C.ringtx1` (around writing it into the control ring),
+`bell.poke` (the doorbell rung), `bell.wr0`/`bell.wr1` (the old detached
+writer thread around its `WriteFile`) or `bell.issued` (the new inline
+write issued), `door.rx` (a doorman read a bell byte), `P.unpark`/`P.rx`/
+`P.tx` (the proxy's control thread woke, read the request, wrote the
+answer), `C.park`/`C.unpark`/`C.reply` (the compositor gave up spinning,
+was woken, saw the answer), `C.socktx` (the answer written to the
+launcher's socket).
+
+**Before**, 20 ms between requests (µs after `L.send`; p50 and mean):
+
+| hop | p50 | mean |
+|---|---|---|
+| the compositor's request thread wakes on its socket (`C.line`) | 39.7 | 45.2 |
+| request in the ring, bell rung (`bell.poke`) | 44.5 | 50.1 |
+| the detached writer thread wakes and starts its `WriteFile` (`bell.wr0`) | 105.3 | 407.6 |
+| the proxy's doorman has the byte (`H:door.rx`) | 308.4 | 550.2 |
+| the proxy's control thread is awake and has the request (`H:P.rx`) | 366.6 | 593.1 |
+| the answer written (`H:P.tx`) | 369.7 | 609.7 |
+| the compositor sees it (`C.reply`); 154 of 500 had stopped spinning at 1 ms and waited for a bell back | 384.8 | 664.3 |
+| the launcher has it (`L.recv`) | 418.3 | 693.2 |
+
+At 1 s between requests the same hops were 61.6 (the compositor's wake),
+389 (the writer thread's wake, mean 598), 608 (the doorman), 660 (the control
+thread), 793 (the compositor) and 859 µs (the launcher; mean 1050).
+
+The host's half, from the kernel trace (815 requests that found the proxy
+parked; p50/mean):
+
+| hop | p50 | mean |
+|---|---|---|
+| QEMU's main thread woken by the vCPU's kick (ioeventfd) until it runs | 2.6 | 4.4 |
+| QEMU's virtio-serial work until it writes the byte to the hub | 33.1 | 32.3 |
+| the hub's reader woken and running | 5.5 | 15.5 |
+| the hub reads the byte, then sends it to every client in turn | 6.0 + 20.1 | 6.7 + 26.0 |
+| the proxy's doorman woken and running | 24.9 | 41.1 |
+| the doorman reads the byte, rings the lane (`door.rx`) | 10.1 | 17.3 |
+| the control thread woken by the doorman's futex wake and running | 17.3 + 6.4 | 32.3 + 10.2 |
+| **QEMU woken to the proxy reading the request** | **156.6** | **184.5** |
+
+The CPUs those threads ran on came out of C1 or C2 almost every time
+(the hub and the proxy on the host's two user cores, 14–15; C3, with its
+1 ms exit latency, in 4%), so this was not the deep idle states 105.13
+suspected. It was the number of thread wakes in a row, each a few to tens
+of microseconds on a core that had been idle and clocked down, on both
+machines.
+
+**What changed, hop by hop.**
+
+1. **The guest's bell is written by the thread that rang it** (Windows
+   only: `winpipe::AsyncWriter`). The detached writer (§99.5) handed every
+   bell byte to a thread of its own, and on an idle guest that thread's
+   wake was the slowest hop on the guest: 61 µs p50 at 20 ms gaps, 318 µs at
+   1 s, with a tail past a millisecond. The ringing thread now issues the
+   overlapped `WriteFile` itself (the virtqueue kick happens inside that
+   call) and never waits for it: the request and its byte live in one of 32
+   slots until the write completes, which the next write notices. A pool
+   whose writes all still pend (a host end that stopped draining) has them
+   cancelled and the byte refused, which the bell counts as dropped as it
+   counted a full queue; §99.5's promise, that a port that stops draining
+   never stops a ring thread, is kept with no thread. The call itself costs
+   20–50 µs on the guest (vioser's request path and the kick's exit).
+   `WC_BELL_INLINE=0` puts the detached writer back, to compare.
+2. **The hub rings the lane itself** (shared: `bellhub::DirectRings`,
+   `--port UPSTREAM=HUB,rings=FILE`). The hub already reads every byte the
+   guest rings; the lanes' wake words are in the ring region at the tail of
+   the shared-memory file, which the hub maps as the proxy does, and a
+   `FUTEX_WAKE` on a shared file mapping reaches a waiter in any process that
+   maps the file. So the waiting thread is woken by the hub's own thread,
+   and the two wakes after it (the proxy's doorman, then the doorman's futex
+   wake of the waiter: 71 µs p50, 90 mean, from the hub's read to the control
+   thread being woken) are gone from the path. The clients still get every
+   byte; for a futex waiter their wake is a spurious one, and a waiter that
+   waits some other way (the proxy's eventfd per Wayland connection) still
+   needs it. The hub attaches only the ring layout
+   (`Control::attach_for_bells`: the protocol's ids are read from the region,
+   the layout is checked as for any attach), follows the header's run id to
+   a new compositor, and rings nothing while the file has no rings.
+   `bellhub::tests::the_hub_wakes_a_lane_waiter_in_a_shared_file_with_no_client`.
+3. **Every wait for an answer yields while it spins, and only the side that
+   must spin does** (shared). 105.13's spins were busy loops. On the guest a
+   busy spin held its vCPU against the very thread it was waiting for:
+   Windows does not move a woken thread to an idle core that is parked, so
+   the launcher spinning for its answer kept the compositor's request
+   thread off the vCPU for the length of the spin, and two busy spinners on
+   one vCPU lost it for a 15.6 ms tick. The compositor's wait for the host's
+   answer now yields (`SwitchToThread`) for up to 2 ms (it was a busy 1 ms;
+   a third of the 20 ms-gap requests used to outlast it and need a bell
+   back), and the proxy's 200 µs spin yields too. The launcher no longer
+   spins at all: on a loaded guest (a game at half a core) its yielding spin
+   and the compositor's shared a vCPU and lost it to the load for 10–25 ms,
+   where a thread blocked on the socket is woken with the wait's priority
+   boost. `WC_LAUNCH_SPIN_US` and `WC_CTL_SPIN_US` set them, to measure.
+
+**Which hops are whose.** For another platform (the real Mac, §103.17):
+
+| hop | where it lives | platform |
+|---|---|---|
+| the launcher's request to the compositor (a local socket) | `wc-launch`, `session_svc` | Windows only: on macOS the launcher and the main process are one |
+| the compositor's thread wakes on that socket | guest scheduler | Windows only |
+| the bell's write (vioser `WriteFile`, the kick) | `winpipe` | Windows (a virtio-console write and its kick on Linux/libkrun) |
+| the hypervisor carrying the kick to the host's port (QEMU's main loop: 33 µs here) | QEMU | QEMU; HVF/libkrun on the Mac has its own |
+| the hub reading the byte and ringing the lane | `bellhub` | shared |
+| the waiting thread's wake | `park`, `wlbytes` | shared (a futex on Linux, a shared word on macOS) |
+| the answer back while the asker spins (no bell) | `session_svc`, `macsvc` | shared |
+| a yielding spin, never a busy one, on the side that expects the answer | `session_svc`, `macsvc` | shared |
+
+**What is left on the path, and why it is not software here.** The kick
+reaches the host through QEMU's main loop: its main thread is woken by the
+vCPU's ioeventfd, runs virtio-serial's handler and writes the byte to the
+hub's socket (33 µs of work on an idle P-core, and on a loaded guest that
+loop also runs the guest's audio and display: with a game playing sound the
+byte reached the hub 8–11 ms after the guest wrote it in about 1 request in
+50). The guest's `WriteFile` through vioser costs 20–50 µs. Both go with a
+different doorbell, which needs the VM to restart and is proposed, not done:
+
+* **An ivshmem doorbell** (`ivshmem-doorbell` with an `ivshmem-server`, or
+  `ioeventfd`/`irqfd` registered for the arena device): the guest rings by
+  one MMIO write (the driver's `IOCTL_IVSHMEM_RING_DOORBELL`), KVM signals an
+  eventfd the hub (or the waiter itself) reads, and the host rings back by
+  writing an eventfd KVM turns into the guest's MSI-X, with no QEMU thread
+  and no virtio-serial queue on either way. Expected saving per isolated
+  request: QEMU's wake and work (~35 µs, and the main loop's tail on a busy
+  guest), the hub's socket hop (~12 µs) and most of `WriteFile` (~20–40 µs).
+  It needs the guest's ivshmem driver to bind interrupts (the virtio-win
+  driver does), nix-config's VM definition to add the server and the
+  device's `vectors`, and a VM restart at a time the family does not use it.
+
+**Host power, measured and not taken.** The host's cores clock down when
+idle (`powersave`, EPP `balance_performance`); a wake runs the first
+microseconds slowly. `energy_performance_preference = performance` on every
+core cut the 1 s-gap mean from 536 to 262 µs before the software changes,
+and costs ~10 W more package power on this laptop (turbostat, 30 s each:
+15.2 W as it is, 27.2 W with it). Scoped to the host's two user cores
+(14–15, where the hub and the proxy run) it cost 17.0 W, within this
+machine's run-to-run noise (17.3 W after restoring), and its latency gain
+after the software changes was lost in the guest's own load. Neither is
+proposed: the software changes are, and a host-wide power setting for a
+family laptop is the user's call.
+
+**The teardown bug** (found on wcl-12128, 18:00 on 2026-10-19). A NixOS
+switch re-executed the user's service manager while a session ended.
+`systemctl --user is-active` failed during the re-execution, the service
+read the failure as "the proxy's unit is gone" and ran `down`; every
+`systemctl --user stop` in `down` failed the same way and was silenced;
+`down` removed the session's directory, said "down ok", and the service
+forgot the session. Its PulseAudio and GPU units ran on with nobody left who
+knew their names. Now:
+
+* the service asks `is-active` for the state and ends a session only when
+  the manager says `inactive` or `failed`; no answer is no decision
+  (`sessiond::classify_is_active`);
+* `down` stops each unit and then asks for its state, retrying while the
+  manager does not answer (`WC_LAUNCH_STOP_TRIES` tenths of a second, 10 s),
+  and fails, keeping the directory and naming the units, if any is still
+  running;
+* the service forgets a session only after a `down` that worked, and on the
+  macOS front end releases nothing to the guest before that, since the units
+  may still write into its RAM (§103.15).
+
+Tests: `down_stops_every_unit_even_while_the_manager_re_executes` and
+`down_that_cannot_stop_the_units_fails_and_keeps_the_session` (the real
+script against a stand-in `systemctl` that refuses like a re-executing
+manager), `a_session_is_forgotten_only_after_a_down_that_worked`.
+
 ## 106. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
 
 2026-10-19, branch `host-integration`, crate `wc-hostint`. The model is the
