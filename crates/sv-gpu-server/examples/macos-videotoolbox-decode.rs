@@ -1,6 +1,11 @@
+#![allow(unexpected_cfgs)]
 //! Headless real hardware H.264 decode fixture. CPU readback exists only here.
 //! Run the signed macOS example in a coordinated test window. It exits after
 //! thirty seconds even if the platform decoder stops responding.
+#[cfg(all(target_os = "macos", sv_nv12_sampling_fixture))]
+#[path = "support/vt_joined_sample.rs"]
+mod joined_sample;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     eprintln!("macos-videotoolbox-decode requires macOS and VideoToolbox hardware");
@@ -208,11 +213,18 @@ mod fixture {
         let mut full_range = false;
         let mut coded_output = false;
         let mut copy_target = false;
+        #[cfg(sv_nv12_sampling_fixture)]
+        let mut joined_target = false;
         for argument in std::env::args().skip(1) {
             match argument.as_str() {
                 "--full-range" => full_range = true,
                 "--coded-output" => coded_output = true,
                 "--copy-target" => copy_target = true,
+                #[cfg(sv_nv12_sampling_fixture)]
+                "--joined-target" => {
+                    joined_target = true;
+                    copy_target = true;
+                }
                 _ => {
                     return Err(
                         "usage: macos-videotoolbox-decode [--full-range] [--coded-output] [--copy-target]".into(),
@@ -273,6 +285,14 @@ mod fixture {
                 target_height,
                 PixelRange::Video,
             )?)
+        } else {
+            None
+        };
+        #[cfg(sv_nv12_sampling_fixture)]
+        let mut joined_probe = if joined_target {
+            Some(super::joined_sample::Probe::new(Arc::clone(
+                target.as_ref().unwrap(),
+            ))?)
         } else {
             None
         };
@@ -340,6 +360,17 @@ mod fixture {
                 // GPU copy has completed and its readback lock has been dropped.
                 // The synchronous helper retains both pictures until Metal
                 // completion; no reader can overlap the next overwrite.
+                #[cfg(sv_nv12_sampling_fixture)]
+                if let Some(probe) = joined_probe.as_mut() {
+                    unsafe {
+                        probe.copy_sample(Arc::clone(&picture), frame, full_range)?;
+                    }
+                } else {
+                    unsafe {
+                        target.copy_from_gpu(&picture)?;
+                    }
+                }
+                #[cfg(not(sv_nv12_sampling_fixture))]
                 unsafe {
                     target.copy_from_gpu(&picture)?;
                 }
