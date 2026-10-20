@@ -36127,3 +36127,72 @@ them in the host configuration's `wctestInstalls`, which adds
   session; the guest proof is the coordinator's. Pool regions past the first
   (§110's `region_path` of a `broker:` boot name) are not reachable through
   the broker yet. That is the guest-RAM continuation's `find("gpu.<k>")`.
+
+## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
+
+**The fault.** On testhost on 2026-10-20 sessions ended twice ("its proxy
+is silent", 08:36 and 09:25). The Windows guest had not crashed: for six to
+ten seconds no vCPU halted while the passed-through iGPU came out of D3. The
+guest's runtime power management wakes it about once a minute. pci.sys then
+restores its config space through `0xcf8/0xcfc`, and every one of those
+exits waits for QEMU's BQL. The other vCPUs spin behind it. The 5 s lease
+(§103.14) then ended the proxy, and the session went down with it. Evidence,
+host traces and the proposal for the stall itself are outside git, in
+/mnt/datasets/builds/evidence/frozen-guest/.
+
+**Three witnesses, and what each decides.**
+
+1. **This session's pings**, every 500 ms, as before.
+2. **The guest's heartbeat.** The compositor beats the owner word of the
+   ring control region every 100 ms on a thread of its own (`ringlink.rs`,
+   `start_guest_beat`). Every session's proxy can read it. If the heartbeat
+   moves while this session's pings have stopped, the guest runs and only
+   this session's side is gone, so the lease ends after 5 s, as before.
+3. **The VM's process on the host.** The proxy finds it through
+   `WC_LAUNCH_VM_PID`, `WC_LAUNCH_VM_PIDFILE` or `WC_LAUNCH_VM_UNIT` (a system
+   unit whose main process is QEMU) and reads `/proc/PID/task/*/stat`. This
+   needs no privilege and touches nothing in the VM. It is asked only while
+   pings and heartbeat have both stopped:
+   - a stopped thread, or at least two threads busy for the whole window
+     (vCPUs that never halt), means the guest is stalled. The lease holds it
+     for up to `WC_LAUNCH_LEASE_FROZEN_SECS` (60).
+   - a process that is gone, or one that is mostly idle, means the guest
+     runs but its compositor does not. The lease ends after 5 s.
+
+Without a VM witness, a silent guest is held for up to
+`WC_LAUNCH_LEASE_BLIND_SECS` (20). A guest build before §113 never beats, so
+it keeps the old 5 s. When the heartbeat comes back after a silence, the
+session's pinger gets a fresh 5 s. A gap in the proxy's own 250 ms ticks is
+the proxy stalling, not the guest, and restarts the clocks. The lease clock
+is monotonic now; it used to be the wall clock. The policy is
+`wc_proxy::lease::Judge`: pure, clocked by its caller, and unit-tested for
+each of these cases.
+
+**The guest's half.** A session's `watch` (§107) probes `rtt` every two
+seconds and ends the session at the second miss. A probe that took longer
+than its own 2 s wait plus a second was stalled in, so it is not a miss. A
+gap of over a second between two 250 ms turns of the loop clears the misses
+before it and is logged.
+
+**What is still slow.** A compositor that crashes on a guest that is itself
+busy (two or more threads running flat out) is taken for a stall and held
+for up to 60 s. Without a VM witness, any compositor crash is held for up to
+20 s. Its memory is safe in the meantime: the arena is the ivshmem BAR, or
+the keeper holds it (§103.15).
+
+**Proved.**
+- `wc_proxy::lease` tests: a session dying while the guest beats; an 8 s
+  freeze ridden out; a fresh lease after the freeze; a dead compositor on an
+  idle VM; a gone VM; the 60 s and 20 s bounds; a guest that never beats; a
+  stall of the proxy itself.
+- `session_svc` `probes_ride_out_a_stall_of_this_process`.
+- `scripts/wc-no-ssh.sh` leg 3a: the compositor is SIGSTOPped for 8 s, the
+  proxy holds, and the session answers afterwards. Leg 3 then kills it with
+  -9, and the lease ends in 5 s ("its VM process is gone").
+- `scripts/wc-multi-install.sh` leg 3b: the same 8 s stall under three
+  sessions of one compositor, and none of them ends.
+
+**Deploying it** needs a guest build (for the heartbeat) and, for the VM
+witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
+on testhost (nix-config). Without the guest build the old lease stands;
+without the unit the 20 s bound applies.
