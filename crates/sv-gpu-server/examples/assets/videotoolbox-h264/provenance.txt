@@ -41,3 +41,15 @@ retained output after source-mmap overwrite. The overwrite occurs only after
 session drain/drop and Arc::try_unwrap proves every compressed-block reference
 has been released. CPU pixel readback occurs only in this diagnostic example.
 No macOS execution is claimed by the vmhost software sanity check.
+
+Canonical StdVideo VUI sanity check on vmhost:
+The native parameter encoder's unit test reconstructs this fixture's SPS from
+StdVideo fields using conservative omitted restriction fields. Its expected NAL
+is 6742c00ada109f8884000003000400000300c83c2211a8. Relative to the original SPS,
+the omitted horizontal/vertical motion-vector restriction exponents change
+from8 to16. Timing, reorder count0, DPB count1, prediction/POC syntax and crop
+remain unchanged. Replacing both original SPS NALs with this canonical SPS,
+then decoding the full 2 IDR + 6 P stream with the same FFmpeg executable,
+produced byte-identical 38400-byte YUV output compared with the original asset.
+This is a pixel-semantics check, not a claim of original SPS byte identity or
+preserved omitted SEI display scheduling, and not a native VT runtime result.

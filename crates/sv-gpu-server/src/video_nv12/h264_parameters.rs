@@ -591,6 +591,35 @@ mod tests {
         );
     }
     #[test]
+    fn canonical_vui_matches_software_verified_cropped_fixture_sps() {
+        // Replacing both SPS NALs in the checked-in 2 IDR + 6 P fixture with
+        // this exact NAL produced byte-identical 38400-byte FFmpeg YUV output.
+        // Only omitted MV restriction exponents changed, from 8 to legal 16.
+        let mut s = baseline();
+        s.level_idc = 0;
+        s.pic_width_in_mbs_minus1 = 3;
+        s.pic_height_in_map_units_minus1 = 3;
+        s.flags.set_constraint_set0_flag(1);
+        s.flags.set_constraint_set1_flag(1);
+        s.flags.set_frame_cropping_flag(1);
+        s.frame_crop_bottom_offset = 7;
+        s.flags.set_vui_parameters_present_flag(1);
+        let mut v: Vui = unsafe { std::mem::zeroed() };
+        v.flags.set_timing_info_present_flag(1);
+        v.num_units_in_tick = 1;
+        v.time_scale = 50;
+        v.flags.set_bitstream_restriction_flag(1);
+        v.max_dec_frame_buffering = 1;
+        s.pSequenceParameterSetVui = &v;
+        assert_eq!(
+            unsafe { sps_nal(&s) }.unwrap(),
+            [
+                0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9f, 0x88, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0,
+                0xc8, 0x3c, 0x22, 0x11, 0xa8
+            ]
+        );
+    }
+    #[test]
     fn hrd_requires_selected_parameters() {
         let mut v: Vui = unsafe { std::mem::zeroed() };
         v.flags.set_nal_hrd_parameters_present_flag(1);
