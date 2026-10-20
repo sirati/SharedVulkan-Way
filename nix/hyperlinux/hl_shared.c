@@ -46,7 +46,7 @@ void *hl_wc_resolve(uint64_t va, uint64_t *avail) {
     pthread_mutex_lock(&lock);
     for (view *v = views; v; v = v->next) {
         if (va >= v->va && va < v->end) {
-            *avail = v->end - va;
+            if (avail) *avail = v->end - va;
             p = (char *)v->o->map.base + v->o->map.data_offset + v->offset + va - v->va;
             break;
         }
