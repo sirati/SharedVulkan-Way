@@ -14,6 +14,11 @@ pub struct Process {
     run: u64,
     registration: u64,
 }
+impl Process {
+    pub(crate) fn registration(self) -> u64 {
+        self.registration
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Key {
     pub run: u64,

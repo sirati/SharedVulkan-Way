@@ -295,12 +295,13 @@ impl Authenticator {
         let roles = self.binding.roles;
         let required = match phase {
             Phase::Grant | Phase::GrantRetired => roles.grantor,
-            Phase::Allocate
+            Phase::RegisterProducer
+            | Phase::Allocate
             | Phase::Resize
             | Phase::Prepare
             | Phase::ProducerRetired
             | Phase::TransferCancelled => roles.producer,
-            Phase::Accept | Phase::ConsumerReleased => roles.consumer,
+            Phase::RegisterConsumer | Phase::Accept | Phase::ConsumerReleased => roles.consumer,
         };
         if origin != required {
             return Err(denied("service control phase is not this endpoint's role"));
