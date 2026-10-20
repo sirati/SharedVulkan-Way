@@ -131,7 +131,9 @@ impl<S: DurableStore, B: Send + Sync + 'static> ServiceContext<S, B> {
     pub(crate) fn origin(&self) -> Origin {
         self.endpoint.origin()
     }
-    pub(crate) fn grantor(&self) -> Origin { self.grantor }
+    pub(crate) fn grantor(&self) -> Origin {
+        self.grantor
+    }
     pub(crate) fn source(&self) -> &Source {
         &self.source
     }
@@ -290,18 +292,31 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
     pub(crate) fn incoming_grant(&self, frame: &Frame) -> io::Result<Binding> {
         self.ready()?;
         if self.context.endpoint.origin() == self.context.grantor {
-            return Err(denied("canonical grantor cannot accept peer allocation authority"));
+            return Err(denied(
+                "canonical grantor cannot accept peer allocation authority",
+            ));
         }
-        let mut signed = DOMAIN.to_vec(); signed.extend_from_slice(frame.canonical());
+        let mut signed = DOMAIN.to_vec();
+        signed.extend_from_slice(frame.canonical());
         let expected = hmac_sha256(&self.key, &signed);
-        if expected.iter().zip(frame.mac()).fold(0u8,|v,(a,b)|v|(a^b)) != 0 {
+        if expected
+            .iter()
+            .zip(frame.mac())
+            .fold(0u8, |v, (a, b)| v | (a ^ b))
+            != 0
+        {
             return Err(denied("invalid canonical grant authentication"));
         }
         let message = Message::decode(frame.canonical())?;
         let b = &message.binding;
-        if message.origin != self.context.grantor || message.phase != Phase::Grant || message.sequence != 1
-            || *b != self.grant_binding(b.grant,b.grant_offset,b.grant_length)? {
-            return Err(denied("offered grant differs from enrolled canonical source/pair"));
+        if message.origin != self.context.grantor
+            || message.phase != Phase::Grant
+            || message.sequence != 1
+            || *b != self.grant_binding(b.grant, b.grant_offset, b.grant_length)?
+        {
+            return Err(denied(
+                "offered grant differs from enrolled canonical source/pair",
+            ));
         }
         Ok(message.binding)
     }
@@ -910,8 +925,16 @@ mod tests {
         wrong_grantor.installation = "third-install".into();
         wrong_grantor.session += 2;
         wrong_grantor.roles.grantor = opposite(w.context.grantor);
-        assert!(Lifecycle::start_with_challenge(w.context.clone(), ("third-install", KEY),
-            wrong_grantor, BootstrapRole::Initiator, [13;32]).is_err());
+        assert!(
+            Lifecycle::start_with_challenge(
+                w.context.clone(),
+                ("third-install", KEY),
+                wrong_grantor,
+                BootstrapRole::Initiator,
+                [13; 32]
+            )
+            .is_err()
+        );
     }
     #[test]
     fn os_challenges_are_nonzero_and_independent() {

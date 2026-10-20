@@ -4,6 +4,10 @@
 //! allocation paths in protected mode and route their requests here. No whole
 //! grant is released yet: uncertain history stays quarantined; durable release
 //! after actual trusted completion remains a production gate on this finite BAR.
+//! Suballocation authority belongs only to the binding's producer origin.
+//! Native producer/consumer registrations are distinct and never stand in for
+//! remote processes. Cross-VM transfers explicitly refuse until typed current-
+//! channel remote registration and resource mirror transitions are implemented.
 use crate::User;
 use crate::bar_control::{Allocator, Consumer, Extent, GrantIdentity, Key, Process, Transfer};
 use crate::bar_registry::{DurableStore, PhysicalBacking};
@@ -71,10 +75,16 @@ pub struct GrantId {
     id: u64,
     owner: Arc<()>,
 }
+#[derive(Clone, Copy, PartialEq)]
+enum ProcessRole {
+    Producer,
+    Consumer,
+}
 #[derive(Clone)]
 pub struct RegisteredProcess {
     grant: GrantId,
     process: Process,
+    role: ProcessRole,
 }
 #[derive(Clone)]
 pub struct AllocationId {
@@ -298,7 +308,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     ) -> io::Result<GrantId> {
         self.check_lifecycle(lifecycle)?;
         if self.context.origin() != self.context.grantor() {
-            return Err(denied("only source-wide canonical grantor may choose original ranges"));
+            return Err(denied(
+                "only source-wide canonical grantor may choose original ranges",
+            ));
         }
         let length = capacity
             .checked_add(PAGE - 1)
@@ -329,27 +341,55 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     }
     /// Mirror ONLY an authenticated canonical peer offer. This service cannot
     /// choose a fresh physical range or synthesize a grant from shared metadata.
-    pub fn accept_grant(&mut self, lifecycle: &mut Lifecycle<S,B>, frame: &Frame) -> io::Result<GrantId> {
+    pub fn accept_grant(
+        &mut self,
+        lifecycle: &mut Lifecycle<S, B>,
+        frame: &Frame,
+    ) -> io::Result<GrantId> {
         self.check_lifecycle(lifecycle)?;
         let binding = lifecycle.incoming_grant(frame)?;
-        if self.records.contains_key(&binding.grant) { return Err(denied("canonical peer grant ID already installed")); }
+        if self.records.contains_key(&binding.grant) {
+            return Err(denied("canonical peer grant ID already installed"));
+        }
         let offset = binding.grant_offset;
         let length = binding.grant_length;
         if !offset.is_multiple_of(PAGE) || !length.is_multiple_of(PAGE) {
             return Err(denied("canonical peer grant is not page aligned"));
         }
-        let end = offset.checked_add(length).ok_or_else(|| denied("canonical peer grant overflow"))?;
-        let i = self.free.iter().position(|r| offset >= r.offset && end <= r.offset+r.length)
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| denied("canonical peer grant overflow"))?;
+        let i = self
+            .free
+            .iter()
+            .position(|r| offset >= r.offset && end <= r.offset + r.length)
             .ok_or_else(|| denied("canonical peer grant overlaps history or protected layout"))?;
         let run = self.free.remove(i);
         let kind = run.kind;
-        if run.offset < offset { self.free.push(FreeRun {kind,offset:run.offset,length:offset-run.offset}); }
-        if end < run.offset+run.length { self.free.push(FreeRun {kind,offset:end,length:run.offset+run.length-end}); }
-        self.free.sort_by_key(|r|r.offset);
-        self.install(lifecycle,binding,kind,Some(frame))
+        if run.offset < offset {
+            self.free.push(FreeRun {
+                kind,
+                offset: run.offset,
+                length: offset - run.offset,
+            });
+        }
+        if end < run.offset + run.length {
+            self.free.push(FreeRun {
+                kind,
+                offset: end,
+                length: run.offset + run.length - end,
+            });
+        }
+        self.free.sort_by_key(|r| r.offset);
+        self.install(lifecycle, binding, kind, Some(frame))
     }
-    fn install(&mut self, lifecycle: &mut Lifecycle<S,B>, binding: Binding,
-        kind: GrantKind, first_frame: Option<&Frame>) -> io::Result<GrantId> {
+    fn install(
+        &mut self,
+        lifecycle: &mut Lifecycle<S, B>,
+        binding: Binding,
+        kind: GrantKind,
+        first_frame: Option<&Frame>,
+    ) -> io::Result<GrantId> {
         let id = binding.grant;
         let offset = binding.grant_offset;
         let length = binding.grant_length;
@@ -372,6 +412,11 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         }
         let region =
             u32::try_from(id).map_err(|_| denied("canonical bookkeeping IDs exhausted"))?;
+        // The legacy table has only a u8 session slot. This private table is
+        // per exact canonical grant, so slot1 is bookkeeping normalization,
+        // NEVER the original session authority. The retained outer Binding's
+        // full u64 session/install/source and opaque owner handles stay exact.
+        // No normalized table identity may be exported as legacy arena state.
         let grant = wc_handle::barpool::Grant {
             id: region,
             session: 1,
@@ -408,21 +453,65 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             owner: self.identity.clone(),
         })
     }
-    /// Capture only the actual enrolled user's exact native process and watch.
+    fn require_role(
+        &self,
+        lifecycle: &Lifecycle<S, B>,
+        grant: &GrantId,
+        role: ProcessRole,
+    ) -> io::Result<()> {
+        let binding = self.record(lifecycle, grant)?.guard.binding();
+        let origin = match role {
+            ProcessRole::Producer => binding.roles.producer,
+            ProcessRole::Consumer => binding.roles.consumer,
+        };
+        if origin != self.context.origin() {
+            return Err(denied(
+                "resource role belongs to peer service, not a local process",
+            ));
+        }
+        Ok(())
+    }
+    /// Register the actual native producer only at the pinned producer service.
     ///
     /// # Safety
-    /// User must be obtained from this exact connection's OS credentials and
-    /// process must retain its original kernel object without PID substitution.
-    /// Protected provider provenance is additionally required where applicable.
-    pub unsafe fn register_process(
+    /// User must be the exact connection's OS credentials; process must retain
+    /// its original kernel object without PID substitution. Protected provider
+    /// provenance is additionally required where applicable. A peer registration
+    /// ID or authenticated remote message cannot implement ServiceProcess.
+    pub unsafe fn register_producer(
         &mut self,
         lifecycle: &Lifecycle<S, B>,
         grant: &GrantId,
         user: User,
         process: Arc<dyn ServiceProcess>,
     ) -> io::Result<RegisteredProcess> {
+        self.register_native(lifecycle, grant, user, process, ProcessRole::Producer)
+    }
+    /// Register an actual native consumer only at the pinned consumer service.
+    ///
+    /// # Safety
+    /// Same exact native credentials/kernel-object contract as register_producer.
+    /// This registers no remote producer and creates no pending transfer proof.
+    pub unsafe fn register_consumer(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        grant: &GrantId,
+        user: User,
+        process: Arc<dyn ServiceProcess>,
+    ) -> io::Result<RegisteredProcess> {
+        self.register_native(lifecycle, grant, user, process, ProcessRole::Consumer)
+    }
+    fn register_native(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        grant: &GrantId,
+        user: User,
+        process: Arc<dyn ServiceProcess>,
+        role: ProcessRole,
+    ) -> io::Result<RegisteredProcess> {
+        self.require_role(lifecycle, grant, role)?;
         let record = self.record(lifecycle, grant)?;
-        if &user != &record.table.grant().user {
+        if user != record.table.grant().user {
             return Err(denied("process user differs from canonical grant"));
         }
         let native = NativeProcess {
@@ -436,6 +525,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         Ok(RegisteredProcess {
             grant: grant.clone(),
             process: registration,
+            role,
         })
     }
     fn process(&self, lifecycle: &Lifecycle<S, B>, process: &RegisteredProcess) -> io::Result<()> {
@@ -444,6 +534,28 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .get(&process.process)
             .ok_or_else(|| denied("unknown native process registration"))?
             .live()
+    }
+    fn process_role(
+        &self,
+        lifecycle: &Lifecycle<S, B>,
+        process: &RegisteredProcess,
+        role: ProcessRole,
+    ) -> io::Result<()> {
+        if process.role != role {
+            return Err(denied("native registration has a different resource role"));
+        }
+        self.require_role(lifecycle, &process.grant, role)?;
+        self.process(lifecycle, process)
+    }
+    fn local_transfer(&self, lifecycle: &Lifecycle<S, B>, grant: &GrantId) -> io::Result<()> {
+        let roles = self.record(lifecycle, grant)?.guard.binding().roles;
+        if roles.producer != self.context.origin() || roles.consumer != self.context.origin() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cross-VM resources require typed authenticated remote registrations and mirror transitions",
+            ));
+        }
+        Ok(())
     }
     fn allocation(
         &self,
@@ -468,7 +580,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         length: u64,
         capacity: u64,
     ) -> io::Result<(AllocationId, Extent)> {
-        self.process(lifecycle, process)?;
+        self.process_role(lifecycle, process, ProcessRole::Producer)?;
         let (key, extent) = self
             .records
             .get_mut(&process.grant.id)
@@ -495,7 +607,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         allocation: &AllocationId,
         length: u64,
     ) -> io::Result<Extent> {
-        self.process(lifecycle, process)?;
+        self.process_role(lifecycle, process, ProcessRole::Producer)?;
         self.allocation(lifecycle, allocation)?;
         Self::same_grant(&process.grant, &allocation.grant)?;
         self.records
@@ -511,8 +623,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         allocation: &AllocationId,
         recipient: &RegisteredProcess,
     ) -> io::Result<PendingTransfer> {
-        self.process(lifecycle, producer)?;
-        self.process(lifecycle, recipient)?;
+        self.local_transfer(lifecycle, &allocation.grant)?;
+        self.process_role(lifecycle, producer, ProcessRole::Producer)?;
+        self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         self.allocation(lifecycle, allocation)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
         Self::same_grant(&recipient.grant, &allocation.grant)?;
@@ -533,7 +646,8 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         recipient: &RegisteredProcess,
         pending: &PendingTransfer,
     ) -> io::Result<(ConsumerId, Extent)> {
-        self.process(lifecycle, recipient)?;
+        self.local_transfer(lifecycle, &pending.allocation.grant)?;
+        self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         self.allocation(lifecycle, &pending.allocation)?;
         Self::same_grant(&recipient.grant, &pending.allocation.grant)?;
         let (consumer, extent) = self
@@ -563,7 +677,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         allocation: &AllocationId,
         backend: &mut P,
     ) -> io::Result<P::Projection> {
-        self.process(lifecycle, producer)?;
+        self.process_role(lifecycle, producer, ProcessRole::Producer)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
         let record = self.record(lifecycle, &allocation.grant)?;
         if record.producers.get(&allocation.key) != Some(&producer.process) {
@@ -587,7 +701,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         consumer: &ConsumerId,
         backend: &mut P,
     ) -> io::Result<P::Projection> {
-        self.process(lifecycle, recipient)?;
+        self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.record(lifecycle, &consumer.allocation.grant)?;
         if record
@@ -644,6 +758,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         grant: &GrantId,
     ) -> io::Result<Frame> {
         self.record(lifecycle, grant)?;
+        if self.context.origin() != self.context.grantor() {
+            return Err(denied("only canonical grantor may announce a whole grant"));
+        }
         lifecycle.seal(
             &mut self.records.get_mut(&grant.id).unwrap().channel,
             Phase::Grant,
@@ -731,6 +848,7 @@ mod tests {
     fn binding() -> BootstrapBinding {
         let mut binding = BootstrapBinding::from(&crate::service_control::fixture().binding);
         binding.roles.grantor = Origin::Windows;
+        binding.roles.consumer = Origin::Windows;
         binding
     }
     fn physical() -> PhysicalBacking {
@@ -833,7 +951,15 @@ mod tests {
     fn process(o: &mut Owner, l: &Life, g: &GrantId) -> (RegisteredProcess, Arc<Watch>) {
         let p = Arc::new(Watch(AtomicU8::new(0)));
         let id = unsafe {
-            o.register_process(l, g, User::sid(&binding().windows_sid), p.clone())
+            o.register_producer(l, g, User::sid(&binding().windows_sid), p.clone())
+                .unwrap()
+        };
+        (id, p)
+    }
+    fn consumer_process(o: &mut Owner, l: &Life, g: &GrantId) -> (RegisteredProcess, Arc<Watch>) {
+        let p = Arc::new(Watch(AtomicU8::new(0)));
+        let id = unsafe {
+            o.register_consumer(l, g, User::sid(&binding().windows_sid), p.clone())
                 .unwrap()
         };
         (id, p)
@@ -920,7 +1046,7 @@ mod tests {
         let (mut o, mut life, _, _, _, _, _, _) = setup();
         let g = o.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
         let (p, watch) = process(&mut o, &life, &g);
-        let (c, cwatch) = process(&mut o, &life, &g);
+        let (c, cwatch) = consumer_process(&mut o, &life, &g);
         let (other, _) = process(&mut o, &life, &g);
         let (a, e) = o.allocate(&life, &p, 1, 2 * PAGE).unwrap();
         assert_eq!(e.offset, PAGE);
@@ -1011,7 +1137,9 @@ mod tests {
         let (mut canonical, mut grantor, mut peer, _, peer_context, _, _, _) = setup();
         let mut mirror = owner(&peer_context);
         assert!(mirror.grant(&mut peer, GrantKind::Pixel, PAGE).is_err());
-        let grant = canonical.grant(&mut grantor, GrantKind::Pixel, PAGE).unwrap();
+        let grant = canonical
+            .grant(&mut grantor, GrantKind::Pixel, PAGE)
+            .unwrap();
         let offer = canonical.grant_frame(&grantor, &grant).unwrap();
         // Re-zeroing after canonical publication could destroy live producer
         // bytes. Mirror installation must only reserve/verify this offer.
@@ -1020,8 +1148,98 @@ mod tests {
         assert_eq!(range(&mirror, &installed), range(&canonical, &grant));
         assert!(mirror.accept_grant(&mut peer, &offer).is_err());
         assert!(mirror.verify(&peer, &installed, &offer).is_err());
-        assert_eq!(peer_context.exclusions().unwrap(), vec![(PAGE,PAGE)]);
+        assert_eq!(peer_context.exclusions().unwrap(), vec![(PAGE, PAGE)]);
         assert!(mirror.grant_frame(&peer, &installed).is_err());
+    }
+    #[test]
+    fn mirrored_consumer_cannot_invent_producer_or_allocate_project_writeable() {
+        let (w, _) = context(Origin::Windows, Store::default(), false);
+        let (l, _) = context(Origin::Linux, Store::default(), false);
+        let mut b = binding();
+        b.roles.consumer = Origin::Linux;
+        let mut producer_service = unsafe {
+            Lifecycle::start(
+                w.clone(),
+                "test-install",
+                KEY,
+                b.clone(),
+                BootstrapRole::Initiator,
+            )
+            .unwrap()
+        };
+        let mut consumer_service = unsafe {
+            Lifecycle::start(l.clone(), "test-install", KEY, b, BootstrapRole::Responder).unwrap()
+        };
+        let h = producer_service.hello().unwrap();
+        let c = consumer_service.receive(&h).unwrap().unwrap();
+        let f = producer_service.receive(&c).unwrap().unwrap();
+        consumer_service.receive(&f).unwrap();
+        let mut canonical = owner(&w);
+        let mut mirror = owner(&l);
+        let grant = canonical
+            .grant(&mut producer_service, GrantKind::Pixel, 2 * PAGE)
+            .unwrap();
+        let offer = canonical.grant_frame(&producer_service, &grant).unwrap();
+        let installed = mirror.accept_grant(&mut consumer_service, &offer).unwrap();
+        let native = Arc::new(Watch(AtomicU8::new(0)));
+        assert!(
+            unsafe {
+                mirror.register_producer(
+                    &consumer_service,
+                    &installed,
+                    User::uid(binding().linux_uid),
+                    native.clone(),
+                )
+            }
+            .is_err()
+        );
+        assert!(mirror.records[&installed.id].processes.is_empty());
+        let consumer = unsafe {
+            mirror
+                .register_consumer(
+                    &consumer_service,
+                    &installed,
+                    User::uid(binding().linux_uid),
+                    native.clone(),
+                )
+                .unwrap()
+        };
+        assert!(
+            mirror
+                .allocate(&consumer_service, &consumer, 1, PAGE)
+                .is_err()
+        );
+        let (producer, _) = process(&mut canonical, &producer_service, &grant);
+        let (allocation, _) = canonical
+            .allocate(&producer_service, &producer, 1, PAGE)
+            .unwrap();
+        let mut backend = Backend {
+            target: native,
+            calls: 0,
+            fail: false,
+        };
+        assert!(
+            mirror
+                .project_producer(&consumer_service, &consumer, &allocation, &mut backend)
+                .is_err()
+        );
+        assert_eq!(backend.calls, 0);
+        let error = canonical
+            .prepare(&producer_service, &producer, &allocation, &producer)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            unsafe {
+                canonical.register_consumer(
+                    &producer_service,
+                    &grant,
+                    User::sid(&binding().windows_sid),
+                    Arc::new(Watch(AtomicU8::new(0))),
+                )
+            }
+            .is_err()
+        );
     }
     #[test]
     fn layout_rejects_overlap_header_outside_and_unaligned_ranges() {
