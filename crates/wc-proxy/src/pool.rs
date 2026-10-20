@@ -127,6 +127,12 @@ pub trait PoolTransport {
     /// ran.
     fn create(&mut self, size: u64) -> io::Result<Region>;
 
+    /// The original backing of an allocation, before a toolkit paints it.
+    /// Unsupported transports refuse instead of returning copied memory.
+    fn native_backing(&self, _region: &Region) -> io::Result<wc_native_shm::Backing> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "this transport cannot export original GTK backing"))
+    }
+
     /// Stop publishing. The bytes may be reused by a later [`create`].
     ///
     /// [`create`]: PoolTransport::create
@@ -220,6 +226,7 @@ pub struct SharedFile {
     next: u64,
     live: HashMap<u64, Live>,
     published: u64,
+    native_fixture: bool,
 }
 
 struct Live {
@@ -230,6 +237,7 @@ struct Live {
     _handle: Handle,
     view: MappingMut,
     size: u64,
+    local: PathBuf,
 }
 
 impl SharedFile {
@@ -249,11 +257,27 @@ impl SharedFile {
             next: 0,
             live: HashMap::new(),
             published: 0,
+            native_fixture: std::env::var_os("WC_NATIVE_SHM_FIXTURE").is_some_and(|v| v == "1"),
         })
+    }
+
+    /// Explicit disposable local fixture. Never selected by guest-RAM failure.
+    pub fn new_native_fixture(dir: &Path, peer_prefix: &str) -> io::Result<Self> {
+        let mut out = Self::new(dir, peer_prefix)?;
+        out.native_fixture = true;
+        Ok(out)
     }
 }
 
 impl PoolTransport for SharedFile {
+    fn native_backing(&self, region: &Region) -> io::Result<wc_native_shm::Backing> {
+        if !self.native_fixture {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "native GTK files require the explicit disposable fixture"));
+        }
+        let live = self.live.get(&region.key).ok_or_else(|| io::Error::other("native GTK allocation is no longer live"))?;
+        Ok(wc_native_shm::Backing::Fixture { path: live.local.clone(), offset: 0 })
+    }
+
     fn name(&self) -> &'static str {
         "shared-file"
     }
@@ -274,7 +298,7 @@ impl PoolTransport for SharedFile {
         let handle = Handle::create_shared_file(&local_str, &peer, size)?;
         let view = handle.map_mut()?;
         self.published += size;
-        self.live.insert(key, Live { _handle: handle, view, size });
+        self.live.insert(key, Live { _handle: handle, view, size, local });
         Ok(Region { descriptor: Descriptor::SharedFile { path: peer, size }, size, key })
     }
 
@@ -367,7 +391,7 @@ enum Backing {
 }
 
 /// A lease on a broker region (§111), ended when dropped.
-pub struct BrokerLease(pub u64);
+pub struct BrokerLease(pub u64, pub u64);
 
 impl Drop for BrokerLease {
     fn drop(&mut self) {
@@ -943,7 +967,7 @@ impl ProvidedRegion {
     pub fn ram_window(k: u32, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
         use std::os::fd::AsFd;
         let (r, fds) = wc_broker::client::find_region(&format!("gpu.{k}"))?;
-        let lease = BrokerLease(r.id);
+        let lease = BrokerLease(r.id, offset);
         if len == 0 || offset.checked_add(len).is_none_or(|e| e > r.len) || !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("no window {offset}+{len} in the {}-byte guest-RAM region {k}", r.len)));
         }
@@ -1935,6 +1959,23 @@ impl Alloc {
 }
 
 impl PoolTransport for Arena {
+    fn native_backing(&self, region: &Region) -> io::Result<wc_native_shm::Backing> {
+        let Descriptor::ArenaSlice { arena, offset, len } = &region.descriptor else {
+            return Err(io::Error::other("native GTK allocation has no arena identity"));
+        };
+        let arenas = self.alloc();
+        let slot = arenas.slots.iter().find(|s| s.map.id == *arena)
+            .ok_or_else(|| io::Error::other("native GTK arena no longer exists"))?;
+        if offset.checked_add(*len).is_none_or(|end| end > slot.map.len) {
+            return Err(io::Error::other("native GTK allocation exceeds its registered arena"));
+        }
+        let Backing::GuestRamLeased(_, lease) = &slot.map.backing._backing else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "native GTK requires a broker-leased guest-RAM region"));
+        };
+        let offset = lease.1.checked_add(*offset).ok_or_else(|| io::Error::other("native GTK backing offset overflow"))?;
+        Ok(wc_native_shm::Backing::Broker { id: lease.0, offset })
+    }
+
     fn free_bytes(&self) -> Option<(u64, u64)> {
         Some(Arena::free_bytes(self))
     }

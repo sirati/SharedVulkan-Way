@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wc_native_shm_v1">
+  <copyright>Copyright 2026 waycompose contributors. SPDX-License-Identifier: MIT</copyright>
+  <interface name="wc_native_shm_v1" version="1">
+    <description summary="original shared backing for a shipped Wayland toolkit">
+      A local proxy allocator for Cairo wl_shm buffers. Allocation happens
+      before the toolkit maps or paints memory. A production allocation names
+      a registered broker region; the client opens its own authenticated lease.
+      The client then passes the original bounded fd in wl_shm.create_pool.
+      Caller-claimed region ownership is never sufficient for recognition.
+      Allocation failure must not turn into a payload-copy fallback in strict mode.
+      This object, like wl_shm, lives until its display connection ends.
+    </description>
+    <request name="allocate">
+      <arg name="serial" type="uint" summary="unique among this object's live allocations"/>
+      <arg name="size" type="uint" summary="positive size, at most INT32_MAX"/>
+    </request>
+    <request name="release">
+      <description summary="the toolkit has finished with its original mapping">
+        Sent after Cairo use ends and the allocation's wl_buffers and wl_shm_pool
+        are destroyed. It does not certify compositor or GPU drain. The server
+        retains the allocation until its independent downstream lifetime ends.
+      </description>
+      <arg name="serial" type="uint"/>
+    </request>
+    <event name="allocated">
+      <arg name="serial" type="uint"/>
+      <arg name="kind" type="uint" summary="1 broker region, 2 explicit disposable fixture"/>
+      <arg name="region_high" type="uint"/>
+      <arg name="region_low" type="uint"/>
+      <arg name="offset_high" type="uint"/>
+      <arg name="offset_low" type="uint"/>
+      <arg name="size" type="uint"/>
+      <arg name="fixture_path" type="string" summary="empty for production allocations"/>
+    </event>
+    <event name="failed">
+      <arg name="serial" type="uint"/>
+      <arg name="reason" type="string"/>
+    </event>
+  </interface>
+</protocol>

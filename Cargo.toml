@@ -48,6 +48,7 @@ members = [
   "crates/wc-launch",
   "crates/wc-arena-host",
   "crates/wc-shmclient",
+  "crates/wc-native-shm",
   "crates/wc-proxy",
   # §105: host integration, per-device audio and opening links and files both ways. Pure.
   "crates/wc-hostint",

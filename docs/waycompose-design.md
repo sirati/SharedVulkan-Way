@@ -37823,6 +37823,53 @@ backends unchanged. Regression tests send a real forwarded socket through the
 broker protocol: mapped access receives a hub fd, unmapped access is refused,
 and forged uid or pid metadata never reaches the broker's incoming queue.
 
+### 112.10 Original GTK backing before Cairo paints
+
+The corrected unpatched-Mesa local run still copied two real 5,818,176-byte
+GTK parent buffers. Its GPU child already used shared dma-bufs. Those parent
+pixels must not be dropped or excluded from the strict zero-copy check.
+An already-created ordinary Linux memfd cannot be relabeled as guest RAM.
+
+The shipped GTK3 integration changes `create_shm_pool` in GDK's Wayland
+backend, before mmap or Cairo painting. Firefox and Mesa/Zink source remain
+upstream. `nix/gtk-native-shm.nix` builds the GTK library and the
+`wc-native-shm` mapping/lease helper. GTK discovers the proxy-local
+`wc_native_shm_v1` allocator, obtains original backing metadata, opens its own
+authenticated broker lease, and paints directly into the bounded udmabuf.
+It passes that same fd through normal `wl_shm.create_pool`. The proxy chooses
+an extent from its existing transport allocator, retains its registered
+backing, and recognizes the SCM_RIGHTS fd with Linux `KCMP_FILE`. Caller
+region names and matching anon-inode stat numbers do not establish identity.
+The translation changes the upstream descriptor and buffer offset, never the
+pixel payload. A separately selected named-file fixture uses live regular
+file identity and is not evidence of cross-VM udmabuf mapping.
+
+GTK keeps its mapping and independent broker lease through Cairo destruction.
+The proxy additionally waits for toolkit release, pool destruction, explicit
+compositor `wl_buffer.release`, and buffer deletion before recycling an
+extent. `delete_id` alone is not proof of compositor drain. A premature destroy
+or disconnected client with unproved drain leaves the extent reserved until
+the transport ends and is logged. It never authorizes guessed reuse. The
+compositor's direct path releases after `FromUi::DirectShown`; its shadow path
+releases after its read. Existing broker guest-RAM retirement still waits for
+all region holders before `UNMAPPED` and guest reuse.
+
+`WC_NATIVE_SHM=1` enables the local proxy allocator. GTK strict mode is
+`WC_NATIVE_SHM_STRICT=1`: missing allocation support or refusal fails visibly,
+without a copied allocation fallback. `WC_NATIVE_SHM_FIXTURE=1` explicitly
+permits disposable named-file backing on both fixture participants. Production
+allocations require existing broker-leased guest RAM and the existing mapped
+user policy. No new sandbox exception, broker authorization policy, or raw
+QEMU RAM descriptor is introduced.
+
+Seven targeted Rust fixture tests pass: original-page painting, SCM_RIGHTS
+identity and lifetime, a real broker lease blocking retirement through mapping
+use, foreign anon-inode rejection despite matching fstat metadata, proxy
+registration rejection for a foreign fd, ordinary dual-lifetime reclamation,
+and refusal to guess drain after premature destruction. GTK packaging and
+real Cairo/Firefox runtime validation remain pending. The strict Firefox
+zero-copy and guest hardware gates remain open.
+
 ## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
 
 **The fault.** On testhost on 2026-10-20 sessions ended twice ("its proxy

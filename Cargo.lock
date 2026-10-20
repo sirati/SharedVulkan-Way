@@ -1798,6 +1798,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-native-shm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sv-transport",
+ "wc-broker",
+]
+
+[[package]]
 name = "wc-probe"
 version = "0.1.0"
 dependencies = [
@@ -1819,6 +1828,7 @@ dependencies = [
  "wc-broker",
  "wc-handle",
  "wc-hostint",
+ "wc-native-shm",
 ]
 
 [[package]]

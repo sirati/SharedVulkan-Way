@@ -229,6 +229,7 @@ impl Spec {
         // whose fd is an `sv_drm` token read and closed here, and the feedback's
         // `format_table`, a memfd this proxy makes.
         spec.load(include_str!("../protocols/linux-dmabuf-v1.xml"))?;
+        spec.load(include_str!("../protocols/wc-native-shm-v1.xml"))?;
         Ok(spec)
     }
 
