@@ -180,6 +180,8 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("arena size overflow")?;
     let listener = Endpoint::bind(&socket)?;
     let bells = Endpoint::bind(&bell)?;
+    // Bind every endpoint before starting workers so name conflicts unwind.
+    let relay = Endpoint::bind(&format!("{socket}.relay"))?;
     let controls = ControlSet::new();
     let writers = Arc::new(Bells::default());
     sv_transport::park::install_cross_wake(Some(writers.clone()));
@@ -193,7 +195,6 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = attach_bell(reader, &set, &bell_writers);
             }
         })?;
-    let relay = Endpoint::bind(&format!("{socket}.relay"))?;
     let (accepted, clients) = std::sync::mpsc::channel();
     let direct = accepted.clone();
     std::thread::Builder::new()
