@@ -132,10 +132,23 @@ phase_term() {
     vm "\"$SYS/bin/wc-broker\" ctl 'hello term' stats"
     local t0; t0=$(date +%s.%N)
     vm "sudo -n kill -TERM $p0"
-    for _ in $(seq 1 300); do vm "kill -0 $p0 2>/dev/null" || break; sleep 0.1; done
+    for _ in $(seq 1 300); do vm "sudo -n kill -0 $p0 2>/dev/null" || break; sleep 0.1; done
+    if vm "sudo -n kill -0 $p0 2>/dev/null"; then
+      echo "FAIL: original daemon is still alive after the shutdown deadline"
+      return 1
+    fi
     echo "the daemon ended $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}') s after SIGTERM"
-    sleep 3
-    echo "relaunched by launchd: pid $(vm "sudo -n launchctl print system/org.waycompose.broker | sed -n 's/.*pid = //p'")"
+    local p1=""
+    for _ in $(seq 1 150); do
+      p1=$(vm "sudo -n launchctl print system/org.waycompose.broker | sed -n 's/.*pid = //p'")
+      [ -n "$p1" ] && [ "$p1" != "$p0" ] && break
+      sleep 0.1
+    done
+    if [ -z "$p1" ] || [ "$p1" = "$p0" ]; then
+      echo "FAIL: launchd did not report a replacement daemon"
+      return 1
+    fi
+    echo "relaunched by launchd: pid $p1"
     broker_log | grep -E "SIGTERM|orphan|exiting" | tail -4
   } 2>&1 | tee "$out"
 }

@@ -35220,9 +35220,12 @@ SIGTERM with `down`, so the host releases within about 1–2 s.
 * **The GPU server** was tied to its session (`ends with pool`), its exit
   seen, and its session's pool freed by the release word; 300 frames
   presented (PASS).
-* **SIGTERM to the daemon** while it held 2 orphans: it waited for their
-  release word (the host wrote it), freed them, and ended 0.70 s after the
-  signal; launchd started it again.
+* **SIGTERM to the daemon** while it held 2 orphans: the daemon logged its
+  shutdown wait, but exit and restart were not proved. The harness queried
+  the root daemon with an unprivileged `kill -0`, which treats permission
+  denial as process exit. It then reported the same pid before and after
+  the signal. The 0.70 s measurement is invalid. The harness now probes
+  with sudo and requires a different replacement pid; a VM rerun is pending.
 * **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
   after): its `open` of user 1's regions, `find` of user 1's pool and
   `device wcbell` (held by user 1's main process) were refused by uid; it
