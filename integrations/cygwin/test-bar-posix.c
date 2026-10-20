@@ -2,6 +2,8 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
+#include <dlfcn.h>
+#include <string.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -19,6 +21,32 @@ int wc_bridge_pool_alloc(size_t len, uintptr_t *address, uint64_t *offset, uint3
     *offset = 131072;
     *arena = 42;
     return 0;
+}
+static volatile unsigned fallback_maps, fallback_unmaps;
+static void *fallback_mmap(void *a, size_t n, int p, int f, int fd, off_t o)
+{
+    (void)a; (void)n; (void)p; (void)f; (void)fd; (void)o;
+    ++fallback_maps; errno = EAGAIN; return MAP_FAILED;
+}
+static int fallback_munmap(void *a, size_t n)
+{
+    (void)a; (void)n; ++fallback_unmaps; errno = EAGAIN; return -1;
+}
+void *dlopen(const char *name, int flags)
+{
+    (void)flags; assert(!strcmp(name, "cygwin1.dll")); return bar;
+}
+void *dlsym(void *handle, const char *name)
+{
+    assert(handle == bar);
+    if (!strcmp(name, "mmap")) return (void *)fallback_mmap;
+    assert(!strcmp(name, "munmap")); return (void *)fallback_munmap;
+}
+int dlclose(void *handle) { assert(handle == bar); return 0; }
+int wc_bridge_bar_overlap(uintptr_t start, size_t len)
+{
+    if (len > UINTPTR_MAX - start) return 1;
+    return len && start < (uintptr_t)bar + sizeof(bar) && (uintptr_t)bar < start + len;
 }
 int main(int argc, char **argv)
 {
@@ -41,7 +69,23 @@ int main(int argc, char **argv)
     assert(mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, duplicate, 0) == MAP_FAILED);
     assert(errno == ENOTSUP);
     assert(munmap(pixels, 4095) == -1 && errno == EINVAL);
+    assert(munmap(bar + 1024, 1024) == -1 && errno == EINVAL);
+    assert(munmap((void *)((uintptr_t)bar - 4096), 8192) == -1 && errno == EINVAL);
+    assert(munmap(bar + 8192, 4096) == -1 && errno == EINVAL);
+    assert(munmap((void *)(UINTPTR_MAX - 1), 4096) == -1 && errno == EINVAL);
+    assert(mmap(bar + 4096, 4096, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED && errno == ENOTSUP);
+    assert(mmap((void *)(UINTPTR_MAX - 1), 4096, PROT_READ,
+                MAP_PRIVATE, -1, 0) == MAP_FAILED && errno == ENOTSUP);
+    assert(fallback_maps == 0 && fallback_unmaps == 0);
     assert(!munmap(pixels, 4096));
+    assert(munmap(bar + 1024, 1024) == -1 && errno == EINVAL);
+    assert(mmap(bar, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED && errno == ENOTSUP);
+    assert(fallback_maps == 0 && fallback_unmaps == 0);
+    assert(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, -1, 0) == MAP_FAILED && errno == EAGAIN);
+    assert(munmap((void *)65536, 4096) == -1 && errno == EAGAIN);
+    assert(fallback_maps == 1 && fallback_unmaps == 1);
+
     assert(wc_cygwin_fd_words(duplicate, words) == -1 && errno == ENOTSUP);
     close(duplicate);
     int unknown = open("/dev/null", O_RDONLY);

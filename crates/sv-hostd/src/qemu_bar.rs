@@ -1,5 +1,8 @@
 //! Read-only QMP identity checks for an existing host-side ivshmem BAR.
 //! No backend is created, resized, or selected by a pathname supplied by a client.
+//! The QMP socket and operator configuration must be trusted. Executable naming
+//! is a compatibility check, not authentication. Hotplug or backend reassignment
+//! after attachment is outside this session protocol and must be disabled.
 use crate::qemu::Qmp;
 use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
@@ -188,6 +191,39 @@ impl QemuBar {
         let pci = reply(&mut qmp, json!({"execute":"query-pci"}))?;
         if device_size(&pci, device, slot)? != len {
             return Err(invalid("QEMU BAR identity changed while opening"));
+        }
+        // A delete/re-add with the same PCI geometry must not substitute a
+        // different memory backend between our first query and retained open.
+        let final_backend = reply(
+            &mut qmp,
+            json!({"execute":"qom-get","arguments":{"path":path,"property":"memdev"}}),
+        )?;
+        let final_memdevs = reply(&mut qmp, json!({"execute":"query-memdev"}))?;
+        let final_entries: Vec<_> = final_memdevs
+            .as_array()
+            .ok_or_else(|| invalid("QMP omitted final memory backends"))?
+            .iter()
+            .filter(|entry| entry["id"].as_str() == Some(&backend))
+            .collect();
+        let final_backing = reply(
+            &mut qmp,
+            json!({"execute":"qom-get","arguments":{"path":backend_path,"property":"mem-path"}}),
+        )?;
+        let current_metadata = std::fs::metadata(backing)?;
+        let retained_metadata = file.metadata()?;
+        if final_backend != backend_value
+            || final_backing != backing_value
+            || final_entries.len() != 1
+            || final_entries[0]["share"].as_bool() != Some(true)
+            || final_entries[0]["size"].as_u64() != Some(len)
+            || current_metadata.dev() != metadata.dev()
+            || current_metadata.ino() != metadata.ino()
+            || current_metadata.len() != len
+            || retained_metadata.dev() != metadata.dev()
+            || retained_metadata.ino() != metadata.ino()
+            || retained_metadata.len() != len
+        {
+            return Err(invalid("QEMU BAR backend identity changed while opening"));
         }
         if write {
             use std::os::fd::AsRawFd;

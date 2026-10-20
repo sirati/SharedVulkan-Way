@@ -46,6 +46,8 @@ mod windows {
         closed: AtomicBool,
         pool: Mutex<PoolWindow>,
         pool_base: usize,
+        mapping_base: usize,
+        mapping_len: usize,
         arena: Option<u32>,
         header: Option<(usize, wc_handle::ivshmem::Header)>,
         _control: Arc<Control>,
@@ -167,6 +169,8 @@ mod windows {
                 used: 0,
             }),
             pool_base,
+            mapping_base: owner.ptr() as usize,
+            mapping_len: len,
             arena,
             header,
             _control: control,
@@ -261,6 +265,19 @@ mod windows {
                 }
             }
         }
+    }
+
+    /// Refuse Cygwin VM operations overlapping any retained device page.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn wc_bridge_bar_overlap(address: usize, length: usize) -> i32 {
+        let Some(end) = address.checked_add(length) else {
+            return 1;
+        };
+        let Some(c) = CONNECTION.get() else { return 0 };
+        let Some(last) = c.mapping_base.checked_add(c.mapping_len) else {
+            return 1;
+        };
+        i32::from(length != 0 && address < last && c.mapping_base < end)
     }
 
     /// Allocate one nonrecycled extent of the preassigned BAR pixel window.
