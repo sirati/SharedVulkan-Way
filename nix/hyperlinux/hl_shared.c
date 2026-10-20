@@ -305,6 +305,12 @@ static int64_t map_host(guest_t *g, uint64_t addr, uint64_t len, int prot,
     pthread_mutex_lock(&lock);
     v->next = views; views = v;
     pthread_mutex_unlock(&lock);
+    if (getenv("HL_WC_MAP_TRACE"))
+        fprintf(stderr, "HL_WC_SHARED_MAP dev=%llu ino=%llu offset=%llu len=%llu native_base=%p native_delta=%llu native_len=%llu guest_va=0x%llx ipa=0x%llx prot=%d writable=%d inherited=%d\n",
+            (unsigned long long)o->dev, (unsigned long long)o->ino,
+            (unsigned long long)offset, (unsigned long long)len, o->map.base,
+            (unsigned long long)o->map.data_offset, (unsigned long long)o->map.mapped_len,
+            (unsigned long long)addr, (unsigned long long)o->ipa, prot, o->writable, inherited);
     g->need_tlbi = 1;
     return (int64_t)addr;
 no_memory:
