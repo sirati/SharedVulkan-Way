@@ -1,6 +1,6 @@
 #define VK_NO_PROTOTYPES
 #include "nv12-sample.h"
-#include "nv12_spv.h"
+#include "nv12_fixture_spv.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -192,8 +192,8 @@ VkResult kk_nv12_fixture_start(const struct kk_nv12_fixture_info *i,
        j->device,
        &(VkShaderModuleCreateInfo){
            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-           .codeSize = sizeof(nv12_spv),
-           .pCode = nv12_spv},
+           .codeSize = sizeof(kk_nv12_fixture_spv),
+           .pCode = kk_nv12_fixture_spv},
        NULL, &j->shader));
    TRY(j->CreateComputePipelines(
        j->device, VK_NULL_HANDLE, 1,
