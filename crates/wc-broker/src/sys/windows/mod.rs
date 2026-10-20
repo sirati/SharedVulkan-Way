@@ -308,6 +308,22 @@ impl Windows {
         self.large_pages
     }
 
+    fn watch_retained(&self, pid: Pid, process: Arc<Owned>, exited: Box<dyn FnOnce() + Send>) -> bool {
+        let (opened, mine) = (Arc::clone(&self.opened), Arc::clone(&process));
+        let bell_hub = self.bell_hub.clone();
+        let exited: Box<dyn FnOnce() + Send> = Box::new(move || {
+            {
+                let mut m = opened.lock().unwrap_or_else(|e| e.into_inner());
+                if m.get(&pid).is_some_and(|p| Arc::ptr_eq(p, &mine)) {
+                    m.remove(&pid);
+                }
+            }
+            if let Some(hub) = bell_hub { hub.process_exited(&mine); }
+            exited();
+        });
+        watch_process(process, exited)
+    }
+
     fn identify(&self, pipe: &ServerPipe) -> io::Result<(Peer, Arc<Owned>)> {
         let (pid, sid) = ident::pipe_client(pipe.handle)?;
         let process = Arc::new(if self.protected_bar_mode {
@@ -431,19 +447,13 @@ impl Platform for Windows {
         let Some(process) = self.opened.lock().unwrap_or_else(|e| e.into_inner()).get(&pid).cloned() else {
             return false;
         };
-        let (opened, mine) = (Arc::clone(&self.opened), Arc::clone(&process));
-        let bell_hub = self.bell_hub.clone();
-        let exited: Box<dyn FnOnce() + Send> = Box::new(move || {
-            {
-                let mut m = opened.lock().unwrap_or_else(|e| e.into_inner());
-                if m.get(&pid).is_some_and(|p| Arc::ptr_eq(p, &mine)) {
-                    m.remove(&pid);
-                }
-            }
-            if let Some(hub) = bell_hub { hub.process_exited(&mine); }
-            exited();
-        });
-        watch_process(process, exited)
+        self.watch_retained(pid, process, exited)
+    }
+
+    fn watch_for(&self, writer: &Writer, pid: Pid, exited: Box<dyn FnOnce() + Send>) -> bool {
+        // This process comes directly from this connection's token-checked
+        // accept. Another accept of the same PID cannot replace it here.
+        self.watch_retained(pid, Arc::clone(&writer.process), exited)
     }
 
     fn open_device(&self, name: &str) -> io::Result<Object> {
