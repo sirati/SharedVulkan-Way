@@ -39,11 +39,17 @@ static void *reader(void *unused) {
 }
 int main(void) {
     add_view(1,LINUX_PROT_READ|LINUX_PROT_WRITE,0x1000);
+    assert(hl_wc_stage2_fault(0x1000,0x201000));
+    assert(hl_wc_stage2_fault(0x1040,0x201000)); /* HVF may report page IPA. */
+    assert(hl_wc_stage2_fault(0x1040,0x201040));
+    assert(!hl_wc_stage2_fault(0x1040,0x202000));
+    assert(!hl_wc_stage2_fault(0x2000,0x201000));
     pthread_t thread;assert(!pthread_create(&thread,NULL,reader,NULL));
     pthread_mutex_lock(&gate_lock);
     while (!acquired) pthread_cond_wait(&gate,&gate_lock);
     assert(!hl_wc_unmap(&guest,0x1000,4096));
     assert(!views && retained && released==0 && unmapped==1);
+    assert(!hl_wc_stage2_fault(0x1000,0x201000));
     assert(hl_wc_ipa_busy(0x201000,4096));
     removed=1;pthread_cond_broadcast(&gate);pthread_mutex_unlock(&gate_lock);
     assert(!pthread_join(thread,NULL));

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <ucontext.h>
 
 static void output_denied(void *map) {
     struct timeval *tv = map;
@@ -33,6 +34,20 @@ static void guest_fault(int signal) {
     size_t length=signal==SIGBUS ? 13 : 14;
     ssize_t written=write(1,message,length);
     _exit(written==(ssize_t)length ? 0 : 98);
+}
+static void *expected_bus_address;
+static volatile sig_atomic_t bus_return, bus_seen;
+static void guest_bus(int sig, siginfo_t *info, void *context) {
+    if(sig!=SIGBUS || info->si_code!=BUS_ADRERR || info->si_addr!=expected_bus_address)
+        _exit(97);
+    if(bus_return) {
+        ucontext_t *uc=context;
+        uc->uc_mcontext.pc+=4; /* Skip this single AArch64 load/store. */
+        bus_seen=1;
+        return;
+    }
+    const char message[]="GUEST_SIGBUS_ADRERR\n";
+    _exit(write(1,message,sizeof(message)-1)==sizeof(message)-1 ? 0 : 98);
 }
 int main(int argc,char **argv) {
     if(argc==2 && (!strcmp(argv[1],"--guest-readonly-write") ||
@@ -54,14 +69,39 @@ int main(int argc,char **argv) {
         else *(volatile uint32_t *)p=0;
         _exit(99);
     }
-    if(argc==2 && !strcmp(argv[1],"--guest-map-fault")) {
+    if(argc==2 && (!strcmp(argv[1],"--guest-map-fault") ||
+                  !strcmp(argv[1],"--guest-map-fault-offset") ||
+                  !strcmp(argv[1],"--guest-map-fault-write") ||
+                  !strcmp(argv[1],"--guest-map-fault-return"))) {
+        int precise=strcmp(argv[1],"--guest-map-fault")!=0;
+        int store=!strcmp(argv[1],"--guest-map-fault-write");
+        bus_return=!strcmp(argv[1],"--guest-map-fault-return");
+        int trace=getenv("HL_GUEST_FAULT_TRACE")!=NULL;
+        if(trace)fprintf(stderr,"GUEST_FAULT_STEP begin\n");
         char name[]="/tmp/hl-guest-fault-XXXXXX";int fd=mkstemp(name);assert(fd>=0);
         assert(!unlink(name));assert(!ftruncate(fd,16384));
+        if(trace)fprintf(stderr,"GUEST_FAULT_STEP file-sized\n");
         void *p=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);assert(p!=MAP_FAILED);
+        if(trace)fprintf(stderr,"GUEST_FAULT_STEP mapped %p\n",p);
         struct sigaction action={.sa_handler=guest_fault};sigemptyset(&action.sa_mask);
         assert(!sigaction(SIGBUS,&action,NULL));assert(!sigaction(SIGSEGV,&action,NULL));
+        expected_bus_address=(char *)p+(precise ? 4160 : 0);
+        if(precise) {
+            action.sa_sigaction=guest_bus;action.sa_flags=SA_SIGINFO;
+            assert(!sigaction(SIGBUS,&action,NULL));
+            action.sa_handler=SIG_DFL;action.sa_flags=0;
+            assert(!sigaction(SIGSEGV,&action,NULL));
+        }
+        if(trace)fprintf(stderr,"GUEST_FAULT_STEP handlers-ready\n");
         assert(!ftruncate(fd,0));
-        (void)*(volatile uint32_t *)p;
+        if(trace)fprintf(stderr,"GUEST_FAULT_STEP truncated\n");
+        if(store) *(volatile uint32_t *)expected_bus_address=0x12345678;
+        else (void)*(volatile uint32_t *)expected_bus_address;
+        if(trace)fprintf(stderr,"GUEST_FAULT_STEP load-returned\n");
+        if(bus_return) {
+            assert(bus_seen);assert(!munmap(p,16384));close(fd);
+            puts("GUEST_SIGBUS_RETURN");return 0;
+        }
         _exit(99);
     }
     assert(argc==1);

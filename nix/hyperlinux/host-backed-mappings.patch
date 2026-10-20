@@ -2366,3 +2366,53 @@ index 10753ca..6854b0e 100644
 +                guest_destroy(&g);
 +                return 1;
 +            }
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -1748,0 +1749,47 @@
++            } else if (ec == 0x24 &&
++                       (vexit->exception.syndrome & 0x3c) == 0x04 &&
++                       !(vexit->exception.syndrome & ((1ULL << 7) | (1ULL << 10)))) {
++                /* A native file truncation can remove a registered physical
++                 * page. The resulting Stage-2 abort reaches EL2 directly;
++                 * the EL1 shim has not saved an exception frame. Convert
++                 * only a precise live external VA/IPA match from EL0. */
++                uint64_t pstate;
++                HV_CHECK_CTX(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &pstate), vcpu, g);
++                int external = 0;
++                if ((pstate & 0x1f) == 0) {
++                    pthread_mutex_lock(&mmap_lock);
++                    external = hl_wc_stage2_fault(vexit->exception.virtual_address,
++                                                  vexit->exception.physical_address);
++                    pthread_mutex_unlock(&mmap_lock);
++                }
++                if (!external) {
++                    fprintf(stderr, "%s: unowned Stage-2 data abort VA=0x%llx PA=0x%llx\n",
++                            prefix, (unsigned long long)vexit->exception.virtual_address,
++                            (unsigned long long)vexit->exception.physical_address);
++                    crash_report(vcpu, g, CRASH_UNEXPECTED_EC, "unowned Stage-2 data abort");
++                    exit_code = 128;
++                    running = 0;
++                } else {
++                    uint64_t pc;
++                    HV_CHECK_CTX(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc), vcpu, g);
++                    HV_CHECK_CTX(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc), vcpu, g);
++                    HV_CHECK_CTX(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, pstate), vcpu, g);
++                    signal_set_fault_info(LINUX_BUS_ADRERR,
++                                          vexit->exception.virtual_address,
++                                          vexit->exception.syndrome);
++                    signal_queue_directed(LINUX_SIGBUS,
++                        current_thread ? current_thread->guest_tid : proc_get_pid(),
++                        LINUX_BUS_ADRERR);
++                    int delivered = signal_deliver(vcpu, g, &exit_code);
++                    if (delivered < 0) {
++                        running = 0;
++                    } else if (delivered > 0) {
++                        /* signal_deliver normally returns through an EL1
++                         * ERET. This exit is already EL0: enter the handler
++                         * using its new saved user PC/PSTATE directly. */
++                        HV_CHECK_CTX(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &pc), vcpu, g);
++                        HV_CHECK_CTX(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &pstate), vcpu, g);
++                        HV_CHECK_CTX(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc), vcpu, g);
++                        HV_CHECK_CTX(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, pstate), vcpu, g);
++                    }
++                }

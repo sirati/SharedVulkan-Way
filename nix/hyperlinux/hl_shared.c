@@ -115,6 +115,22 @@ int hl_wc_contains(uint64_t va) {
     pthread_mutex_unlock(&lock);
     return found;
 }
+/* A Stage-2 translation abort belongs to an external allocation only if
+ * both the live guest view and its exact physical page agree. Caller holds
+ * mmap_lock so unmap/protect cannot replace the view during classification. */
+int hl_wc_stage2_fault(uint64_t va, uint64_t ipa) {
+    int found = 0;
+    pthread_mutex_lock(&lock);
+    for (view *v = views; v; v = v->next) {
+        if (va < v->va || va >= v->end) continue;
+        uint64_t expected = v->o->ipa + v->o->map.data_offset +
+                            v->offset + va - v->va;
+        found = ((expected & ~4095ULL) == (ipa & ~4095ULL));
+        break;
+    }
+    pthread_mutex_unlock(&lock);
+    return found;
+}
 int hl_wc_ipa_busy(uint64_t lo, uint64_t span) {
     int busy = 0;
     pthread_mutex_lock(&lock);
