@@ -1991,3 +1991,25 @@ index 10753ca..6854b0e 100644
              usleep(5000);
          }
  
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -21,0 +22 @@
++#include "hl_shared.h"
+@@ -1412,0 +1414,7 @@
++                        /* External views retain their explicit mmap/mprotect
++                         * permissions. Never turn an EL0 fault into access. */
++                        if (hl_wc_contains(far)) {
++                            pthread_mutex_unlock(&mmap_lock);
++                            hv_vcpu_set_reg(vcpu, HV_REG_X0, 1);
++                            break;
++                        }
+@@ -1423,0 +1432,3 @@
++                    /* Zero permits the shim to retry. A refused external
++                     * toggle above enters its ordinary EL0 fault handler. */
++                    hv_vcpu_set_reg(vcpu, HV_REG_X0, 0);
+--- a/src/shim.S
++++ b/src/shim.S
+@@ -398,0 +399 @@
++    cbnz x0, handle_el0_fault  /* Host refused permission promotion */
+@@ -431,0 +433 @@
++    cbnz x0, handle_el0_fault  /* Host refused permission promotion */

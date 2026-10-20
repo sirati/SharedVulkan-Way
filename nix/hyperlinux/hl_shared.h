@@ -9,6 +9,8 @@ int hl_wc_protect(guest_t *, uint64_t, uint64_t, int);
 void hl_wc_reset(guest_t *);
 void hl_wc_vm_destroyed(void);
 uint64_t hl_wc_find_va(guest_t *, uint64_t);
+/* Requires mmap_lock across query and permission change. */
+int hl_wc_contains(uint64_t);
 int hl_wc_ipa_busy(uint64_t, uint64_t);
 int hl_shm_ipa_busy(uint64_t, uint64_t);
 /* Raw external pointers are valid only until their enclosing scope ends.

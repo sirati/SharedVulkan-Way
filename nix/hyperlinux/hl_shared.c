@@ -105,6 +105,16 @@ void *hl_wc_resolve(uint64_t va, uint64_t *avail, int write, int *found) {
     pthread_mutex_unlock(&lock);
     return p;
 }
+/* Caller holds mmap_lock, so the view cannot be replaced before the
+ * permission decision is applied. External mappings never use JIT toggles. */
+int hl_wc_contains(uint64_t va) {
+    int found = 0;
+    pthread_mutex_lock(&lock);
+    for (view *v = views; v; v = v->next)
+        if (va >= v->va && va < v->end) { found = 1; break; }
+    pthread_mutex_unlock(&lock);
+    return found;
+}
 int hl_wc_ipa_busy(uint64_t lo, uint64_t span) {
     int busy = 0;
     pthread_mutex_lock(&lock);
