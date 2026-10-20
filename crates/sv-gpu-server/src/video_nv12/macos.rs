@@ -61,7 +61,8 @@ impl Picture {
     /// # Safety
     /// `buffer` must be a live, completed decoder-output CVPixelBuffer. The
     /// If the producer is VideoToolbox, its completion callback must have run. No
-    /// producer may modify its pixels while this Picture or its imports live.
+    /// producer may modify its pixels while this Picture or its imports live,
+    /// except through an explicitly synchronized overwrite via copy_from_gpu.
     pub unsafe fn from_completed_buffer(buffer: *mut c_void) -> Result<Arc<Self>, &'static str> {
         if buffer.is_null() { return Err("null decoded picture"); }
         // SAFETY: the caller supplies a live completed CVPixelBuffer.
@@ -203,5 +204,88 @@ impl PlaneTextures {
                 .map_err(|e| format!("plane {i} bind: {e:?}"))?;
         }
         Ok(out)
+    }
+}
+
+
+impl Picture {
+    /// Copy a completed decoder picture into this already imported allocation.
+    /// This preserves the bound VkImage and never maps or reads pixel bytes.
+    ///
+    /// # Safety
+    /// The caller must retire every earlier GPU/display reader of `self`, hold
+    /// the target image's exclusive producer ownership, and prevent all other
+    /// writers. No later reader may start until this function returns success.
+    /// On failure, the target's contents are undefined and must not be signaled
+    /// as a completed decode. Both pictures remain retained through completion.
+    pub unsafe fn copy_from_gpu(self: &Arc<Self>, source: &Arc<Self>) -> Result<(), String> {
+        if self.surface == source.surface { return Ok(()); }
+        if self.layout.width != source.layout.width || self.layout.height != source.layout.height
+            || self.range != source.range {
+            return Err("decoded picture and bound target dimensions/range differ".into());
+        }
+        // Pitch and offsets may differ. Metal copies actual plane texels, not
+        // inferred NV12 byte ranges, after each picture validated its layout.
+        let make = |picture: &Picture, index: usize| {
+            let p = picture.layout.planes[index];
+            unsafe { iosurface::texture_plane(picture.surface, if index == 0 { 10 } else { 30 },
+                u32::try_from(p.width).map_err(|_| "copy plane width")?,
+                u32::try_from(p.height).map_err(|_| "copy plane height")?, index as u64, 0) }
+                .ok_or("Metal rejected NV12 blit plane")
+        };
+        let src = [make(source, 0)?, make(source, 1)?];
+        let dst = [make(self, 0)?, make(self, 1)?];
+        #[repr(C)] #[derive(Clone, Copy)] struct Three { x: usize, y: usize, z: usize }
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+            fn objc_msgSend();
+            fn objc_autoreleasePoolPush() -> *mut c_void;
+            fn objc_autoreleasePoolPop(pool: *mut c_void);
+        }
+        unsafe fn object(object: *mut c_void, selector: &std::ffi::CStr) -> *mut c_void {
+            let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            unsafe { send(object, sel_registerName(selector.as_ptr())) }
+        }
+        unsafe fn call(object: *mut c_void, selector: &std::ffi::CStr) {
+            let send: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            unsafe { send(object, sel_registerName(selector.as_ptr())) }
+        }
+        struct Pool(*mut c_void);
+        impl Drop for Pool { fn drop(&mut self) { unsafe { objc_autoreleasePoolPop(self.0) } } }
+        struct Queue(*mut c_void);
+        impl Drop for Queue { fn drop(&mut self) { unsafe { call(self.0, c"release") } } }
+        unsafe {
+            let _pool = Pool(objc_autoreleasePoolPush());
+            let device = object(dst[0].0, c"device");
+            if device.is_null() { return Err("NV12 blit device unavailable".into()); }
+            let queue = Queue(object(device, c"newCommandQueue"));
+            if queue.0.is_null() { return Err("NV12 blit queue unavailable".into()); }
+            let command = object(queue.0, c"commandBuffer");
+            if command.is_null() { return Err("NV12 blit command unavailable".into()); }
+            let encoder = object(command, c"blitCommandEncoder");
+            if encoder.is_null() { return Err("NV12 blit encoder unavailable".into()); }
+            let copy: unsafe extern "C" fn(*mut c_void, *mut c_void,
+                *mut c_void, usize, usize, Three, Three, *mut c_void, usize, usize, Three) =
+                std::mem::transmute(objc_msgSend as *const ());
+            for index in 0..2 {
+                let p = self.layout.planes[index];
+                copy(encoder, sel_registerName(c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:".as_ptr()),
+                    src[index].0, 0, 0, Three { x: 0, y: 0, z: 0 },
+                    Three { x: p.width, y: p.height, z: 1 }, dst[index].0, 0, 0,
+                    Three { x: 0, y: 0, z: 0 });
+            }
+            call(encoder, c"endEncoding");
+            call(command, c"commit");
+            call(command, c"waitUntilCompleted");
+            let status: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
+                std::mem::transmute(objc_msgSend as *const ());
+            if status(command, sel_registerName(c"status".as_ptr())) != 4 {
+                return Err("NV12 GPU copy did not complete".into());
+            }
+        }
+        Ok(())
     }
 }
