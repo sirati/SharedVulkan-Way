@@ -1610,16 +1610,13 @@ fn lines(mut conn: wc_transport::Stream, mut f: impl FnMut(&str) -> Vec<u8>) {
 /// One connection of a launcher: request lines, each answered in order, until
 /// it closes. A launcher sends one; `--ping N` sends N on one connection.
 fn answer(conn: wc_transport::Stream, ctl: &Ctl) {
-    // §105.14: HIGHEST for as long as the connection lives. The thread runs
-    // only when a request arrives; on a loaded guest a normal one waited up
-    // to 133 ms for its vCPU after the launcher had written, and an
-    // above-normal one still 53 ms: a readied thread that does not outrank
-    // the thread running where it is queued waits for that thread's quantum
-    // to end (one or two 15.6 ms ticks).
+    // §105.14: above normal for as long as the connection lives. The thread
+    // runs only when a request arrives, and on a loaded guest a normal one
+    // waited up to 133 ms for its vCPU after the launcher had written.
     #[cfg(windows)]
-    // SAFETY: the calling thread's pseudo-handle.
+    // SAFETY: the calling thread's pseudo-handle; 1 is ABOVE_NORMAL.
     unsafe {
-        prio::SetThreadPriority(prio::GetCurrentThread(), prio::HIGHEST);
+        prio::SetThreadPriority(prio::GetCurrentThread(), 1);
     }
     lines(conn, |line| {
         let line = line.trim();

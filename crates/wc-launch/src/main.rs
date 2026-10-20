@@ -750,35 +750,6 @@ mod win {
         CtlClient::connect(p)?.request(line)
     }
 
-    /// §105.14: the calling thread at HIGHEST priority until dropped.
-    struct Urgent {
-        was: i32,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn GetThreadPriority(t: isize) -> i32;
-        fn SetThreadPriority(t: isize, p: i32) -> i32;
-    }
-
-    impl Urgent {
-        fn now() -> Urgent {
-            // SAFETY: the calling thread's pseudo-handle; no other effect.
-            let was = unsafe { GetThreadPriority(GetCurrentThread()) };
-            // SAFETY: as above; 2 is THREAD_PRIORITY_HIGHEST.
-            unsafe { SetThreadPriority(GetCurrentThread(), 2) };
-            Urgent { was }
-        }
-    }
-
-    impl Drop for Urgent {
-        fn drop(&mut self) {
-            // SAFETY: as in `now`.
-            unsafe { SetThreadPriority(GetCurrentThread(), self.was) };
-        }
-    }
-
     /// One connection to the compositor's control socket, for any number of
     /// requests in turn (§105.13).
     pub struct CtlClient {
@@ -852,11 +823,6 @@ mod win {
 
         pub fn request(&mut self, line: &str) -> Result<String, String> {
             use std::io::Write;
-            // §105.14: HIGHEST while the answer is outstanding, as the
-            // compositor's request thread is. On a loaded guest a normal
-            // thread woken by the answer waited behind the running thread
-            // of its processor for that thread's quantum: 9.6–32.6 ms.
-            let _urgent = Urgent::now();
             self.s.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("control socket: {e}"))?;
             let nl = loop {
                 if let Some(i) = self.buf.iter().position(|b| *b == b'\n') {
