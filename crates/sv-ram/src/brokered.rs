@@ -528,6 +528,10 @@ impl BrokerMappers {
 }
 
 impl Mappers for BrokerMappers {
+    fn can_scan(&self) -> bool {
+        self.recovery_error.is_none()
+    }
+
     fn publish(&mut self, m: &Mapped, ram: BorrowedFd<'_>) -> Result<(), String> {
         if let Some(error) = &self.recovery_error {
             return Err(format!("guest-RAM recovery blocked: {error}"));
@@ -1070,10 +1074,13 @@ mod tests {
             assert!(m.recovery_error.is_some(), "{failure}");
             assert!(!m.let_go(999, 1), "unknown epochs must also remain blocked");
             restarted_peer.set_mappers(Box::new(m));
+            // A new announcement would otherwise fail publication and receive
+            // REFUSED, which also permits the provider to free its memory.
+            provider.announce(3, 2 << 20).unwrap();
             provider.retire(entry);
             for _ in 0..3 {
                 let events = restarted_peer.scan(|_| {});
-                assert!(!events.iter().any(|e| matches!(e, PeerEvent::Unmapped { .. })), "{failure}: {events:?}");
+                assert!(events.is_empty(), "{failure}: {events:?}");
                 restarted_peer.beat();
                 assert!(provider.poll().unwrap().is_empty(), "{failure}");
             }
