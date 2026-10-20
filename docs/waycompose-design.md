@@ -37147,9 +37147,27 @@ or an existing broker socket before changing either end's installed files;
 it no longer issues `launchctl bootout`. To upgrade, first end sessions and
 verify their host release, SIGTERM the daemon, wait for its exit, and prevent
 new sessions before unloading its job. Never force bootout of an old broker
-that still holds regions. A crash, explicit SIGKILL, or VM termination still
-removes this process's holds; crash-safe retention needs an independent
-holder and adoption, and is not implemented.
+that still holds regions.
+
+**Independent retention after broker death.** Before any region grant, a
+private retention process receives the already allocated shared-memory fd,
+creates its own shared mapping, independently calls `mlock`, and acknowledges
+success. It is another invocation of `wc-broker`, with no public socket,
+allocator or authorization endpoint. The broker alone decides grants and
+normal destruction. The holder uses a separate session/process group, and
+launchd's `AbandonProcessGroup` preserves it when the broker exits.
+
+Broker EOF never frees its mappings. The holder restores their metadata as
+orphans in the same `Core` lifetime engine, uses `Release::Probe { after: None }`,
+and frees only the matching user's pool when its boot page carries the host
+release word. Other pools remain wired. No deadline, signal handler or channel
+error unwinds existing holds. A missing or failed holder refuses new grants.
+This covers a broker-process crash with a surviving holder. It does not cover
+holder and broker failure together, VM termination, or the GPU server's own
+extent. A region never stamped with a boot release page may remain held
+indefinitely after broker death. New brokers do not yet re-adopt old holders;
+those holders independently wait for host release rather than freeing on
+restart.
 
 #### 111.9.4 Tests
 
@@ -37211,7 +37229,7 @@ holder and adoption, and is not implemented.
   denial as process exit. It then reported the same pid before and after
   the signal. The 0.70 s measurement is invalid. The harness now requires a successful root probe and positive PID absence,
   enforces an elapsed observation deadline, and validates a different live
-  replacement pid; a VM rerun is pending.
+  replacement pid; the corrected safety rerun is recorded below.
 * **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
   after): its `open` of user 1's regions, `find` of user 1's pool and
   `device wcbell` (held by user 1's main process) were refused by uid; it
@@ -37239,7 +37257,81 @@ holder and adoption, and is not implemented.
   run.
 * The harness's check that a user cannot open a port node itself used
   `head -c0`, which macOS rejects; the node modes above are the evidence.
-  Fixed for the next run.
+  Fixed before the safety rerun below.
+
+**Safety rerun, 3072 MiB VM, 2026-10-20 around 12:00-12:04.** Evidence is
+in `evidence/session-fixes/broker-mac/safe-rerun/`, outside git. The new broker
+was built after the no-timeout correction; no unsafe old baseline ran.
+
+* The corrected direct port-open probe and root-key read were refused.
+  The LaunchDaemon was root's, the ports 0600, the socket 0666 and the key
+  directory/key 0700/0600.
+* Five recorded main-process SIGKILL cycles each ended with host teardown,
+  the host release word and pool reclamation. Recursive panic-file counts
+  were four before and four after, and guest uptime continued throughout.
+  The harness used default foot settings and throwaway Linux HOME/XDG
+  state; Console ran on a private D-Bus session.
+* The root daemon held two orphan regions when SIGTERM arrived. A successful
+  root process-table snapshot observed its exit after 5210 ms, including SSH
+  observation overhead, and launchd reported a different live pid, 581 to
+  1265. Its log showed host release followed by `every region released;
+  exiting`. This replaces the original run's invalid 0.70 s assertion.
+* The 2000 Wayland round trips measured mean 3.240 ms, p50 1.231 ms,
+  p99 12.646 ms and maximum 1470.707 ms. The runtime ctypes/libwayland
+  fixture includes Python call overhead. This **fails** the 0.2 ms target;
+  it proves neither acceptable latency nor broker overhead relative to the
+  old unsafe baseline. Concurrent second-user sessions and fresh GPU timing
+  remain unproved by this rerun.
+* The successful VM run peaked at 4,423,475,200 bytes including QEMU/cache;
+  an earlier cold-start attempt peaked at 5,089,390,592 bytes before tests.
+  These observations include reclaimable cache, not only configured RAM. Cleanup
+  restored guest support/apps, host files and original unit arguments,
+  removed the test daemon/key, cleanly stopped the VM and restored its
+  original 4096 MiB configuration. The peer's `work` VM was untouched.
+
+**Restart ownership.** The restored older `mac-sessiond` exposed a separate
+isolation bug: startup adopted every active `wc-launch-*` unit, including
+unrelated `wcma-*`, `wcmb-*` and `wcmc-*` harness sessions with no known boot
+page. It then ran `down` for them. Restart state is now scoped by configured
+QMP path, VM hint, session script and key policy; each checkpoint carries that
+full owner description. Recovery requires a matching boot page in that VM
+and its configured MAC policy. A directory hash only names this state and is
+not trusted as authorization. Every managed session has a boot record, and
+ownership is checked again before teardown. Unowned/legacy global state is
+left untouched; failed host release retains the checkpoint for retry.
+Before upgrading the old service with live sessions, drain those sessions
+through their actual owner. Old global checkpoints cannot prove installation
+ownership and are not automatically migrated.
+
+**Independent-holder macOS runtime proof, 2026-10-20.** The disposable
+`wayland-host` VM ran at 3072 MiB under an exclusive run lease, using the
+vmhost-built broker from `5ec8367`. A native fixture allocated two 64 KiB regions
+in pool A and one in pool B, stamped them, closed every fd and mapping, and
+exited before the broker was killed. No GUI or application workload was used.
+
+The root LaunchDaemon broker PID 383 was SIGKILLed. Twelve seconds later its
+separate holder PID 385 remained, reparented to launchd. Native
+`mach_vm_region(..., VM_REGION_BASIC_INFO_64, ...)` inspection reported
+`user_wired_count=1` for all three independent holder mappings, at the same
+addresses observed before broker death. The host wrote sentinel values directly
+through QEMU's shared guest-RAM backend both before and after the broker kill;
+Mach reads of the holder's mappings verified both values.
+
+The host then wrote pool A's release word exactly once, stopped accessing that
+pool, and observed both A mappings disappear while B remained wired at the same
+address with its sentinel intact. Pool B's release ended the holder. A successful
+sudo process-table snapshot positively established its absence. Panic-file
+counts stayed 4 before and 4 after. This proves broker-process SIGKILL retention
+and per-pool host release in this macOS VM; it does not test simultaneous
+holder/broker death, a full graphical session or the GPU server's own extent.
+
+The VM was cleanly stopped, its exact prior 4096 MiB configuration restored, and
+the temporary job, binaries and socket removed. Both existing host units kept
+their PIDs and arguments throughout. Measured VM-unit MemoryPeak was
+5,239,672,832 bytes including QEMU/cache. Evidence is in
+`evidence/session-fixes/broker-mac/holder-vm/`. An earlier successful run is
+retained as `holder-vm-first`; the final run strengthened holder-exit observation
+with a successful full process-table query.
 
 #### 111.9.5 Limits
 
@@ -37247,14 +37339,14 @@ holder and adoption, and is not implemented.
   A second macOS user's session gets no doorbell: it polls its rings, and the
   host finds its record only by a periodic sweep (`--sweep-secs`). A port per
   user (`org.sirati.wcbell.N`, a chardev each on the hub) is the fix.
-* **A broker that dies loses its holds.** Normal SIGTERM retains every
-  live and orphan region until release, and launchd has no automatic
-  SIGKILL deadline, but a crash or explicit forced kill is still unsafe.
-  launchd restarts it, but the new
-  process holds none of the old one's regions: a main process that dies after
-  that, before its session's release, is the §103.15 case again. The broker
-  has no state to lose otherwise. A main process could hand its fds back to a
-  new broker (`adopt` with fds); not built.
+* **Independent holder limits.** A broker-process crash leaves its separate
+  wired holder alive until host release. Simultaneous holder/broker death or
+  VM termination still loses those wires. Restarted brokers do not re-adopt
+  the old holders, so old allocations remain private to their original
+  clients until host release; missing release pages retain memory indefinitely.
+  The disposable macOS VM proof above verifies independent wiring and
+  launchd survival for a broker-process SIGKILL. It does not establish safety
+  against failure of the holder itself or a terminated VM.
 * **The GPU server's own extent** is still its own superpages: kept by
   nothing if the GPU server itself crashes while `sv-hostd` serves it
   (§103.15's remaining case). Moving it into the broker would change its
@@ -38076,3 +38168,55 @@ The following thirty-minute observation contained 13 complete GPU D0
 dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
 the busy-loop recovery under that workload. The process that triggers the
 periodic GPU wake remains unidentified.
+## §114. Doorbell writer recovery
+
+A shared compositor outlives its installations. A failed doorbell write must
+therefore leave later hints usable. `DetachedWriter` consumes the next queued
+hint after a write error instead of ending its thread. Unix file and inherited
+fd endpoints use that writer too, so a full port cannot block a ring caller.
+`WC_BELL_INLINE=0` selects it for Linux sockets as well, allowing the local
+multi-install harness to exercise the guest's queued writer path.
+
+Windows overlapped writes wait at most 500 ms, then allow another 500 ms for
+cancellation. Each pipe retains at most 32 still-pending synchronous writes,
+including their event, record and buffer. Writes are capped at 64 KiB per call,
+so the pending buffers consume at most 2 MiB per pipe. A full quarantine refuses
+new writes before allocating or submitting anything. Later completions reclaim
+entries and permit new writes. Pending status, rather than a particular timeout
+code, determines ownership on every return. A pipe with pending writes retains
+its original raw handle and outstanding allocations on shutdown, avoiding a
+blocking close and preserving every kernel buffer. Reads use their independent
+completion wait and never acquire the write quarantine's mutex.
+
+The default Windows `AsyncWriter` issues hints without waiting. Each request
+has an address-stable allocation. The I/O manager publishes its pending status;
+an unexpected write error never clears that status or releases its buffer. Requests still pending after 500 ms move to a
+quarantine after cancellation, and fresh or completed allocations replace them
+in the active pool. Late completions permit reuse. The quarantine holds at most
+256 requests beyond the 32 active slots. If a driver stops completing every
+request, hints eventually return `WouldBlock`; the application thread still
+runs. Shutdown retains any allocation and port reference whose request remains
+pending rather than waiting indefinitely for a broken driver.
+
+Both writer implementations reserve from one process-wide budget before
+allocating a record, buffer or event. It permits at most 1024 records/slots and
+32 MiB of write buffers across live and deliberately retained allocations.
+AsyncWriter reserves its slots up front, leaving its ordinary write path free
+of budget operations. A retained allocation keeps its reservation forever, so
+constructing another Pipe or AsyncWriter cannot reset the safety cap. Full
+budgets refuse new allocations; existing owners can reclaim capacity after
+completion or normal destruction. Abandoned allocations have no background
+reaper and remain charged until process exit. Stuck handles are never closed to
+recover capacity. Each retained original handle has at least one charged record.
+
+The broker currently refuses a second device grant to the same process, opens
+ports exclusively and transfers handles with DUPLICATE_CLOSE_SOURCE. The budget
+does not rely on those restrictions: repeated wrappers or async writers still
+share the same limits.
+
+Tests cover a failed queued hint followed by a delivered hint, bounded repeated
+synchronous cancellation failures and handle retention during shutdown,
+repeated Pipe and AsyncWriter lifetimes sharing record and byte budgets,
+constructor rollback, and simulated Windows cancellations that never complete followed by a late completion. The
+simulation never submits the fabricated requests to a driver. Test evidence
+and guest measurements belong outside the repository.

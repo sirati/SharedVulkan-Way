@@ -59,3 +59,11 @@ mod tests {
         assert_eq!(identity_word(""), "?");
     }
 }
+
+/// Host-provided PCI shared memory in a macOS guest. This is separate from
+/// the POSIX shm backend for macOS-owned guest-RAM windows.
+#[cfg(target_os = "macos")]
+pub mod macos_pci;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod wired_holder;

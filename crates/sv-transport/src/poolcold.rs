@@ -1003,6 +1003,7 @@ mod tests {
         host_attach(mb, live, ev, poke, n, t, |_| Ok(()), |_| true)
     }
 
+    #[cfg(target_os = "linux")]
     fn file_pair(len: usize) -> (Arc<SharedRegion>, Arc<SharedRegion>) {
         use std::os::fd::AsFd;
         static N: AtomicU32 = AtomicU32::new(0);
