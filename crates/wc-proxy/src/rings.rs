@@ -412,7 +412,8 @@ impl Drop for RingWake {
 /// them or could not open its port — which the caller reports and answers by
 /// using the socket. Every other failure is an error with the reason in it.
 pub fn attach_ivshmem(path: &Path, run: u64) -> io::Result<Option<Arc<Control>>> {
-    let h = crate::guestram::ivshmem_header(path, run)?;
+    let f = crate::guestram::open_backing(path, true)?;
+    let (h, _) = crate::guestram::read_ivshmem_header_fd(&f, run)?;
     let (off, len) = h.rings;
     if len == 0 {
         return Ok(None);
@@ -424,7 +425,6 @@ pub fn attach_ivshmem(path: &Path, run: u64) -> io::Result<Option<Arc<Control>>>
             format!("{}: rings of {len} bytes, and this proxy's are {want}", path.display()),
         ));
     }
-    let f = crate::guestram::open_backing(path, true)?;
     let region = sv_transport::region::SharedRegion::map_fd(
         std::os::fd::AsFd::as_fd(&f),
         off,

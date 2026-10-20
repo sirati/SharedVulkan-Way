@@ -373,7 +373,6 @@ pub fn ivshmem_header(path: &Path, expected_run: u64) -> io::Result<wc_handle::i
 }
 
 fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle::ivshmem::Header, u64)> {
-    use wc_handle::ivshmem::{ENCODED_LEN, Header};
     let f = open_backing(path, false).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -384,11 +383,38 @@ fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle:
             ),
         )
     })?;
+    read_ivshmem_header_fd(&f, expected_run)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+/// Snapshot metadata from the original open BAR, which may support mmap but
+/// not positional reads. No pixel backing is copied or reopened here.
+pub(crate) fn read_ivshmem_header_fd(f: &std::fs::File, expected_run: u64)
+    -> io::Result<(wc_handle::ivshmem::Header, u64)> {
+    use std::os::fd::AsRawFd;
+    use wc_handle::ivshmem::{ENCODED_LEN, Header};
     let file_len = f.metadata()?.len();
+    if file_len < ENCODED_LEN as u64 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "BAR is shorter than its header"));
+    }
+    // SAFETY: the kernel checks this borrowed fd and creates a read-only
+    // mapping. Only its ENCODED_LEN bytes are read, and it is unmapped below.
+    let addr = unsafe { libc::mmap(std::ptr::null_mut(), ENCODED_LEN,
+        libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+    if addr == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
     let mut b = [0u8; ENCODED_LEN];
-    // Positional: a broker region's fds share one file offset (§111.10).
-    std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, 0)?;
-    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", path.display()));
+    for (i, byte) in b.iter_mut().enumerate() {
+        if i == wc_handle::ivshmem::MAGIC.len() {
+            // Pair with the publisher's release fence before its magic.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        }
+        // SAFETY: the checked mapping covers every indexed byte. Volatile
+        // reads snapshot externally published metadata without Rust references.
+        *byte = unsafe { std::ptr::read_volatile((addr as *const u8).add(i)) };
+    }
+    // SAFETY: this is the exact mapping established above; b owns the snapshot.
+    unsafe { libc::munmap(addr, ENCODED_LEN); }
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
     let h = Header::decode(&b).map_err(|e| bad(e.to_string()))?;
     if h.run_id != expected_run {
         return Err(bad(format!(
@@ -397,6 +423,9 @@ fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle:
              not published yet",
             h.run_id, h.generation
         )));
+    }
+    if h.region_len != file_len {
+        return Err(bad(format!("the file is {file_len} bytes and the header describes a {}-byte region", h.region_len)));
     }
     Ok((h, file_len))
 }
@@ -725,6 +754,27 @@ mod tests {
         let e = Plan::read_all(&p).unwrap_err();
         assert!(e.to_string().contains("region 5"), "{e}");
         assert!(e.to_string().contains("cover 4096 bytes of a 8192-byte arena"), "{e}");
+    }
+
+    #[test]
+    fn mapped_bar_header_uses_original_readonly_fd_after_path_replacement() {
+        use wc_handle::ivshmem::{HEADER_BYTES, Header};
+        let dir = tempdir::Guard::new();
+        let path = dir.path().join("bar");
+        let len = HEADER_BYTES + 65536;
+        let header = Header { run_id: 17, generation: 2, region_len: len,
+            arena_id: 0, outbound: (0, 0), rings: (0, 0) };
+        let mut bytes = vec![0; len as usize];
+        bytes[..header.encode().len()].copy_from_slice(&header.encode());
+        std::fs::write(&path, &bytes).unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, dir.path().join("held")).unwrap();
+        let replacement = Header { run_id: 18, ..header };
+        bytes[..replacement.encode().len()].copy_from_slice(&replacement.encode());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_ivshmem_header_fd(&original, 17).unwrap().0.run_id, 17);
+        assert!(read_ivshmem_header_fd(&original, 18).is_err());
+        assert_eq!(ivshmem_header(&path, 18).unwrap().run_id, 18);
     }
 
     /// IVSHMEM ARENA. The host's half end to end on one machine: a file laid
