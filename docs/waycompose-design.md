@@ -36961,8 +36961,9 @@ the Looking Glass B7 ivshmem driver leaves its devices
 process mapped the GPU device directly before the broker (`direct-opened`,
 `bw ... 4.97 GiB/s` as u1). After it, the same open is access denied. A port
 another process holds cannot be opened to change its descriptor (vioser is
-exclusive); it keeps its live descriptor until it is free, and the property
-takes over at its next start.
+exclusive). Startup refuses if the port's live or PnP protection cannot be
+verified. Security reads retry access-denied opens for up to two seconds to
+allow asynchronous driver closes to finish; unreadable protection still fails.
 
 **Regions.** Unnamed pagefile sections (`CreateFileMappingW` with no name,
 `SEC_COMMIT`), so no other process can open one by name; `large` adds
@@ -37062,10 +37063,11 @@ bytes. Reparse directories and key paths are refused. The service executable
 and recovery files also have privileged ownership. This matters because an
 owner can change a DACL even without a grant in that DACL.
 Installation does not trust SCM's transient Running state alone. The ready
-command independently verifies raw ACLs, opens an overlapped pipe, checks its
-kernel server PID against the current running SCM service and its token SID
-against SYSTEM, then checks hello/stats. It pins the process and rechecks SCM
-before success. Each exchange has a one-second I/O deadline; cancellation is
+command opens an overlapped pipe, checks its kernel server PID against the
+current running SCM service and its token SID against SYSTEM, then checks
+hello/stats. While the verified process remains pinned, it independently
+checks both live and PnP protection for present BARs and doorbell ports, then
+rechecks process liveness and SCM before success. Each exchange has a one-second I/O deadline; cancellation is
 drained before its buffers disappear. Generic private/user broker clients
 keep their existing connection behavior.
 
@@ -37082,8 +37084,8 @@ includes the mandatory label. The five-column `devices.txt` and durable count
 checkpoint are flushed before mutation. Missing, truncated, unreadable or
 invalid installed history requires trusted recovery. A fresh install records
 an explicit empty baseline; restart cannot invent lost history. Independent
-startup verification requires both live and PnP raw descriptors to remain
-protected, even when securing failed or rollback history was lost. Unknown or
+startup verification requires both live and PnP descriptors on the BARs and
+doorbell ports to remain protected, even when securing failed or rollback history was lost. Unknown or
 permissive protection fails before the public pipe or signer is created.
 Missing optional devices are skipped. Protected devices with missing history
 can still recover retained holder sections; their uninstall stays refused.
