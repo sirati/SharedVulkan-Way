@@ -1,0 +1,62 @@
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -972,6 +972,34 @@
+  *
+  * Both modes check exit_group_requested so the main thread also reacts
+  * to exit_group called by a worker. */
++/* Cancellation can interrupt live EL0 code rather than a shim HVC. Signal
++ * frames still use the shim's ELR/SPSR convention. Do not inject while an EL1
++ * shim save/restore is incomplete; retain the pending signal for a safe HVC. */
++static int deliver_canceled_signal(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
++    uint64_t pc, pstate;
++    if (hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc) != HV_SUCCESS ||
++        hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &pstate) != HV_SUCCESS)
++        goto failed;
++    if ((pstate & 0x1f) != 0)
++        return 0;
++    if (hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc) != HV_SUCCESS ||
++        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, pstate) != HV_SUCCESS)
++        goto failed;
++    int ret = signal_deliver(vcpu, g, exit_code);
++    if (ret <= 0) return ret;
++    if (hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &pc) != HV_SUCCESS ||
++        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &pstate) != HV_SUCCESS ||
++        hv_vcpu_set_reg(vcpu, HV_REG_PC, pc) != HV_SUCCESS ||
++        hv_vcpu_set_reg(vcpu, HV_REG_CPSR, pstate) != HV_SUCCESS)
++        goto failed;
++    return ret;
++failed:
++    crash_report(vcpu, g, CRASH_UNEXPECTED_EC,
++                 "failed to synchronize canceled signal context");
++    *exit_code = 128;
++    return -1;
++}
++
+ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+                   guest_t *g, int verbose, int timeout_sec, int is_main) {
+     int exit_code = 0;
+@@ -1884,12 +1912,9 @@
+                     fprintf(stderr, "%s: ptrace interrupt → ptrace-stop\n",
+                             prefix);
+                 int cont_sig = thread_ptrace_stop(current_thread, 5);
+-                if (cont_sig > 0) {
+-                    signal_queue(cont_sig);
+-                    int sr = signal_deliver(vcpu, g, &exit_code);
+-                    if (sr < 0) running = 0;
+-                }
+-                continue;
++                /* Use the same guarded live-context delivery below for an
++                 * injected ptrace signal and ordinary pending signals. */
++                if (cont_sig > 0) signal_queue(cont_sig);
+             }
+
+             /* Check guest ITIMER_REAL (may have fired during tight loop) */
+@@ -1899,7 +1924,7 @@
+              * resume the vCPU. This enables alarm()/SIGALRM delivery
+              * and tgkill-based signals in compute-bound loops. */
+             if (signal_pending()) {
+-                int sig_ret = signal_deliver(vcpu, g, &exit_code);
++                int sig_ret = deliver_canceled_signal(vcpu, g, &exit_code);
+                 if (sig_ret < 0)
+                     running = 0;
+                 /* sig_ret >= 0: signal delivered or nothing pending,
