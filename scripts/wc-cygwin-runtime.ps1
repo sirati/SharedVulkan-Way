@@ -103,7 +103,7 @@ if ($RunRingClient -or $RunRenderedClient -or $RunLeaseProbe) {
       $env:WC_CYGWIN_RUN = $BarRun
       $legacy = Run-Probe 'weston-info' 20 $LegacyBin 'legacy-format'
       $legacyText = Get-Content -Raw -LiteralPath (Join-Path $evidence 'legacy-format.stderr.txt')
-      if ($legacy -eq 0 -or $legacyText -notmatch 'header version 3') { throw 'retained legacy binary did not refuse new allocation layout' }
+      if ($legacy -eq 0 -or $legacyText -notmatch 'header version 4') { throw 'retained legacy binary did not refuse new allocation layout' }
     }
     $env:WC_CYGWIN_RUN = [string]($parsedRun + [uint64]1)
     $rejected = Run-Probe 'weston-info' 20

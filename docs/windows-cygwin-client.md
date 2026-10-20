@@ -249,3 +249,24 @@ retirement. Crashed endpoint holds remain retained. Four focused Rust tests
 cover real Handle descriptor transfer, pending references, alias short reads,
 backpressure, EOF, EPIPE and normal allocation recycling. This API stage has
 no real Windows clipboard acceptance yet.
+
+The compositor's `--allow-data-control` flag enables Smithay's existing
+wlr-data-control global. It defaults to off. Visibility requires the actual
+Unix socket peer's effective user and an established `InBandLease` descriptor
+connection. Windows clients also pass the broker's native process and user
+checks before they can obtain the original BAR connection. This capability is
+intended for explicit clipboard tooling without simulated input or focus.
+
+The cooperative BAR stream descriptor is format 4, control wire 3. Payload
+stays in a bounded 16 KiB ByteChannel in the original BAR. Local Cygwin pipes
+supply ordinary fd readiness; they do not carry cross-VM payload. EOF follows
+the actual last writer and drained ring; EPIPE follows the actual last reader.
+An interrupted process retains cooperative holds. These counters do not
+authorize privileged allocation recovery.
+
+`scripts/wc-cygwin-clipboard-runtime.ps1` exercises unchanged wl-clipboard 2.3.0
+with explicit `wl-copy --foreground --paste-once` and `wl-paste --no-newline`.
+The bundle includes the genuine Cygwin `cat` that wl-paste execs. This narrow
+inherited local-pipe exec path does not promise general fork support for BAR
+mappings or background clipboard daemon modes. Building the tools alone makes
+no real Windows clipboard runtime claim.
