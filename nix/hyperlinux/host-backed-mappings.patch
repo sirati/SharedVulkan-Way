@@ -2204,3 +2204,154 @@ index 10753ca..6854b0e 100644
 @@ -315 +325 @@
 -    if (guest_ptr(g, VVAR_BASE)) {
 +    if (guest_trusted_ptr(g, VVAR_BASE, VVAR_SIZE)) {
+--- a/src/elf.c
++++ b/src/elf.c
+@@ -18,0 +19,34 @@
++/* Pure guest backing-layout policy, implemented by guest.c. Keep this ELF
++ * parser independent of Darwin's guest_t/Hypervisor headers. */
++extern int guest_control_layout_overlap(uint64_t guest_size, uint64_t off,
++                                         uint64_t len);
++
++static int elf_write_span(uint64_t guest_size, uint64_t gpa, uint64_t len) {
++    return len <= guest_size && gpa <= guest_size - len &&
++           !guest_control_layout_overlap(guest_size, gpa, len);
++}
++static int elf_zero_span(uint64_t guest_size, uint64_t gpa, uint64_t memsz,
++                         uint64_t *zero_len) {
++    if (memsz > guest_size || gpa > guest_size - memsz ||
++        memsz > UINT64_MAX - 4095) return -1;
++    *zero_len = (memsz + 4095) & ~4095ULL;
++    if (*zero_len > guest_size - gpa) *zero_len = guest_size - gpa;
++    return elf_write_span(guest_size, gpa, *zero_len) ? 0 : -1;
++}
++int elf_validate_layout(const elf_info_t *info, uint64_t guest_size,
++                         uint64_t load_base) {
++    if (!info || info->num_segments <= 0 || info->num_segments > ELF_MAX_SEGMENTS ||
++        !info->phnum || info->phentsize < sizeof(elf64_phdr_t)) return -1;
++    uint64_t ph_size = (uint64_t)info->phnum * info->phentsize;
++    /* Modular relocation is intentional for Rosetta's high-VA image. Only
++     * the final backing offsets and complete write spans are authoritative. */
++    if (!elf_write_span(guest_size, info->phdr_gpa + load_base, ph_size)) return -1;
++    for (int i = 0; i < info->num_segments; ++i) {
++        uint64_t zero_len;
++        if (info->segments[i].filesz > info->segments[i].memsz ||
++            elf_zero_span(guest_size, info->segments[i].gpa + load_base,
++                          info->segments[i].memsz, &zero_len)) return -1;
++    }
++    return 0;
++}
++
+@@ -113 +147,3 @@
+-        elf64_phdr_t *ph = (elf64_phdr_t *)(ph_buf + (size_t)i * ehdr.e_phentsize);
++        elf64_phdr_t ph_value;
++        memcpy(&ph_value, ph_buf + (size_t)i * ehdr.e_phentsize, sizeof(ph_value));
++        elf64_phdr_t *ph = &ph_value;
+@@ -187,0 +224 @@
++    if (elf_validate_layout(info, guest_size, load_base)) return -1;
+@@ -196,0 +234,8 @@
++        fclose(f);
++        return -1;
++    }
++
++    if (memcmp(ehdr.e_ident, "\177ELF", 4) ||
++        ehdr.e_ident[EI_CLASS] != ELFCLASS64 || ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
++        ehdr.e_type != info->e_type || ehdr.e_machine != info->e_machine ||
++        ehdr.e_phnum != info->phnum || ehdr.e_phentsize != info->phentsize) {
+@@ -214,0 +260,19 @@
++
++    int checked_segments = 0;
++    for (uint16_t i = 0; i < ehdr.e_phnum; ++i) {
++        elf64_phdr_t ph;
++        memcpy(&ph, ph_buf + (size_t)i * ehdr.e_phentsize, sizeof(ph));
++        if (ph.p_type != PT_LOAD) continue;
++        if (checked_segments >= info->num_segments) goto invalid_snapshot;
++        int j = checked_segments++;
++        uint64_t zero_len;
++        if (ph.p_vaddr != info->segments[j].gpa ||
++            ph.p_offset != info->segments[j].offset ||
++            ph.p_filesz != info->segments[j].filesz ||
++            ph.p_memsz != info->segments[j].memsz ||
++            (int)ph.p_flags != info->segments[j].flags ||
++            ph.p_filesz > ph.p_memsz ||
++            elf_zero_span(guest_size, ph.p_vaddr + load_base, ph.p_memsz,
++                          &zero_len)) goto invalid_snapshot;
++    }
++    if (checked_segments != info->num_segments) goto invalid_snapshot;
+@@ -239 +303,3 @@
+-        elf64_phdr_t *ph = (elf64_phdr_t *)(ph_buf + (size_t)i * ehdr.e_phentsize);
++        elf64_phdr_t ph_value;
++        memcpy(&ph_value, ph_buf + (size_t)i * ehdr.e_phentsize, sizeof(ph_value));
++        elf64_phdr_t *ph = &ph_value;
+@@ -309,0 +376,4 @@
++invalid_snapshot:
++    free(ph_buf);
++    fclose(f);
++    return -1;
+--- a/src/elf.h
++++ b/src/elf.h
+@@ -126,0 +127,4 @@
++/* Validate every loader write, including PHDR and rounded zero tails, against
++ * guest bounds and protected control storage. Safe before exec's PNR. */
++int elf_validate_layout(const elf_info_t *, uint64_t guest_size, uint64_t load_base);
++
+--- a/src/syscall_exec.c
++++ b/src/syscall_exec.c
+@@ -299,0 +300,7 @@
++    if (elf_validate_layout(&elf_info, g->guest_size, elf_load_base) ||
++        (!need_rosetta && elf_info.interp_path[0] &&
++         elf_validate_layout(&interp_info, g->guest_size, g->interp_base))) {
++        free(argv_buf); free(envp_buf);
++        return -LINUX_ENOEXEC;
++    }
++
+--- a/src/syscall_shm.c
++++ b/src/syscall_shm.c
+@@ -178,2 +178,2 @@
+-    if (ipa + ipa_span > g->guest_size)
+-        return;
++    if (ipa > g->guest_size || ipa_span > g->guest_size - ipa ||
++        guest_control_gpa_overlap(g, ipa, ipa_span)) return;
+@@ -399,0 +400,3 @@
++    /* Reject privileged VA replacement before shmat/Stage-2 mutation. */
++    if (shmaddr && guest_control_va_overlap(g, shmaddr, s->ipa_span))
++        SHMAT_FAIL(-LINUX_EINVAL);
+@@ -406 +409 @@
+-        return -LINUX_EINVAL;
++        SHMAT_FAIL(-LINUX_EINVAL);
+@@ -458,0 +462,6 @@
++            if (zone_lo > zone_hi || ipa_span > zone_hi - zone_lo) {
++                shmdt(host);
++                s->host_addr = NULL;
++                SHMAT_FAIL(-LINUX_ENOMEM);
++            }
++
+@@ -465 +474 @@
+-            for (uint64_t cand = zone_lo; cand + ipa_span <= zone_hi;
++            for (uint64_t cand = zone_lo; cand <= zone_hi - ipa_span;
+@@ -467 +476,4 @@
+-                if (!ipa_range_busy(cand, ipa_span)) { ipa = cand; break; }
++                if (!ipa_range_busy(cand, ipa_span) &&
++                    !guest_control_gpa_overlap(g, cand, ipa_span)) {
++                    ipa = cand; break;
++                }
+@@ -479,0 +492,7 @@
++        }
++
++        if (ipa > g->guest_size || ipa_span > g->guest_size - ipa ||
++            map_size > ipa_span || guest_control_gpa_overlap(g, ipa, ipa_span)) {
++            shmdt(host);
++            s->host_addr = NULL;
++            SHMAT_FAIL(-LINUX_EINVAL);
+@@ -851,0 +871,12 @@
++    /* Validate the entire inherited image before changing any Stage-2 entry. */
++    for (int i = 0; i < n; i++) {
++        if (in[i].nattach <= 0 || in[i].nattach_va == 0) continue;
++        if (!in[i].ipa_span || in[i].ipa > g->guest_size ||
++            in[i].ipa_span > g->guest_size - in[i].ipa ||
++            in[i].map_size > in[i].ipa_span ||
++            guest_control_gpa_overlap(g, in[i].ipa, in[i].ipa_span)) return -1;
++        if (in[i].nattach_va < 0 || in[i].nattach_va > HL_SHM_MAX_ATTACH) return -1;
++        for (int k = 0; k < in[i].nattach_va; ++k)
++            if (guest_control_va_overlap(g, in[i].attach_va[k], in[i].ipa_span))
++                return -1;
++    }
