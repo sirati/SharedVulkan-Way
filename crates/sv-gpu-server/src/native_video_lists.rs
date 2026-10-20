@@ -243,6 +243,12 @@ mod tests {
     }
     fn parsed(kind: u32, active: [u32; 2], mods: [Vec<Modification>; 2]) -> Parsed {
         Parsed {
+            sequence: super::super::h264::Sequence {
+                frame_bits: 4,
+                poc: 2,
+                max_refs: 5,
+                ..Default::default()
+            },
             idr: false,
             reference: true,
             frame_num: 1,

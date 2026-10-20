@@ -145,15 +145,21 @@ pub(super) fn summary(
     }
     result.ok_or_else(|| "empty slice list".into())
 }
-struct Sps {
-    id: u32,
-    frame_bits: u32,
-    poc: u32,
-    poc_bits: u32,
-    delta_zero: bool,
-    max_refs: u32,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Sequence {
+    pub id: u32,
+    pub frame_bits: u32,
+    pub poc: u32,
+    pub poc_bits: u32,
+    pub delta_zero: bool,
+    pub max_refs: u32,
+    pub gaps_allowed: bool,
+    pub offset_non_ref: i32,
+    pub offset_top_bottom: i32,
+    pub cycle_offsets: Vec<i32>,
+    pub coded_extent: [u32; 2],
 }
-fn sps(nal: &[u8]) -> Result<Sps, String> {
+fn sps(nal: &[u8]) -> Result<Sequence, String> {
     if nal.first().map(|b| b & 31) != Some(7) {
         return Err("expected SPS".into());
     }
@@ -195,6 +201,9 @@ fn sps(nal: &[u8]) -> Result<Sps, String> {
     let poc = b.ue()?;
     let mut poc_bits = 0;
     let mut delta_zero = false;
+    let mut offset_non_ref = 0;
+    let mut offset_top_bottom = 0;
+    let mut cycle_offsets = Vec::new();
     match poc {
         0 => {
             poc_bits = b
@@ -205,14 +214,14 @@ fn sps(nal: &[u8]) -> Result<Sps, String> {
         }
         1 => {
             delta_zero = b.read(1)? != 0;
-            b.se()?;
-            b.se()?;
+            offset_non_ref = b.se()?;
+            offset_top_bottom = b.se()?;
             let count = b.ue()?;
             if count > 255 {
                 return Err("invalid POC cycle".into());
             }
             for _ in 0..count {
-                b.se()?;
+                cycle_offsets.push(b.se()?);
             }
         }
         2 => {}
@@ -222,19 +231,34 @@ fn sps(nal: &[u8]) -> Result<Sps, String> {
     if max_refs > 16 {
         return Err("too many SPS reference frames".into());
     }
-    b.read(1)?;
-    b.ue()?;
-    b.ue()?;
+    let gaps_allowed = b.read(1)? != 0;
+    let width = b
+        .ue()?
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(16))
+        .filter(|n| *n <= 8192)
+        .ok_or("invalid SPS coded width")?;
+    let height = b
+        .ue()?
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(16))
+        .filter(|n| *n <= 8192)
+        .ok_or("invalid SPS coded height")?;
     if b.read(1)? != 1 {
         return Err("requires progressive SPS".into());
     }
-    Ok(Sps {
+    Ok(Sequence {
         id,
         frame_bits,
         poc,
         poc_bits,
         delta_zero,
         max_refs,
+        gaps_allowed,
+        offset_non_ref,
+        offset_top_bottom,
+        cycle_offsets,
+        coded_extent: [width, height],
     })
 }
 struct Pps {
@@ -245,7 +269,7 @@ struct Pps {
     weighted_pred: bool,
     weighted_bipred: u32,
 }
-fn pps(nal: &[u8], sps: &Sps) -> Result<Pps, String> {
+fn pps(nal: &[u8], sps: &Sequence) -> Result<Pps, String> {
     if nal.first().map(|b| b & 31) != Some(8) {
         return Err("expected PPS".into());
     }
@@ -321,6 +345,7 @@ pub(super) struct Slice {
 }
 #[derive(Clone, Debug)]
 pub(super) struct Parsed {
+    pub sequence: Sequence,
     pub idr: bool,
     pub reference: bool,
     pub frame_num: u32,
@@ -516,6 +541,7 @@ pub(super) fn parse(
             old.slices.push(slice);
         } else {
             parsed = Some(Parsed {
+                sequence: s.clone(),
                 idr,
                 reference,
                 frame_num,

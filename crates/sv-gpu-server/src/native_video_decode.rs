@@ -13,6 +13,8 @@ mod dpb;
 mod h264;
 #[path = "native_video_lists.rs"]
 mod lists;
+#[path = "native_video_poc.rs"]
+mod poc;
 
 pub(crate) struct Resources {
     pub source: Arc<dyn CompressedBytes>,
