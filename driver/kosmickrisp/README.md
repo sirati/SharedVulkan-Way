@@ -63,3 +63,7 @@ unchanged SRGB shader-write and input-attachment refusals. That allocation
 fixture does not establish single-plane rendering or sampling completion.
 VideoToolbox production, renderer retirement and guest/application completion
 remain separate integration work.
+The native fixture also confirms that texture handle properties and image
+requirements exclude every host-visible type and that selecting one for a
+texture import returns `VK_ERROR_INVALID_EXTERNAL_HANDLE`. Ordinary and
+MTLHEAP imports using the original host-visible type still map successfully.
