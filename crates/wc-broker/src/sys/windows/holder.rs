@@ -120,6 +120,13 @@ fn conversation(p: &ServerPipe, kept: &mut BTreeMap<u64, Kept>) -> io::Result<bo
                     continue;
                 }
                 write(p, "ok\n")?;
+                // DisconnectNamedPipe discards unread outgoing bytes. Wait
+                // until the client consumed the positive empty-holder reply
+                // before dropping this instance. This never releases a region.
+                // SAFETY: the connected holder-owned pipe is live here.
+                if unsafe { windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(p.handle) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
                 return Ok(true);
             }
             _ => out = "err unknown\n".into(),
