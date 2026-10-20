@@ -37062,6 +37062,77 @@ them in the host configuration's `wctestInstalls`, which adds
   the broker yet. That is the guest-RAM continuation's `find("gpu.<k>")`.
 
 ## 112. Stock Firefox on the dma-buf path
+2026-10-20, branch `stock-firefox` (with `kwin-gpu-zero-cost` merged into
+master first as its own merge, and `sf-relay` merged into this branch). The
+user: "it needs to remove the Firefox patch. That's not okay and it should use
+the DMA buffer we implemented." And then, for every application: "the test for
+a correct implementation is that we can run applications natively without
+having to do any weird shit, like having to switch off a sandbox." So the
+applications are stock, with their default settings and their own sandboxes;
+what we ship below them (sv-icd, sv-drm, our Mesa) may be patched.
+
+### 112.1 What changed, in one paragraph
+
+Firefox is the nixpkgs package, unpatched, with no preference set for its
+graphics or its decoder, and its RDD sandbox on. It runs inside `sv-drm ns`,
+where the userspace render node of §104 is a PCI device with the guest GPU's
+ids (`--pci`), so Firefox's own probe finds a hardware EGL device and chooses
+hardware WebRender by itself. Its frames reach the compositor without a copy:
+sv-icd's `VK_KHR_wayland_surface` now presents swapchain images that are
+shared sections (112.3). Video decode is VA-API, Firefox's default on Linux,
+through Zink's VA-API driver in our Mesa (112.4) over the forwarded Vulkan
+Video, and the decoded frames are dma-bufs naming sections (112.5). The decoder
+runs in Firefox's sandbox and reaches its GPU session through the render node
+(112.x). The readback patch, its package script, the `.wc-vulkan-readback`
+marker, `wc-session`'s decode branch and `MOZ_DISABLE_RDD_SANDBOX` are gone
+(112.8).
+
+### 112.2 Why the readback patch is not needed any more
+
+§86 and docs/video-decode.md §7.7 patched Firefox for three reasons, and each
+was a consequence of the host having no DRM device:
+
+1. Firefox's Vulkan decoder ends in `vkGetMemoryFdKHR(DMA_BUF)`, which a
+   forwarded device could not answer. §104 answers it: the fd is a token
+   naming a section.
+2. glxtest said the GL was software (Mesa's EGL on a host without a DRM node
+   reports `EGL_MESA_device_software`), so Firefox never tried hardware
+   decode. With the node, the EGL device is a DRM device.
+3. `gfxPlatformGtk` drops hardware decode when the compositor offers no
+   dma-buf. wc-proxy offers `zwp_linux_dmabuf_v1` on the node since §104.
+
+And the decode path is no longer Vulkan Video in Firefox at all. Firefox 157
+release turns its Vulkan decoder off twice (`media.hardware-video-decoding-
+vulkan.enabled` is `@IS_NIGHTLY_BUILD@`, and `GfxInfo.cpp` blocklists
+`FEATURE_HARDWARE_VIDEO_DECODING_VULKAN` on every device), so with default
+settings Firefox decodes through VA-API, and the VA-API driver is ours.
+
+### 112.3 Swapchains whose images are the frames
+
+`crates/sv-icd/src/wsi.rs` (`zero_copy`), `present.rs`
+(`wayland::dmabuf`). With `SV_DRM_NODE` set, a Wayland surface, a
+`B8G8R8A8` format and a GPU side that keeps fence records (§104.11), each
+swapchain image is a LINEAR image on an exportable allocation, which the ICD
+makes a section (§104.4). At creation every image is handed to the compositor
+once, as a `zwp_linux_dmabuf_v1` buffer (version 3, `create_immed`, ARGB8888
+or XRGB8888 by the swapchain's alpha) whose fd is the image's token. A present
+is then one empty submit that waits for the application's semaphores and
+signals one of ours, a mark numbering that signal for the compositor (the
+token's sync page and `svFenceMark`, exactly as Zink's own export of a dma-buf
+frame, §104.11), and `attach`, `damage_buffer`, `commit` on the application's
+surface. No `vkCmdCopyImageToBuffer`, no memcpy into `wl_shm`, no copy in
+wc-proxy: the proxy sends the section's name and `wc_gpu_fence_v1.wait`, and
+the compositor draws the section (§104.12). `vkAcquireNextImageKHR` hands out
+an image the compositor has released (`wl_buffer.release`, on a queue of our
+own); with three images it does not wait in practice. Anything that does not
+fit (no `zwp_linux_dmabuf_v1`, a refused buffer, an `R8G8B8A8` swapchain, no
+fence record) falls back to the copy path, said once; `SV_WSI_ZERO_COPY=0`
+forces it.
+
+This reverses the choice `wsi.rs`'s header defended (render targets in
+host-visible LINEAR memory). The argument there was about a discrete GPU; the
+guest's GPU is integrated, its "device-local" memory is the same RAM, and §104
+already renders KWin's frames this way.
 
 ### 112.x The render node introduces a sandboxed client to its GPU services
 
@@ -37195,3 +37266,26 @@ local pool has one region; the ICD's path is the same call with another `k`);
 `ivshmem-serve`'s built-in `--bell` hub and `sv-hostd serve`/`qemu-serve`,
 which do not register; an `ANY-UID` registration accepted (the tests run as a
 user; the rule is a pure function, tested).
+
+
+### 112.9 Status at handover (2026-10-20 11:00)
+
+Done and checked locally (evidence `/mnt/datasets/builds/evidence/stock-firefox/local/`):
+zero-copy Wayland swapchains (5372 of Firefox's commits as sections on
+lavapipe, pixels identical to the copy path), multi-plane LINEAR dma-bufs and
+per-plane imports (sv-dmabuf-e2e's NV12 step), `sv-drm ns --pci/--hide`, the
+render-node relay (112.x), our Mesa on main 42c325ea with Zink's VA-API driver
+(vainfo and a VA decode context through sv-icd; the export asks for exactly
+our LINEAR dma-buf), nested-kwin-gpu and nested-waycompose-gpu (clientGpu)
+passing with this branch's binaries.
+
+**Not yet shown on the guest.** One before/after run (test installations,
+default prefs, default sandbox; evidence `…/stock-firefox/guest/`): both
+held 60 fps scroll (mean 16.7/16.8 ms, p99 18 ms) and played 1200 of 1200
+1080p frames with none dropped. But the stock Firefox ("after") never loaded
+`libsv_icd.so` or Zink: the proxy saw 0 dma-buf buffers, and the host's
+Firefox CPU was 52 % (scroll) and 48 % (video) of a core against 19 % and
+28 % for the readback build, i.e. software WebRender and software decode.
+Its environment had `SV_DRM_NODE`, `VK_DRIVER_FILES`, the Mesa paths and ran
+inside `sv-drm ns --pci 8086:a7a8`. Why Firefox chose software is the next
+step (about:support's graphics failures, glxtest's output, `MOZ_LOG`).
