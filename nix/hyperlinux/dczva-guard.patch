@@ -20,12 +20,13 @@
  5:  hvc #12
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
-@@ -833,6 +833,8 @@
+@@ -833,7 +833,9 @@
                    guest_t *g, int verbose, int timeout_sec, int is_main) {
      int exit_code = 0;
      int running = 1;
 +    int dc_fault_kind = 0;
 +    uint64_t dc_fault_addr = 0;
+     int deferred_signal_irq = 0;
      int iter = 0;
      /* The watchdog is now OPT-IN and covers the main vCPU only: it fires when
       * the guest runs `timeout_sec` seconds without a VM exit (a coarse hang
