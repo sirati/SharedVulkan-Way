@@ -37629,8 +37629,25 @@ request, hints eventually return `WouldBlock`; the application thread still
 runs. Shutdown retains any allocation and port reference whose request remains
 pending rather than waiting indefinitely for a broken driver.
 
+Both writer implementations reserve from one process-wide budget before
+allocating a record, buffer or event. It permits at most 1024 records/slots and
+32 MiB of write buffers across live and deliberately retained allocations.
+AsyncWriter reserves its slots up front, leaving its ordinary write path free
+of budget operations. A retained allocation keeps its reservation forever, so
+constructing another Pipe or AsyncWriter cannot reset the safety cap. Full
+budgets refuse new allocations; existing owners can reclaim capacity after
+completion or normal destruction. Abandoned allocations have no background
+reaper and remain charged until process exit. Stuck handles are never closed to
+recover capacity. Each retained original handle has at least one charged record.
+
+The broker currently refuses a second device grant to the same process, opens
+ports exclusively and transfers handles with DUPLICATE_CLOSE_SOURCE. The budget
+does not rely on those restrictions: repeated wrappers or async writers still
+share the same limits.
+
 Tests cover a failed queued hint followed by a delivered hint, bounded repeated
-synchronous cancellation failures and handle retention during shutdown, and
-simulated Windows cancellations that never complete followed by a late completion. The
+synchronous cancellation failures and handle retention during shutdown,
+repeated Pipe and AsyncWriter lifetimes sharing record and byte budgets,
+constructor rollback, and simulated Windows cancellations that never complete followed by a late completion. The
 simulation never submits the fabricated requests to a driver. Test evidence
 and guest measurements belong outside the repository.
