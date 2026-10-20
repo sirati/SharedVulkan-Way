@@ -1,5 +1,7 @@
 //! Exact owned Forward descriptors for the original advanced PCM matrix.
 //! Diagnostic only. This module never enables product Runtime gates.
+#[path = "native_video_high_fixture_stream.rs"]
+mod high_stream;
 #[path = "native_video_fixture_stream.rs"]
 mod stream;
 use ash::vk;
@@ -244,10 +246,29 @@ mod hardware {
     const POOL: u64 = 22;
     use std::sync::atomic::{AtomicBool, Ordering};
     type Rpc = Forward<GpuServer>;
+    #[derive(Clone, Copy, Debug)]
+    enum CaseKind {
+        Pcm(PcmCase),
+        High(high_stream::HighCase),
+    }
+    impl CaseKind {
+        fn parameters(self) -> Result<p::VkVideoDecodeH264SessionParametersAddInfoKHR, String> {
+            match self {
+                Self::Pcm(case) => case.parameter_sets(),
+                Self::High(case) => case.parameter_sets(),
+            }
+        }
+        fn stream(self) -> Result<stream::Stream, String> {
+            match self {
+                Self::Pcm(case) => stream::pcm_original(case),
+                Self::High(case) => high_stream::high_original(case),
+            }
+        }
+    }
     struct Case {
         stream: stream::Stream,
         base: usize,
-        kind: PcmCase,
+        kind: CaseKind,
     }
     struct Graph {
         shared: Arc<Shared>,
@@ -256,7 +277,7 @@ mod hardware {
         pool: vk::CommandPool,
         fence: vk::Fence,
     }
-    fn allocate(rpc: &mut Rpc, shared: &Shared, bytes: usize) -> Result<(), String> {
+    fn allocate(rpc: &mut Rpc, shared: &Shared, bytes: usize, frames: u32) -> Result<(), String> {
         checked(
             wire(rpc.create_buffer(p::VkCreateBufferArgs {
                 device: p::VkDevice(DEVICE),
@@ -313,10 +334,12 @@ mod hardware {
                     p_allocate_info: Some(Box::new(p::VkCommandBufferAllocateInfo {
                         command_pool: p::VkCommandPool(POOL),
                         level: p::VkCommandBufferLevel(vk::CommandBufferLevel::PRIMARY.as_raw()),
-                        command_buffer_count: 37,
+                        command_buffer_count: frames,
                         ..Default::default()
                     })),
-                    p_command_buffers: (0..37).map(|i| p::VkCommandBuffer(1000 + i)).collect(),
+                    p_command_buffers: (0..u64::from(frames))
+                        .map(|i| p::VkCommandBuffer(1000 + i))
+                        .collect(),
                 }),
             )?
             .result,
@@ -504,6 +527,7 @@ mod hardware {
         images: Vec<Arc<Image>>,
         sync2: bool,
         cancelled: Arc<AtomicBool>,
+        expected_frames: usize,
     ) -> Result<(), String> {
         let check = || {
             if cancelled.load(Ordering::SeqCst) {
@@ -523,7 +547,7 @@ mod hardware {
                 shared.driver.queue_family,
                 session,
                 parameters,
-                case.kind.parameter_sets()?,
+                case.kind.parameters()?,
             )?;
             let assignment = slots(&case.stream.frames)?;
             for (index, frame) in case.stream.frames.iter().enumerate() {
@@ -612,7 +636,7 @@ mod hardware {
         if let Some(error) = shared.native_video.lock().unwrap().failure() {
             return Err(format!("advanced worker failure {error:?}"));
         }
-        if ordinal != 37 {
+        if ordinal != expected_frames {
             return Err("advanced frame count differs".into());
         }
         Ok(())
@@ -620,17 +644,30 @@ mod hardware {
     pub(crate) fn run(sync2: bool) -> Result<(), String> {
         let mut cases = Vec::new();
         let mut payload = Vec::new();
-        for kind in (0..3)
-            .flat_map(|ty| {
-                [
-                    PcmCase::Marking(ty),
-                    PcmCase::Gap(ty),
-                    PcmCase::Bootstrap(ty),
-                ]
-            })
-            .chain([PcmCase::BSkip])
-        {
-            let stream = stream::pcm_original(kind)?;
+        let high_scope = std::env::args().any(|a| a == "--high-scope");
+        let kinds: Vec<CaseKind> = if high_scope {
+            [
+                high_stream::HighCase::CavlcPcm,
+                high_stream::HighCase::Cabac,
+            ]
+            .into_iter()
+            .map(CaseKind::High)
+            .collect()
+        } else {
+            (0..3)
+                .flat_map(|ty| {
+                    [
+                        PcmCase::Marking(ty),
+                        PcmCase::Gap(ty),
+                        PcmCase::Bootstrap(ty),
+                    ]
+                })
+                .chain([PcmCase::BSkip])
+                .map(CaseKind::Pcm)
+                .collect()
+        };
+        for kind in kinds {
+            let stream = kind.stream()?;
             payload.resize(payload.len().next_multiple_of(256), 0);
             let base = payload.len();
             payload.extend_from_slice(stream.bytes);
@@ -646,7 +683,9 @@ mod hardware {
             joined_nv12_import: true,
             native_queue_bound_decode: true,
         });
-        state.runtime.lock().unwrap().enable_fixture_staging();
+        if !high_scope {
+            state.runtime.lock().unwrap().enable_fixture_staging();
+        }
         let mut objects = Objects::new();
         objects.set_arena(arena.memory, arena.len);
         objects.insert(DEVICE, HandleType::VkDevice, driver.device.handle());
@@ -663,7 +702,13 @@ mod hardware {
             poisoned: Default::default(),
         });
         let mut rpc = Forward::new(GpuServer::new(Arc::clone(&shared)));
-        allocate(&mut rpc, &shared, payload.len())?;
+        let frame_count: usize = cases.iter().map(|case| case.stream.frames.len()).sum();
+        allocate(
+            &mut rpc,
+            &shared,
+            payload.len(),
+            u32::try_from(frame_count).map_err(|_| "fixture frame count overflow")?,
+        )?;
         let graph = {
             let objects = shared.objects();
             Graph {
@@ -683,7 +728,7 @@ mod hardware {
             }
         };
         println!(
-            "advanced prepared pid={} source_bytes={} bound_images=5 bound_bytes={} bounded_frames=37 product_gates=false",
+            "advanced prepared pid={} source_bytes={} bound_images=5 bound_bytes={} bounded_frames={frame_count} high_scope={high_scope} product_gates=false",
             std::process::id(),
             payload.len(),
             graph
@@ -701,7 +746,14 @@ mod hardware {
             .name("advanced37-forward".into())
             .stack_size(512 * 1024)
             .spawn(move || {
-                let result = body(worker_shared, cases, worker_images, sync2, worker_cancelled);
+                let result = body(
+                    worker_shared,
+                    cases,
+                    worker_images,
+                    sync2,
+                    worker_cancelled,
+                    frame_count,
+                );
                 let _ = tx.send(result);
             })
             .map_err(|e| e.to_string())?;
@@ -738,7 +790,7 @@ mod hardware {
             driver.device.free_memory(graph.shared.arena.memory, None);
         }
         println!(
-            "advanced37 complete true_native_vt_input_retirement=true sync2={sync2} product_gates=false"
+            "advanced complete frames={frame_count} high_scope={high_scope} true_native_vt_input_retirement=true sync2={sync2} product_gates=false"
         );
         Ok(())
     }
