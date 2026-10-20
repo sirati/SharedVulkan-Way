@@ -171,11 +171,18 @@ pub struct Endpoint {
 }
 impl Endpoint {
     pub fn bind(wayland_socket: &Path, registry: Registry) -> io::Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         let mut path = wayland_socket.as_os_str().to_os_string(); path.push(".prime");
         let path = PathBuf::from(path);
-        // Refuse an existing name, including stale endpoints, rather than
-        // unlinking a live or foreign compositor's owner connection service.
+        // The caller already holds ListeningSocket's exclusive Wayland
+        // name lock. Only that owner may replace its crashed endpoint.
+        // Refuse non-sockets and foreign owners even under that lock.
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_socket() && meta.uid() == unsafe { libc::getuid() } => std::fs::remove_file(&path)?,
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "foreign PRIME endpoint")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error),
+        }
         let listener = UnixListener::bind(&path)?;
         let result = (|| { std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?; listener.set_nonblocking(true) })();
         if let Err(error) = result { let _ = std::fs::remove_file(&path); return Err(error); }
