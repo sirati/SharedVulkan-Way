@@ -452,6 +452,22 @@ pub enum ColdMessage {
     /// meaning "one contiguous range". What was missing was the message that
     /// carries the runs when it is not.
     Runs(Vec<AttachRun>),
+    /// The client asks for an [`ColdMessage::Attach`] **with descriptors**
+    /// (waycompose-design.md §112): a client in a sandbox that may not open
+    /// names, reached through the render node. The `Attach` that answers it
+    /// carries no names; it comes with the control object's descriptor and, when
+    /// the arena is a different object, the arena's second
+    /// ([`crate::localfd`]). The connection then stays open for
+    /// [`ColdMessage::RegionRequest`]s. A daemon that predates it refuses it as
+    /// an unexpected message.
+    AttachRequestFds,
+    /// Client → `sv-hostd`, after an `AttachRequestFds` attach: the descriptor
+    /// of the leased pool's region `k`, which a named client would open as
+    /// `poolhdr::region_path`.
+    RegionRequest { k: u32 },
+    /// The answer: region `k` is `len` bytes, and its descriptor comes with
+    /// this message. A refusal is [`ColdMessage::Refuse`].
+    Region { k: u32, len: u64 },
 }
 
 /// One run of the daemon's stitched view, as the ICD needs it.
@@ -477,6 +493,9 @@ const TAG_ATTACH_REQUEST: u32 = 5;
 const TAG_PING: u32 = 6;
 const TAG_SHUTDOWN: u32 = 7;
 const TAG_RUNS: u32 = 8;
+const TAG_ATTACH_REQUEST_FDS: u32 = 9;
+const TAG_REGION_REQUEST: u32 = 10;
+const TAG_REGION: u32 = 11;
 
 /// The most runs one `Runs` message may carry.
 ///
@@ -501,7 +520,12 @@ impl ColdMessage {
                     + 8
             }
             ColdMessage::Runs(r) => 8 + r.len() * 24,
-            ColdMessage::AttachRequest | ColdMessage::Ping | ColdMessage::Shutdown => 0,
+            ColdMessage::RegionRequest { .. } => 4,
+            ColdMessage::Region { .. } => 4 + 8,
+            ColdMessage::AttachRequest
+            | ColdMessage::AttachRequestFds
+            | ColdMessage::Ping
+            | ColdMessage::Shutdown => 0,
         }
     }
 
@@ -560,6 +584,16 @@ impl ColdMessage {
                 }
             }
             ColdMessage::AttachRequest => e.u32(TAG_ATTACH_REQUEST)?,
+            ColdMessage::AttachRequestFds => e.u32(TAG_ATTACH_REQUEST_FDS)?,
+            ColdMessage::RegionRequest { k } => {
+                e.u32(TAG_REGION_REQUEST)?;
+                e.u32(*k)?;
+            }
+            ColdMessage::Region { k, len } => {
+                e.u32(TAG_REGION)?;
+                e.u32(*k)?;
+                e.u64(*len)?;
+            }
             ColdMessage::Ping => e.u32(TAG_PING)?,
             ColdMessage::Shutdown => e.u32(TAG_SHUTDOWN)?,
         }
@@ -635,6 +669,9 @@ impl ColdMessage {
                 ColdMessage::Runs(runs)
             }
             TAG_ATTACH_REQUEST => ColdMessage::AttachRequest,
+            TAG_ATTACH_REQUEST_FDS => ColdMessage::AttachRequestFds,
+            TAG_REGION_REQUEST => ColdMessage::RegionRequest { k: d.u32()? },
+            TAG_REGION => ColdMessage::Region { k: d.u32()?, len: d.u64()? },
             TAG_PING => ColdMessage::Ping,
             TAG_SHUTDOWN => ColdMessage::Shutdown,
             _ => return Err(Error::BadColdMessage("unknown message tag")),
@@ -766,13 +803,16 @@ mod tests {
             ColdMessage::AttachRequest,
             ColdMessage::Ping,
             ColdMessage::Shutdown,
+            ColdMessage::AttachRequestFds,
+            ColdMessage::RegionRequest { k: 3 },
+            ColdMessage::Region { k: 3, len: 1 << 30 },
         ];
         let mut buf = Vec::new();
         for m in &msgs {
             m.encode(&mut buf).unwrap();
             assert_eq!(&ColdMessage::decode(&buf).unwrap(), m, "{m:?}");
         }
-        assert_eq!(msgs.len(), 7, "every variant must appear above");
+        assert_eq!(msgs.len(), 10, "every variant must appear above");
     }
 
     /// §87: the ivshmem locator crosses as an offset and decodes to the same

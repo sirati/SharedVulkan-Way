@@ -491,6 +491,10 @@ impl Brokered {
             }
         }
         let unix = Unix::bind(path, Vec::new())?.with_services(services);
+        // The system broker is the only cross-user sandbox entry. A forwarded
+        // socket retains its creator's credentials; Connect uses `users` above.
+        #[cfg(target_os = "linux")]
+        unix.register_render_node(Path::new("/run/sv-drm/services.sock"))?;
         let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
         let config = wc_broker::server::Config {
             devices: Vec::new(),
@@ -908,7 +912,9 @@ mod tests {
     }
 
     fn tmp(tag: &str) -> Tmp {
-        let p = std::env::temp_dir().join(format!("wc-sessiond-test-{tag}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("wc-sessiond-test-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         Tmp(p)

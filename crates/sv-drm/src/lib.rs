@@ -13,6 +13,9 @@
 //! * [`drm`]: the DRM ioctls, and per-open GEM handles for imported tokens.
 //! * [`ns`]: `sv-drm ns`, the namespace in which libdrm sees the node as a
 //!   render node on bus "faux".
+//! * [`relay`]: the driver-private connect ioctl, through which a sandboxed
+//!   client reaches its GPU services, and the registrations behind it.
+//! * [`fusenode`]: a test harness serving the node as a FUSE file, without root.
 
 #[cfg(target_os = "linux")]
 pub mod cuse;
@@ -22,3 +25,7 @@ pub mod drm;
 pub mod ns;
 #[cfg(target_os = "linux")]
 pub mod token;
+#[cfg(target_os = "linux")]
+pub mod relay;
+#[cfg(target_os = "linux")]
+pub mod fusenode;

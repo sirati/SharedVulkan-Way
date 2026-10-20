@@ -144,6 +144,46 @@ pub fn secure_dir(dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Stamp only large-page sections. The locator reads one stamp per 2 MiB
+/// unit, without translating addresses or scanning small pages.
+fn stamp_guest_ram(bytes: &mut [u8], _id: u64, unit: u64) -> std::io::Result<Option<String>> {
+    use sv_transport::lpstamp;
+    if unit != lpstamp::UNIT {
+        return Ok(None);
+    }
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            algorithm: *mut core::ffi::c_void,
+            buffer: *mut u8,
+            len: u32,
+            flags: u32,
+        ) -> i32;
+    }
+    let mut nonce = [0u8; 16];
+    // SAFETY: the system RNG writes exactly the nonce buffer's length.
+    if unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            nonce.as_mut_ptr(),
+            nonce.len() as u32,
+            2,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::other(
+            "the system RNG could not make a guest RAM stamp",
+        ));
+    }
+    let units = u32::try_from(bytes.len() as u64 / unit)
+        .map_err(|_| std::io::Error::other("too many large pages"))?;
+    for i in 0..units {
+        let at = i as usize * unit as usize;
+        bytes[at..at + lpstamp::STAMP_LEN].copy_from_slice(&lpstamp::stamp(&nonce, i, units));
+    }
+    Ok(Some(nonce.iter().map(|b| format!("{b:02x}")).collect()))
+}
+
 /// Start everything and serve until the process ends.
 fn serve(a: &Args) -> Result<(), String> {
     let me = super::ident::current_user().unwrap_or_default();
@@ -163,7 +203,8 @@ fn serve(a: &Args) -> Result<(), String> {
     } else {
         log("--no-acl: the devices' descriptors are left alone");
     }
-    let platform = Windows::bind(&a.pipe, &a.pipe_sddl, a.devices.clone()).map_err(|e| format!("pipe {}: {e}", a.pipe))?;
+    let platform = Windows::bind(&a.pipe, &a.pipe_sddl, a.devices.clone()).map_err(|e| format!("pipe {}: {e}", a.pipe))?
+        .with_region_init(Box::new(stamp_guest_ram));
     let platform = if a.holder {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let spawn = super::holder::Spawn {

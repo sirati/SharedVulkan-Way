@@ -1492,6 +1492,42 @@ over). The compositor opens a section by the name the proxy passes, read and
 write for GDI's `CreateDIBSection`, and only reads it. The fence record
 (§104.11) is a page per GPU session that the compositor and other sessions only
 read.
+
+**The node's relay** (added with `waycompose-design.md` §112, branch
+`sf-relay`). With `--services PATH`, `sv-drm serve` also answers
+`DRM_IOCTL_SVDRM_CONNECT`: it moves one end of a socketpair from the caller to
+a service registered under the name the caller gives. The rules are plain OS
+identity, no secrets:
+
+* Any user may register on the control socket (0666), but `register NAME`
+  serves only the registrant's own `SO_PEERCRED` uid. `register NAME ANY-UID`
+  serves every uid and is refused unless the registrant is uid 0 or a system
+  uid (< 1000); such a service checks `SO_PEERCRED` itself. A live
+  `(NAME, scope)` cannot be registered twice, so a user cannot take over
+  another registration of the same scope while it is up; a registration ends
+  with its connection.
+* A caller reaches `(NAME, its uid)` or `(NAME, ANY-UID)`, nothing else:
+  `ENOENT` when nobody registered NAME, `EACCES` when only other uids did. The
+  check comes before `sv-drm` touches the caller's descriptors.
+* `sv-drm` takes the descriptor with `pidfd_getfd` (root, so Yama's scope 1
+  and 2 allow it), passes it only if it is an `AF_UNIX` stream or seqpacket
+  socket whose peer uid is the caller's, and never opens or connects anything
+  for a caller. The service sees the client's own `SO_PEERCRED` on it, and
+  `sv-hostd` and the bell hub check that uid again against their own.
+* The embedded system broker registers `waycompose-broker ANY-UID` when
+  the render-node services socket exists. It compares the forwarded uid and
+  pid with the socket's kernel credentials before handing it to its normal
+  accept path. The broker then applies its existing mapped-user policy to
+  hub connections and region access. A sandboxed client gains no cross-user
+  direct hub grant and no bypass of the broker's user mapping.
+* `conn UID PID` is sent without waiting: a service that stops reading costs
+  its clients `EAGAIN`, not the node.
+
+What a sandboxed client gains is exactly what the same user's unsandboxed
+process has: its own `sv-hostd` session and doorbell hub. Over that connection
+it receives descriptors for the objects it would otherwise open by name (the
+GPU pool's regions, which that user can already open), not names, since the
+sandbox forbids the opens.
 ### R40 — A macOS guest starts its sessions through a record in its own RAM
 Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
 (role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It
@@ -1586,7 +1622,7 @@ as above.
 ### R43 — The host maps the Windows guest's own RAM, and the guest lends it on request
 Added 2026-10-19 with `waycompose-design.md` §108. The GPU pool, and through
 §110 the Wayland arena, grow into **regions of the guest's RAM**. These are
-large-page sections that a SYSTEM keeper in the guest creates and holds, and
+large-page sections that the SYSTEM broker service creates and holds, and
 the host finds them by a 2 MiB probe of QEMU's RAM backend. Before §108 the
 host touched only the two ivshmem devices; now it maps pages that Windows
 lent and will reuse. What can go wrong, and what holds it:
@@ -1601,17 +1637,25 @@ lent and will reuse. What can go wrong, and what holds it:
     every lease on the region has ended (by `close`, by its connection, or
     by its process's exit, which the kernel reports through a pidfd). After a
     restart of the daemon, it also waits for every holder its record names
-    (pid and start time);
+    (pid and start time). The fallible lease hook records and fsyncs that
+    holder before any handles leave; failed persistence refuses the lease.
+    Recovery validates a versioned checksum and every record. Unreadable,
+    missing or malformed journals block the whole pool without overwriting
+    the journal or answering any table entry. A new state directory may
+    initialize only against an empty region table. Production cannot disable durable
+    state, and old unversioned journals require a controlled migration;
   * every host mapper unmaps to `PROT_NONE`, so a stale pointer faults in its
     own process;
-  * the memory has two holders in the guest (the keeper's handle and the
-    provider's view), so a crashed GPU process or compositor does not free it.
+  * the broker, its independent holder process, and the provider retain the
+    section. A provider crash leaves an orphan for the next provider of the
+    same SID and pool. A broker crash preserves the holder's duplicate;
+  * allocation is refused if the independent holder cannot keep its copy.
 
   Tested on a test VM (§108.12): 86 provider kills under host writes, a
-  canary in reused memory, 0 corrupt words. **Residual:** the keeper and
-  every provider of a pool killed together before the host lets go (108.10).
-  An administrator can do that; a user's logoff cannot, because the keeper is
-  SYSTEM.
+  canary in reused memory, 0 corrupt words. The shared broker integration
+  replaces the old keeper pipe. **Residual:** simultaneously killing the
+  SYSTEM broker, its holder and every provider before the host lets go.
+  A user's logoff cannot kill the SYSTEM holder.
 * **Who can reach guest RAM on the host.** Mapping any region needs the RAM
   backend, which is the whole guest.
   * **Decided (user, 2026-10-19):** only a broker reaches it. The broker runs
@@ -1644,14 +1688,14 @@ lent and will reuse. What can go wrong, and what holds it:
   occur. The table lives in the pool's bootstrap device, which only the
   pool's owner maps (one mapping per device), so another guest process
   cannot rewrite an entry.
-* **The guest starves itself.** The keeper refuses any region that would
+* **The guest starves itself.** The Windows broker refuses any region that would
   leave Windows less than `max(1 GiB, 15% of RAM)` available, and a pool's
   budget caps what it may add. Large pages are never paged, so what is lent
   is unavailable to Windows until it is given back. The pool gives back
   idle regions after 30 s (5 min inside the low-water margin) and everything
   on an orderly exit.
 * **Windows users against each other.** Sections are **unnamed**. The
-  keeper gives each to the asking process by `DuplicateHandle`, after reading
+  broker gives each to the asking process by `DuplicateHandle`, after reading
   the process's user SID at connect. A pool is (SID, name), so user B can
   neither open, adopt nor free user A's regions. A provider of B that maps
   the bootstrap after A's provider died marks A's table entries foreign:
@@ -1660,11 +1704,10 @@ lent and will reuse. What can go wrong, and what holds it:
   * The first build had named `Global\` sections with an SDDL admitting
     every interactive user. That was a cross-user hole, found in review and
     fixed.
-  * The keeper's pipe admits every authenticated user; that grants nothing
+  * The broker's pipe admits every authenticated user; that grants nothing
     by itself.
   * The user's account needs **no** `SeLockMemoryPrivilege`: only the SYSTEM
-    keeper creates large-page sections. The keeper becomes a module of the
-    one privileged Windows service (§111, R44).
+    broker service creates large-page sections (§111, R44).
 
 
 ### R44 — One privileged broker per machine: users by uid or SID, handles moved, keys held

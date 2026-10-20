@@ -196,7 +196,18 @@ mod unix_client {
 
     impl Client {
         pub fn connect(path: &str) -> io::Result<Client> {
-            let s = UnixStream::connect(path).map_err(|e| io::Error::new(e.kind(), format!("the broker at {path}: {e}")))?;
+            let s = match UnixStream::connect(path) {
+                Ok(s) => s,
+                Err(direct) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(node) = std::env::var_os("SV_DRM_NODE") {
+                        let s = sv_drm::relay::connect_via(std::path::Path::new(&node), sv_drm::relay::BROKER_SERVICE)
+                            .map_err(|e| io::Error::new(e.kind(), format!("the broker at {path}: {direct}; through the render node: {e}")))?;
+                        return Ok(Client { s, buf: Vec::new(), fds: Vec::new(), events: VecDeque::new() });
+                    }
+                    return Err(io::Error::new(direct.kind(), format!("the broker at {path}: {direct}")));
+                }
+            };
             Ok(Client { s, buf: Vec::new(), fds: Vec::new(), events: VecDeque::new() })
         }
 

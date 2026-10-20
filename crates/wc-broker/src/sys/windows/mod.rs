@@ -369,6 +369,23 @@ impl Platform for Windows {
                     format!("a large-page region is a whole number of {unit}-byte pages, not {len} bytes"),
                 ));
             }
+            // Keep the guest's working memory available, as the old keeper
+            // did. A broker budget alone does not account for other apps.
+            let (total, available) = sv_transport::winram::memory_status();
+            let reserve = std::env::var("WC_RAM_RESERVE_MIB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or((1u64 << 30).max(total / 100 * 15), |m| {
+                    m.saturating_mul(1 << 20)
+                });
+            if available < len.saturating_add(reserve) {
+                return Err(io::Error::other(format!(
+                    "budget: {} MiB asked, {} MiB available, {} MiB kept for Windows",
+                    len >> 20,
+                    available >> 20,
+                    reserve >> 20
+                )));
+            }
             flags |= SEC_LARGE_PAGES;
         }
         // SAFETY: a pagefile-backed section; no attributes and NO NAME, so
@@ -454,10 +471,13 @@ impl Platform for Windows {
         if let Some(h) = &self.holder
             && let Err(e) = h.add(info, user, obj.h)
         {
-            // Not fatal: the provider and the broker hold it; only a crash
-            // of both would lose it.
-            eprintln!("[wc-broker] region {}: the holder did not take a copy ({e})", info.id);
+            // Link::add registers the raw handle before transferring it.
+            // The failed allocation drops that handle, so the restart
+            // watcher must not retain it and later duplicate a reused value.
+            h.del(info.id);
+            return Err(e);
         }
+
         Ok(note)
     }
 
