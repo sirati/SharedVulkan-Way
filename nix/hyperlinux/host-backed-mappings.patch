@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 20b0299..43dc0fa 100644
+index 20b0299..1da2991 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -87,7 +87,7 @@ HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
@@ -7,7 +7,7 @@ index 20b0299..43dc0fa 100644
             thread.c futex.c vdso.c crash_report.c rosetta.c \
             gdb_stub.c trace.c syscall_stats.c fd_object.c vfs.c device.c \
 -           audio.c audio_oss.c audio_coreaudio.c app_open.c)
-+           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c)
++           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_copy.c hl_atomic.c hl_seals.c hl_drm.c)
  HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
             syscall_internal.h syscall_fs.h syscall_io.h \
             syscall_poll.h syscall_fd.h syscall_inotify.h \
