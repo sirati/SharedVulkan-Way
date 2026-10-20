@@ -30,10 +30,16 @@ static void inspect(const char *name,void *view) {
     uint32_t value=0x51400000+(++sequence);
     memcpy(producer,&value,sizeof(value));
     assert(*(volatile uint32_t *)view==value);
-    hv_return_t rc=hv_vm_map(view,IPA,LEN,HV_MEMORY_READ);
-    printf("RO_HVF name=%s current=%d maximum=%d shared=%d offset=%llu hv=0x%08x original_page_visible=1\n",
-        name,info.protection,info.max_protection,info.shared,(unsigned long long)info.offset,(unsigned)rc);
-    if(rc==HV_SUCCESS) assert(hv_vm_unmap(IPA,LEN)==HV_SUCCESS);
+    /* Admission diagnosis only. No vCPU exists, so the RX trial grants no
+     * guest execution. This does not justify broader product permissions. */
+    for(unsigned executable=0;executable<2;executable++) {
+        hv_memory_flags_t flags=HV_MEMORY_READ | (executable ? HV_MEMORY_EXEC : 0);
+        hv_return_t rc=hv_vm_map(view,IPA,LEN,flags);
+        printf("RO_HVF name=%s current=%d maximum=%d shared=%d offset=%llu stage2=%s hv=0x%08x original_page_visible=1\n",
+            name,info.protection,info.max_protection,info.shared,(unsigned long long)info.offset,
+            executable ? "RX" : "R",(unsigned)rc);
+        if(rc==HV_SUCCESS) assert(hv_vm_unmap(IPA,LEN)==HV_SUCCESS);
+    }
 }
 int main(void) {
     char path[]="/tmp/hl-ro-hvf-XXXXXX";int rw=mkstemp(path);assert(rw>=0);assert(!ftruncate(rw,LEN));
