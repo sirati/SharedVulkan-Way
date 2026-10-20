@@ -1529,6 +1529,390 @@ pub mod wayland {
         }
     }
 
+    /// `VK_KHR_wayland_surface` with **no copy** (docs/waycompose-design.md
+    /// §112): the swapchain's images are shared sections (§104), and each is
+    /// handed to the compositor once, at swapchain creation, as a
+    /// `zwp_linux_dmabuf_v1` buffer whose fd is the image's token. A present
+    /// is then only `attach`, `damage`, `commit`: wc-proxy sends the
+    /// compositor the section's name and the frame's fence number (§104.11),
+    /// and the compositor reads the pixels where the guest's GPU wrote them.
+    ///
+    /// The token is a sealed memfd of this host, sent to `wc-proxy` on this
+    /// host; what crosses to the guest is the section's name (docs/design.md
+    /// §1a), exactly as for KWin's GBM buffers.
+    pub mod dmabuf {
+        use super::*;
+
+        /// `zwp_linux_dmabuf_v1` requests.
+        const DMABUF_CREATE_PARAMS: u32 = 1;
+        const DMABUF_DESTROY: u32 = 0;
+        /// `zwp_linux_buffer_params_v1` requests.
+        const PARAMS_DESTROY: u32 = 0;
+        const PARAMS_ADD: u32 = 1;
+        const PARAMS_CREATE_IMMED: u32 = 3;
+        /// DRM fourcc codes: `B8G8R8A8` in memory is `ARGB8888`/`XRGB8888`.
+        pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+        pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+
+        #[repr(C)]
+        struct WlMessage {
+            name: *const c_char,
+            signature: *const c_char,
+            types: *const *const WlInterface,
+        }
+
+        /// Statics holding raw pointers to other statics; never written.
+        #[repr(transparent)]
+        struct Shared<T>(T);
+        // SAFETY: the wrapped values are immutable tables of pointers to
+        // string literals and other immutable statics.
+        unsafe impl<T> Sync for Shared<T> {}
+
+        /// `types` for every message: libwayland reads a message's types only
+        /// to create the proxy of a `new_id` *event* (never sent to us: the
+        /// buffer is made with `create_immed`) and to print names under
+        /// `WAYLAND_DEBUG`, which takes NULL as "unknown".
+        static NO_TYPES: Shared<[*const WlInterface; 6]> = Shared([core::ptr::null(); 6]);
+
+        macro_rules! msg {
+            ($n:literal, $s:literal) => {
+                WlMessage {
+                    name: concat!($n, "\0").as_ptr() as *const c_char,
+                    signature: concat!($s, "\0").as_ptr() as *const c_char,
+                    types: &NO_TYPES.0 as *const _ as *const *const WlInterface,
+                }
+            };
+        }
+
+        static DMABUF_REQUESTS: Shared<[WlMessage; 2]> =
+            Shared([msg!("destroy", ""), msg!("create_params", "n")]);
+        static DMABUF_EVENTS: Shared<[WlMessage; 2]> =
+            Shared([msg!("format", "u"), msg!("modifier", "3uuu")]);
+        static PARAMS_REQUESTS: Shared<[WlMessage; 4]> = Shared([
+            msg!("destroy", ""),
+            msg!("add", "huuuuu"),
+            msg!("create", "iiuu"),
+            msg!("create_immed", "2niiuu"),
+        ]);
+        static PARAMS_EVENTS: Shared<[WlMessage; 2]> = Shared([msg!("created", "n"), msg!("failed", "")]);
+
+        static DMABUF_INTERFACE: Shared<WlInterface> = Shared(WlInterface {
+            name: c"zwp_linux_dmabuf_v1".as_ptr(),
+            version: 3,
+            method_count: 2,
+            methods: &DMABUF_REQUESTS.0 as *const _ as *const c_void,
+            event_count: 2,
+            events: &DMABUF_EVENTS.0 as *const _ as *const c_void,
+        });
+        static PARAMS_INTERFACE: Shared<WlInterface> = Shared(WlInterface {
+            name: c"zwp_linux_buffer_params_v1".as_ptr(),
+            version: 3,
+            method_count: 4,
+            methods: &PARAMS_REQUESTS.0 as *const _ as *const c_void,
+            event_count: 2,
+            events: &PARAMS_EVENTS.0 as *const _ as *const c_void,
+        });
+
+        struct FoundDmabuf {
+            name: u32,
+            version: u32,
+        }
+
+        unsafe extern "C" fn on_global(
+            data: *mut c_void,
+            _registry: *mut c_void,
+            name: u32,
+            interface: *const c_char,
+            version: u32,
+        ) {
+            if data.is_null() || interface.is_null() {
+                return;
+            }
+            // SAFETY: as `super::on_global`.
+            unsafe {
+                if core::ffi::CStr::from_ptr(interface).to_bytes() == b"zwp_linux_dmabuf_v1" {
+                    let f = &mut *(data as *mut FoundDmabuf);
+                    f.name = name;
+                    f.version = version;
+                }
+            }
+        }
+        static REGISTRY: RegistryListener = RegistryListener { global: on_global, global_remove: on_global_remove };
+
+        #[repr(C)]
+        struct ParamsListener {
+            created: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
+            failed: unsafe extern "C" fn(*mut c_void, *mut c_void),
+        }
+        unsafe extern "C" fn on_created(_d: *mut c_void, _p: *mut c_void, _b: *mut c_void) {}
+        unsafe extern "C" fn on_failed(data: *mut c_void, _p: *mut c_void) {
+            if !data.is_null() {
+                // SAFETY: `data` is the `AtomicBool` of `Surface::open`, alive
+                // until after the round trip that delivers this event.
+                unsafe { (*(data as *const AtomicBool)).store(true, Ordering::Release) };
+            }
+        }
+        static PARAMS: ParamsListener = ParamsListener { created: on_created, failed: on_failed };
+
+        /// One image's buffer: the `wl_buffer` proxy and whether the
+        /// compositor holds it.
+        struct Buf {
+            proxy: *mut c_void,
+            busy: Box<AtomicBool>,
+        }
+
+        /// A swapchain's images as `wl_buffer`s on the application's surface.
+        pub struct Surface {
+            display: *mut c_void,
+            surface: *mut c_void,
+            surface_version: u32,
+            queue: *mut c_void,
+            buffers: Vec<Buf>,
+            width: u32,
+            height: u32,
+            slot: Option<i32>,
+        }
+
+        // SAFETY: as `super::Surface`: libwayland objects, our own queue
+        // dispatched only through `&mut self`.
+        unsafe impl Send for Surface {}
+
+        impl Surface {
+            /// Bind `zwp_linux_dmabuf_v1` on a queue of our own and make one
+            /// `wl_buffer` per image: `images` is `(token fd, row pitch)`; the
+            /// fds stay the caller's. `None` when the compositor has no such
+            /// global or refuses a buffer; the caller then uses the copy path.
+            pub fn open(
+                display: usize,
+                surface: usize,
+                width: u32,
+                height: u32,
+                premultiplied: bool,
+                images: &[(i32, u32)],
+            ) -> Option<Surface> {
+                let l = lib()?;
+                if width == 0 || height == 0 || images.is_empty() {
+                    return None;
+                }
+                let surface = surface as *mut c_void;
+                // SAFETY: libwayland calls on the application's display (live
+                // for the VkSurfaceKHR's lifetime) and on proxies made here,
+                // with argument arrays matching the signatures above.
+                unsafe {
+                    let display = (l.proxy_get_display)(display as *mut c_void);
+                    if display.is_null() {
+                        return None;
+                    }
+                    let queue = (l.display_create_queue)(display);
+                    if queue.is_null() {
+                        return None;
+                    }
+                    let fail = |queue| {
+                        (l.event_queue_destroy)(queue);
+                        None
+                    };
+                    let wrapper = (l.proxy_create_wrapper)(display);
+                    if wrapper.is_null() {
+                        return fail(queue);
+                    }
+                    (l.proxy_set_queue)(wrapper, queue);
+                    let mut args = [arg_new()];
+                    let registry = (l.proxy_marshal_array_flags)(
+                        wrapper,
+                        WL_DISPLAY_GET_REGISTRY,
+                        l.registry_interface,
+                        (l.proxy_get_version)(wrapper),
+                        0,
+                        args.as_mut_ptr(),
+                    );
+                    (l.proxy_wrapper_destroy)(wrapper);
+                    if registry.is_null() {
+                        return fail(queue);
+                    }
+                    let mut found = FoundDmabuf { name: 0, version: 0 };
+                    (l.proxy_add_listener)(
+                        registry,
+                        &REGISTRY as *const RegistryListener as *const c_void,
+                        &mut found as *mut FoundDmabuf as *mut c_void,
+                    );
+                    if (l.display_roundtrip_queue)(display, queue) < 0 || found.version < 3 {
+                        (l.proxy_destroy)(registry);
+                        return fail(queue);
+                    }
+                    let iface = &DMABUF_INTERFACE.0 as *const WlInterface;
+                    let mut args = [arg_u(found.name), arg_s((*iface).name), arg_u(3), arg_new()];
+                    let dmabuf = (l.proxy_marshal_array_flags)(registry, WL_REGISTRY_BIND, iface, 3, 0, args.as_mut_ptr());
+                    (l.proxy_destroy)(registry);
+                    if dmabuf.is_null() {
+                        return fail(queue);
+                    }
+
+                    let format = if premultiplied { DRM_FORMAT_ARGB8888 } else { DRM_FORMAT_XRGB8888 };
+                    let failed = Box::new(AtomicBool::new(false));
+                    let mut buffers = Vec::with_capacity(images.len());
+                    for &(fd, pitch) in images {
+                        let mut args = [arg_new()];
+                        let params = (l.proxy_marshal_array_flags)(
+                            dmabuf,
+                            DMABUF_CREATE_PARAMS,
+                            &PARAMS_INTERFACE.0,
+                            3,
+                            0,
+                            args.as_mut_ptr(),
+                        );
+                        if params.is_null() {
+                            break;
+                        }
+                        (l.proxy_add_listener)(
+                            params,
+                            &PARAMS as *const ParamsListener as *const c_void,
+                            &*failed as *const AtomicBool as *mut c_void,
+                        );
+                        // plane 0, offset 0, the image's row pitch, LINEAR.
+                        let mut args = [arg_h(fd), arg_u(0), arg_u(0), arg_u(pitch), arg_u(0), arg_u(0)];
+                        (l.proxy_marshal_array_flags)(params, PARAMS_ADD, core::ptr::null(), 3, 0, args.as_mut_ptr());
+                        let mut args = [arg_new(), arg_i(width as i32), arg_i(height as i32), arg_u(format), arg_u(0)];
+                        let b = (l.proxy_marshal_array_flags)(
+                            params,
+                            PARAMS_CREATE_IMMED,
+                            l.buffer_interface,
+                            1,
+                            0,
+                            args.as_mut_ptr(),
+                        );
+                        if b.is_null() {
+                            (l.proxy_destroy)(params);
+                            break;
+                        }
+                        let busy = Box::new(AtomicBool::new(false));
+                        (l.proxy_add_listener)(
+                            b,
+                            &BUFFER_LISTENER as *const BufferListener as *const c_void,
+                            &*busy as *const AtomicBool as *mut c_void,
+                        );
+                        buffers.push((Buf { proxy: b, busy }, params));
+                    }
+                    // `failed` comes before the answer to this sync if at all.
+                    let ok = (l.display_roundtrip_queue)(display, queue) >= 0;
+                    let mut out = Vec::with_capacity(buffers.len());
+                    for (b, params) in buffers {
+                        let mut none: [Arg; 0] = [];
+                        (l.proxy_marshal_array_flags)(params, PARAMS_DESTROY, core::ptr::null(), 3, MARSHAL_FLAG_DESTROY, none.as_mut_ptr());
+                        out.push(b);
+                    }
+                    let mut none: [Arg; 0] = [];
+                    (l.proxy_marshal_array_flags)(dmabuf, DMABUF_DESTROY, core::ptr::null(), 3, MARSHAL_FLAG_DESTROY, none.as_mut_ptr());
+                    let s = Surface {
+                        display,
+                        surface,
+                        surface_version: (l.proxy_get_version)(surface),
+                        queue,
+                        buffers: out,
+                        width,
+                        height,
+                        slot: guard::track(surface),
+                    };
+                    if !ok || failed.load(Ordering::Acquire) || s.buffers.len() != images.len() {
+                        sv_icd_entry::report_always(&format_args!(
+                            "presentation: the compositor refused the swapchain's dma-bufs; copying frames instead"
+                        ));
+                        return None; // Drop destroys what was made
+                    }
+                    sv_icd_entry::report_transport_failure(&format_args!(
+                        "presentation: {} dma-buf image(s), {width}x{height}, zero copy",
+                        s.buffers.len()
+                    ));
+                    Some(s)
+                }
+            }
+
+            pub fn slot(&self) -> Option<i32> {
+                self.slot
+            }
+
+            /// The first image the compositor is not holding, waiting for a
+            /// release up to `limit`. `None` when every image is still held.
+            pub fn free(&mut self, prefer: usize, limit: std::time::Duration) -> Option<usize> {
+                let l = lib()?;
+                let n = self.buffers.len();
+                let deadline = std::time::Instant::now() + limit;
+                loop {
+                    // SAFETY: our own queue, dispatched only here, under `&mut self`.
+                    unsafe { (l.display_dispatch_queue_pending)(self.display, self.queue) };
+                    if let Some(i) = (0..n).map(|k| (prefer + k) % n).find(|&i| !self.buffers[i].busy.load(Ordering::Acquire)) {
+                        return Some(i);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    // SAFETY: as above. A round trip returns once the
+                    // compositor has answered, releases sent before it included.
+                    unsafe {
+                        (l.display_flush)(self.display);
+                        if (l.display_roundtrip_queue)(self.display, self.queue) < 0 {
+                            return None;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
+            }
+
+            /// Show image `i`: attach, damage all of it, commit. Called inside
+            /// `vkQueuePresentKHR`. With the shim and a dead surface, nothing.
+            pub fn show(&mut self, i: usize, generation: Option<u32>) {
+                let Some(l) = lib() else { return };
+                let Some(b) = self.buffers.get(i) else { return };
+                let guarded = match (generation, self.slot) {
+                    (Some(g), Some(slot)) => {
+                        if !guard::begin(slot, g) {
+                            return;
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                b.busy.store(true, Ordering::Release);
+                // SAFETY: requests on the application's live surface (inside
+                // its call, or under the shim's lock) and on our own buffer.
+                unsafe {
+                    let mut args = [arg_o(b.proxy), arg_i(0), arg_i(0)];
+                    (l.proxy_marshal_array_flags)(self.surface, WL_SURFACE_ATTACH, core::ptr::null(), self.surface_version, 0, args.as_mut_ptr());
+                    let (op, w, h) = if self.surface_version >= DAMAGE_BUFFER_SINCE {
+                        (WL_SURFACE_DAMAGE_BUFFER, self.width as i32, self.height as i32)
+                    } else {
+                        (WL_SURFACE_DAMAGE, i32::MAX, i32::MAX)
+                    };
+                    let mut args = [arg_i(0), arg_i(0), arg_i(w), arg_i(h)];
+                    (l.proxy_marshal_array_flags)(self.surface, op, core::ptr::null(), self.surface_version, 0, args.as_mut_ptr());
+                    let mut none: [Arg; 0] = [];
+                    (l.proxy_marshal_array_flags)(self.surface, WL_SURFACE_COMMIT, core::ptr::null(), self.surface_version, 0, none.as_mut_ptr());
+                    if guarded {
+                        guard::end();
+                    }
+                    (l.display_flush)(self.display);
+                }
+            }
+        }
+
+        impl Drop for Surface {
+            fn drop(&mut self) {
+                let Some(l) = lib() else { return };
+                // SAFETY: our own proxies and queue.
+                unsafe {
+                    for b in &self.buffers {
+                        let mut none: [Arg; 0] = [];
+                        (l.proxy_marshal_array_flags)(b.proxy, WL_BUFFER_DESTROY, core::ptr::null(), (l.proxy_get_version)(b.proxy), MARSHAL_FLAG_DESTROY, none.as_mut_ptr());
+                    }
+                    (l.display_flush)(self.display);
+                    (l.event_queue_destroy)(self.queue);
+                }
+                if let Some(slot) = self.slot {
+                    guard::untrack(slot);
+                }
+            }
+        }
+    }
+
     /// `libsv_wlshim.so`'s side of a present that finishes after
     /// `vkQueuePresentKHR` (docs/waycompose-design.md §100), found in the
     /// process with `dlsym(RTLD_DEFAULT)`. Absent, every function says so and

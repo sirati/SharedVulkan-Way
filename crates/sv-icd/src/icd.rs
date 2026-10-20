@@ -2552,7 +2552,7 @@ impl SharedVulkan {
 
     /// The session's fence record (§104.11), asked of the GPU side once.
     /// `None`: it has none, and sync-fd exports wait as before.
-    fn fence_record(&self) -> IcdResult<Option<String>> {
+    pub(crate) fn fence_record(&self) -> IcdResult<Option<String>> {
         if let Some(r) = self.state().fences.record.clone() {
             return Ok(r);
         }
@@ -2569,6 +2569,36 @@ impl SharedVulkan {
         };
         self.state().fences.record = Some(r.clone());
         Ok(r)
+    }
+
+    /// §112: a swapchain image's frame, written by the work that signals
+    /// `semaphore` on `queue` (submitted just before), numbered for the
+    /// compositor: the token's sync page gets the number and the GPU side the
+    /// mark, as Zink's export of a dma-buf frame does (§104.11). `false` when
+    /// the GPU side has no fence record or the memory is not shared.
+    pub(crate) fn mark_shared_write(&self, queue: u64, semaphore: u64, memory: u64) -> IcdResult<bool> {
+        if self.fence_record()?.is_none() {
+            return Ok(false);
+        }
+        let seq = {
+            let mut s = self.state();
+            if !s.shared_memories.contains_key(&memory) {
+                return Ok(false);
+            }
+            s.fences.seq += 1;
+            let seq = s.fences.seq;
+            if let Some(m) = s.shared_memories.get(&memory) {
+                m.file.mark(seq);
+            }
+            seq
+        };
+        self.send_mark(crate::dmabuf::Mark { queue, semaphore, seq }, memory)?;
+        Ok(true)
+    }
+
+    /// A new fd for a shared allocation's token (§112); the caller closes it.
+    pub(crate) fn shared_token_fd(&self, memory: u64) -> Option<i32> {
+        self.state().shared_memories.get(&memory).and_then(|m| m.file.export())
     }
 
     /// `svFenceMark` for an export, on the queue ring after the submit that
