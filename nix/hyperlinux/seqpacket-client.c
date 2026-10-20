@@ -505,7 +505,14 @@ static void sender_exit(void) {
     CHECK(receive(channel[1], bytes, sizeof(bytes), MSG_CMSG_CLOEXEC, &endpoint, &flags, 1) == 8 && endpoint >= 0);
     int type = 0; socklen_t length = sizeof(type);
     CHECK(getsockopt(endpoint, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_SEQPACKET);
-    CHECK(read(endpoint, bytes, sizeof(bytes)) == 10 && !memcmp(bytes, "after-exit", 10));
+    memset(bytes, 0xa5, sizeof(bytes));
+    errno = 0;
+    ssize_t queued = read(endpoint, bytes, sizeof(bytes));
+    int queued_errno = errno;
+    fprintf(stderr, "SEQPACKET sender_exit read=%zd errno=%d bytes=", queued, queued_errno);
+    for (size_t i = 0; i < sizeof(bytes); i++) fprintf(stderr, "%02x", (unsigned char)bytes[i]);
+    fputc('\n', stderr);
+    CHECK(queued == 10 && !memcmp(bytes, "after-exit", 10));
     CHECK(read(endpoint, bytes, sizeof(bytes)) == 0);
     CHECK(close(endpoint) == 0 && close(channel[1]) == 0);
     puts("SEQPACKET queued endpoint after sender exit PASS");
