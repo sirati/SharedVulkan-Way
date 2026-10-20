@@ -261,6 +261,21 @@ impl Qmp {
         Ok(q)
     }
 
+    /// Kernel-authenticated process that owns this QMP socket.
+    pub fn peer_pid(&self) -> std::io::Result<u32> {
+        use std::os::fd::AsRawFd;
+        let mut credentials = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+        // SAFETY: live socket, properly sized writable credential buffer.
+        let status = unsafe { libc::getsockopt(self.sock.as_raw_fd(), libc::SOL_SOCKET,
+            libc::SO_PEERCRED, (&mut credentials as *mut libc::ucred).cast(), &mut len) };
+        if status < 0 { return Err(std::io::Error::last_os_error()); }
+        if len as usize != std::mem::size_of_val(&credentials) || credentials.pid <= 0 {
+            return Err(std::io::Error::other("QMP socket supplied no valid peer pid"));
+        }
+        Ok(credentials.pid as u32)
+    }
+
     fn read_line(&mut self) -> std::io::Result<String> {
         let mut s = String::new();
         let n = self.reader.read_line(&mut s)?;

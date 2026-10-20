@@ -770,3 +770,20 @@ pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
         format!("ivshmem device {index}: an ivshmem device is a Windows guest's, not this machine's"),
     ))
 }
+
+/// Read-only checked window of an already-open host memory backend. The fd
+/// is opened and authenticated by the host, never by a guest pathname.
+#[cfg(target_os = "linux")]
+pub(crate) fn map_file_window(file: &File, offset: u64, len: usize) -> io::Result<MappedView> {
+    let end = offset.checked_add(len as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mapping window overflows"))?;
+    if len == 0 || end > file.metadata()?.len() || offset > i64::MAX as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "mapping window exceeds backend"));
+    }
+    // SAFETY: nonempty checked in-file window, live owned fd and a null hint.
+    // The kernel validates page alignment. Mapping retains its own file ref.
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ,
+        libc::MAP_SHARED, file.as_raw_fd(), offset as libc::off_t) };
+    if ptr == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
+    Ok(MappedView { ptr: ptr.cast(), len })
+}

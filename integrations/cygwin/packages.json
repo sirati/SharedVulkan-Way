@@ -1,0 +1,34 @@
+{
+  "cygwin": {
+    "path": "x86_64/release/cygwin/cygwin-3.6.11-1-x86_64.tar.xz",
+    "sha512": "1c33f8396d78eca035106325c5b90ff1165a6b78839f16190ec00f025067306522a23a5ec1b99557974e471649104cd31dad68685d2a544c31fb4494297a744a"
+  },
+  "cygwin-devel": {
+    "path": "x86_64/release/cygwin/cygwin-devel/cygwin-devel-3.6.11-1-x86_64.tar.xz",
+    "sha512": "5772f9dbc93cb40ed831348db672026b48ae91e22c3431e6ece6a627cd0c7d742a0e8c24ba6b95f853f8c652f9ce7999267e39e294fb18bf821da9e7295f0876"
+  },
+  "w32api-headers": {
+    "path": "x86_64/release/w32api-headers/w32api-headers-14.0.0-1-x86_64.tar.xz",
+    "sha512": "b2b6ecd2a17cbfe42593d92eb067bff56a0870d7c601ec7b0aeb9511b91e0557f07a939e57b337f0ab1da5fdf97980e705ba8ba0520994362060bd2a89925edf"
+  },
+  "w32api-runtime": {
+    "path": "x86_64/release/w32api-runtime/w32api-runtime-14.0.0-1-x86_64.tar.xz",
+    "sha512": "d06e35dfeb4cf86faf59bd512d192870f8711ee581bae127beecd8be82800dca84c0f69e27921317ea6db217864dd942bd777d72efd43a47720f0e507c7cb253"
+  },
+  "libffi-devel": {
+    "path": "x86_64/release/libffi/libffi-devel/libffi-devel-3.8.0-1-x86_64.tar.xz",
+    "sha512": "bb22791e5ded244a53bac715b1edf386786a96fd2d77ffda6fa9131198189303c61d2b3ad9151ca2507d818d8290c636f1fa349ed8b192696d5e43d0c3fb5f70"
+  },
+  "libffi8": {
+    "path": "x86_64/release/libffi/libffi8/libffi8-3.8.0-1-x86_64.tar.xz",
+    "sha512": "935a0567f740a314d70ecd4adc8c4cf5ad37c6fb43f2d26dee882d4fda71f08efb2646bee10cee6e2000f52e25cce87fa29ce07665ba6d22532e0daa76bc887c"
+  },
+  "libgcc1": {
+    "path": "x86_64/release/gcc/libgcc1/libgcc1-14.4.0-1-x86_64.tar.zst",
+    "sha512": "5ac8a56e5eee285efcd6dbd05a473e795e181021d7194b8a98dfe2fa201a71f0abe2908e0b4c81490eb5ef472efaeac8e56a61a5f289eee4ad6e90e52a844ff8"
+  },
+  "gcc-core": {
+    "path": "x86_64/release/gcc/gcc-core/gcc-core-14.4.0-1-x86_64.tar.zst",
+    "sha512": "c463f27075353dbbbb05878a3695c2651a81da0032f75b71f121dece745aa3d646b7f03180618844aa5372be358d5dc2e0efc0fffde80f9216eae3ef5b3d963e"
+  }
+}

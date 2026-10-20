@@ -119,6 +119,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod arena;
+pub mod section_provider;
 /// §107: the shared BAR cut into per-session regions.
 pub mod barpool;
 /// GROWTH. The host→guest channel that asks for another region, as a message
@@ -508,6 +509,9 @@ impl Handle {
     /// it. The returned handle owns the object; the descriptor may be sent to a
     /// peer, which can then [`map`](Handle::map) it.
     pub fn create_section(size: u64) -> io::Result<Self> {
+        if let Some(result) = section_provider::allocate(size) {
+            return result;
+        }
         let name = platform::random_section_name();
         let object = platform::create_section(&name, size)?;
         Ok(Self {
