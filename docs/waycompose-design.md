@@ -37056,7 +37056,9 @@ installation's key on stdin, and the user's `session.key` is deleted.
 running broker. It never installs or restarts the service and is allowed for
 tests. The key and its protected parent directories belong to Administrators
 and grant access only to SYSTEM and Administrators. Provisioning replaces the
-whole DACL, including any old explicit desktop grant. The service executable
+key object using a protected temporary file, then replaces the whole DACL.
+An already-open handle to an old readable key cannot observe the rotated
+bytes. Reparse directories and key paths are refused. The service executable
 and recovery files also have privileged ownership. This matters because an
 owner can change a DACL even without a grant in that DACL.
 

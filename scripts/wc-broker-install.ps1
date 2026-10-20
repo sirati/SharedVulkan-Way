@@ -64,6 +64,9 @@ function Secure-Path([string]$p, [bool]$Directory, [bool]$UsersRead) {
 }
 
 function Secure-Dir([string]$d, [bool]$UsersRead) {
+  if ((Test-Path -LiteralPath $d) -and ((Get-Item -Force -LiteralPath $d).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "refusing reparse directory $d"
+  }
   New-Item -ItemType Directory -Force -Path $d | Out-Null
   Secure-Path $d $true $UsersRead
 }
@@ -149,8 +152,28 @@ switch ($Action) {
     Secure-Dir $Data $false
     Secure-Dir $Keys $false
     $p = Join-Path $Keys "$Install.key"
-    [IO.File]::WriteAllText($p, $k)
-    Secure-Path $p $false $false
+    if ((Test-Path -LiteralPath $p) -and ((Get-Item -Force -LiteralPath $p).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw "refusing reparse key $p"
+    }
+    # Replace the object, never overwrite a formerly exposed key in place.
+    # A desktop process may still have the old object open with read sharing;
+    # changing its DACL cannot revoke that handle's access to new bytes.
+    $tmp = Join-Path $Keys (".key-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    try {
+      $stream = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      try {
+        $bytes = [Text.Encoding]::ASCII.GetBytes($k)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+      } finally { $stream.Dispose() }
+      Secure-Path $tmp $false $false
+      # A failure leaves the signer unavailable rather than publishing to an
+      # existing object. The protected parent prevents desktop replacement.
+      if (Test-Path -LiteralPath $p) { Remove-Item -Force -LiteralPath $p }
+      Move-Item -LiteralPath $tmp -Destination $p
+    } finally {
+      if (Test-Path -LiteralPath $tmp) { Remove-Item -Force -LiteralPath $tmp }
+    }
     Say "key of installation $Install stored in $p (SYSTEM and Administrators only)"
   }
   "show" {
