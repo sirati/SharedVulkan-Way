@@ -137,6 +137,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         allocation: &AllocationId,
     ) -> io::Result<Frame> {
         self.process_role(lifecycle, producer, ProcessRole::Producer)?;
+        self.producer_open(lifecycle, producer, allocation)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
         let extent = self.allocation(lifecycle, allocation)?;
         let record = self.records.get_mut(&allocation.grant.id).unwrap();
@@ -202,6 +203,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         recipient: &RemoteRegistration,
     ) -> io::Result<Frame> {
         self.process_role(lifecycle, producer, ProcessRole::Producer)?;
+        self.producer_open(lifecycle, producer, allocation)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
         Self::same_grant(&recipient.grant, &allocation.grant)?;
         self.allocation(lifecycle, allocation)?;
