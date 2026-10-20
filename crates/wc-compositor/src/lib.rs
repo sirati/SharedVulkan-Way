@@ -1251,7 +1251,19 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         } else {
             0
         };
-        let rings_at = match wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len) {
+        // §111.8: the broker opens the arena device (device 0, PCI slot
+        // 0x1c) and moves it here; this process maps it as it maps one it
+        // opened. Without a broker, the device is opened here as before.
+        #[cfg(windows)]
+        let lent = if dev == 0 { wc_broker::client::lend::ivshmem("arena", "compositor") } else { None };
+        #[cfg(not(windows))]
+        let lent: Option<()> = None;
+        let attached = match lent {
+            #[cfg(windows)]
+            Some(d) => wc_handle::map_ivshmem_device(d).and_then(|m| wc_handle::arena::attach_ivshmem_mapped(id, m, rings_len)),
+            _ => wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len),
+        };
+        let rings_at = match attached {
             Ok(r) => {
                 println!(
                     "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \

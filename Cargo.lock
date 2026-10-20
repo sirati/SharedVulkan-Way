@@ -1293,6 +1293,7 @@ dependencies = [
  "sv-proto",
  "sv-transport",
  "sv-wire",
+ "wc-broker",
  "wc-handle",
 ]
 
@@ -1303,6 +1304,7 @@ dependencies = [
  "sv-arena",
  "sv-gpu-server",
  "sv-transport",
+ "wc-broker",
  "wc-compositor",
 ]
 
@@ -1694,6 +1696,7 @@ name = "wc-broker"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sv-transport",
  "wc-handle",
  "windows-sys",
 ]
@@ -1716,6 +1719,7 @@ dependencies = [
  "wayland-backend",
  "wayland-scanner",
  "wayland-server",
+ "wc-broker",
  "wc-handle",
  "wc-hostint",
  "wc-hostplat",

@@ -659,14 +659,59 @@ fn boot_session(cfg: Config) -> Result<(Arc<Sess>, String), String> {
     }
 }
 
+/// The record's authenticator (§111.6, §111.8). The broker signs it with the
+/// installation's key, which this process cannot read once deploy has moved
+/// it to the broker's directory, and covers the identity it read from this
+/// process's token. Without a broker it is signed here from the
+/// installation's key file, as before §111, with no identity.
+fn sign(
+    cfg: &Config,
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
+    use wc_handle::macboot;
+    let seq = now_micros();
+    #[cfg(windows)]
+    {
+        let req = wc_broker::proto::SignReq {
+            install: cfg.install.clone(),
+            session: rec.session.clone(),
+            index,
+            arena_run: rec.arena_run,
+            arena_pages: rec.arena_pages,
+            outbound: rec.outbound,
+            rings_run: rec.rings_run,
+            rings_pages: rec.rings_pages,
+            gpu: rec.gpu,
+            seq,
+        };
+        let t = Instant::now();
+        match wc_broker::client::process_client("compositor").and_then(|mut c| c.sign(&req)) {
+            Ok((auth, identity)) => {
+                say(&format!(
+                    "boot: record signed by the broker in {} us for {}",
+                    t.elapsed().as_micros(),
+                    identity.text()
+                ));
+                return Ok((auth, Some(identity)));
+            }
+            Err(e) => say(&format!(
+                "boot: the broker did not sign ({e}); signing with the key file {}",
+                cfg.key_file.display()
+            )),
+        }
+    }
+    let text = std::fs::read_to_string(&cfg.key_file).map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
+    let key = macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?;
+    Ok((macboot::Auth::sign_indexed(rec, index, &cfg.install, seq, &key), None))
+}
+
 /// Write the record, ring, and wait for the answer.
 fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
     use wc_handle::macboot;
     let cfg = &sess.cfg;
     let id = h.arena;
     let t0 = Instant::now();
-    let text = std::fs::read_to_string(&cfg.key_file).map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
-    let key = macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?;
     let (run, region_len, rings_len) = wc_handle::arena::ivshmem_identity(id).map_err(|e| e.to_string())?;
     if rings_len == 0 {
         return Err("the region kept no Wayland rings, and without them nothing can cross".into());
@@ -681,12 +726,14 @@ fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
         rings_pages: (rings_len / 4096) as u32,
         gpu: cfg.gpu,
     };
-    let auth = macboot::Auth::sign_indexed(&rec, sess.index, &cfg.install, now_micros(), &key);
+    let (auth, identity) = sign(cfg, &rec, sess.index)?;
     let page0 = wc_handle::arena::ivshmem_header_page(id).map_err(|e| e.to_string())?;
     // SAFETY: the header page of the device this process maps, for the life of
     // the process; nothing else in this process writes past the header's 80
-    // bytes of it, and the boot turn keeps other boots out.
-    unsafe { macboot::publish_indexed(page0, &rec, sess.index, Some(&auth)) };
+    // bytes of it, and the boot turn keeps other boots out. The identity area
+    // is written (or cleared, without one) before the record, so a record is
+    // never read with another boot's identity.
+    unsafe { macboot::publish_identity(page0, &rec, sess.index, identity.as_ref(), Some(&auth)) };
     let bell = sv_transport::park::cross_wake();
     say(&format!(
         "boot: record for session {} of installation {} in the header page (run 0x{run:016x}, index {}, gpu {}); {}",

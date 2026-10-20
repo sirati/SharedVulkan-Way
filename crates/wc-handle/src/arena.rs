@@ -589,6 +589,19 @@ pub fn attach_ivshmem_with_rings(id: u32, device: u32, rings_len: u64) -> io::Re
     attach_ivshmem_view(id, view, size, format!("ivshmem device {device} ({path})"), rings_len)
 }
 
+/// [`attach_ivshmem_with_rings`] for a device this process has already
+/// mapped (§111.8: one the broker opened and moved here, mapped by
+/// `map_ivshmem_device`). `mapped` is what the map returned.
+pub fn attach_ivshmem_mapped(
+    id: u32,
+    mapped: (platform::MappedView, u64, String),
+    rings_len: u64,
+) -> io::Result<IvshmemRegion> {
+    refuse_if_outbound(id)?;
+    let (view, size, path) = mapped;
+    attach_ivshmem_view(id, view, size, format!("ivshmem device {path}, from the broker"), rings_len)
+}
+
 /// The Wayland rings' region of arena `id`, as `(base, len)`: the tail
 /// [`attach_ivshmem_with_rings`] kept out of the arena, or an error when none
 /// was kept.
