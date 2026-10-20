@@ -795,7 +795,8 @@ impl RingTransport {
         Ok(attached)
     }
 
-    /// Connect to a Windows GPU side over a named pipe and two named sections.
+    /// Attach a Windows client. `ivshmem:SLOT` selects a GPU owner across
+    /// the VM boundary; other names select a local pipe and named sections.
     ///
     /// The counterpart of the Linux `connect`, and shorter, because **nothing is
     /// handed over**. The section names are derived from the session string on
@@ -1028,9 +1029,9 @@ impl RingTransport {
         // doorbell is the session that shipped, and refusing to run because an
         // optimisation is unavailable would be worse than not having it.
         // Unix only: the host end of the chardev is a Unix socket, which is what
-        // the cross-VM topology has. A Windows *app* side is the same-machine
-        // topology, where the peer is on this kernel and the ordinary futex wake
-        // already reaches it — there is no hypervisor to carry anything across.
+        // the cross-VM topology has. Named-section Windows sessions use local
+        // wakes. The Windows ivshmem client installs its per-BAR doorman before
+        // this method; its process-owned ControlSet dispatches all sessions.
         #[cfg(unix)]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
