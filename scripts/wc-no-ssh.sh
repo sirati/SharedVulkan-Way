@@ -64,6 +64,7 @@ INST=$D/inst
 mkdir -p "$INST/bin" "$D/installs" "$D/state" "$D/run" "$D/crt" "$D/hub"
 chmod 700 "$D/crt" "$D/hub"
 cp "$ROOT/scripts/wc-session" "$INST/wc-session"
+printf '%s\n' "$D/test-home" >"$INST/test-home"
 for b in wc-proxy wc-arena-host wc-launch sv-hostd; do ln -s "$BIN/$b" "$INST/bin/$b"; done
 cat >"$INST/apps.ini" <<EOF
 [probe]
@@ -77,6 +78,7 @@ chmod 600 "$INST/session.key"
 cp "$INST/session.key" "$D/guest.key"
 ln -s "$INST" "$D/installs/wcns"
 
+export WC_LAUNCH_TEST_HOME="$D/test-home"
 export WC_LAUNCH_RUN="$D/run" WC_LAUNCH_ARENA="$D/arena" WC_LAUNCH_WCBELL="$D/host.sock"
 export WC_LAUNCH_BELL_HUB="$D/hub" WC_LAUNCH_HUB_UNMANAGED=1 WC_LAUNCH_SESSION_SECS=120
 # §113: the "VM" whose process tells a stalled guest from a dead one is the

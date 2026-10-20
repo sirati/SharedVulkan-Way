@@ -37211,7 +37211,7 @@ holder and adoption, and is not implemented.
   denial as process exit. It then reported the same pid before and after
   the signal. The 0.70 s measurement is invalid. The harness now requires a successful root probe and positive PID absence,
   enforces an elapsed observation deadline, and validates a different live
-  replacement pid; a VM rerun is pending.
+  replacement pid; the corrected safety rerun is recorded below.
 * **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
   after): its `open` of user 1's regions, `find` of user 1's pool and
   `device wcbell` (held by user 1's main process) were refused by uid; it
@@ -37239,7 +37239,51 @@ holder and adoption, and is not implemented.
   run.
 * The harness's check that a user cannot open a port node itself used
   `head -c0`, which macOS rejects; the node modes above are the evidence.
-  Fixed for the next run.
+  Fixed before the safety rerun below.
+
+**Safety rerun, 3072 MiB VM, 2026-10-20 around 12:00-12:04.** Evidence is
+in `evidence/session-fixes/broker-mac/safe-rerun/`, outside git. The new broker
+was built after the no-timeout correction; no unsafe old baseline ran.
+
+* The corrected direct port-open probe and root-key read were refused.
+  The LaunchDaemon was root's, the ports 0600, the socket 0666 and the key
+  directory/key 0700/0600.
+* Five recorded main-process SIGKILL cycles each ended with host teardown,
+  the host release word and pool reclamation. Recursive panic-file counts
+  were four before and four after, and guest uptime continued throughout.
+  The harness used default foot settings and throwaway Linux HOME/XDG
+  state; Console ran on a private D-Bus session.
+* The root daemon held two orphan regions when SIGTERM arrived. A successful
+  root process-table snapshot observed its exit after 5210 ms, including SSH
+  observation overhead, and launchd reported a different live pid, 581 to
+  1265. Its log showed host release followed by `every region released;
+  exiting`. This replaces the original run's invalid 0.70 s assertion.
+* The 2000 Wayland round trips measured mean 3.240 ms, p50 1.231 ms,
+  p99 12.646 ms and maximum 1470.707 ms. The runtime ctypes/libwayland
+  fixture includes Python call overhead. This **fails** the 0.2 ms target;
+  it proves neither acceptable latency nor broker overhead relative to the
+  old unsafe baseline. Concurrent second-user sessions and fresh GPU timing
+  remain unproved by this rerun.
+* The successful VM run peaked at 4,423,475,200 bytes including QEMU/cache;
+  an earlier cold-start attempt peaked at 5,089,390,592 bytes before tests.
+  These observations include reclaimable cache, not only configured RAM. Cleanup
+  restored guest support/apps, host files and original unit arguments,
+  removed the test daemon/key, cleanly stopped the VM and restored its
+  original 4096 MiB configuration. The peer's `work` VM was untouched.
+
+**Restart ownership.** The restored older `mac-sessiond` exposed a separate
+isolation bug: startup adopted every active `wc-launch-*` unit, including
+unrelated `wcma-*`, `wcmb-*` and `wcmc-*` harness sessions with no known boot
+page. It then ran `down` for them. Restart state is now scoped by configured
+QMP path, VM hint, session script and key policy; each checkpoint carries that
+full owner description. Recovery requires a matching boot page in that VM
+and its configured MAC policy. A directory hash only names this state and is
+not trusted as authorization. Every managed session has a boot record, and
+ownership is checked again before teardown. Unowned/legacy global state is
+left untouched; failed host release retains the checkpoint for retry.
+Before upgrading the old service with live sessions, drain those sessions
+through their actual owner. Old global checkpoints cannot prove installation
+ownership and are not automatically migrated.
 
 #### 111.9.5 Limits
 
@@ -37834,3 +37878,56 @@ the shared-memory data path. Linux-only dependencies leave the other platform
 backends unchanged. Regression tests send a real forwarded socket through the
 broker protocol: mapped access receives a hub fd, unmapped access is refused,
 and forged uid or pid metadata never reaches the broker's incoming queue.
+
+## §114. Doorbell writer recovery
+
+A shared compositor outlives its installations. A failed doorbell write must
+therefore leave later hints usable. `DetachedWriter` consumes the next queued
+hint after a write error instead of ending its thread. Unix file and inherited
+fd endpoints use that writer too, so a full port cannot block a ring caller.
+`WC_BELL_INLINE=0` selects it for Linux sockets as well, allowing the local
+multi-install harness to exercise the guest's queued writer path.
+
+Windows overlapped writes wait at most 500 ms, then allow another 500 ms for
+cancellation. Each pipe retains at most 32 still-pending synchronous writes,
+including their event, record and buffer. Writes are capped at 64 KiB per call,
+so the pending buffers consume at most 2 MiB per pipe. A full quarantine refuses
+new writes before allocating or submitting anything. Later completions reclaim
+entries and permit new writes. Pending status, rather than a particular timeout
+code, determines ownership on every return. A pipe with pending writes retains
+its original raw handle and outstanding allocations on shutdown, avoiding a
+blocking close and preserving every kernel buffer. Reads use their independent
+completion wait and never acquire the write quarantine's mutex.
+
+The default Windows `AsyncWriter` issues hints without waiting. Each request
+has an address-stable allocation. The I/O manager publishes its pending status;
+an unexpected write error never clears that status or releases its buffer. Requests still pending after 500 ms move to a
+quarantine after cancellation, and fresh or completed allocations replace them
+in the active pool. Late completions permit reuse. The quarantine holds at most
+256 requests beyond the 32 active slots. If a driver stops completing every
+request, hints eventually return `WouldBlock`; the application thread still
+runs. Shutdown retains any allocation and port reference whose request remains
+pending rather than waiting indefinitely for a broken driver.
+
+Both writer implementations reserve from one process-wide budget before
+allocating a record, buffer or event. It permits at most 1024 records/slots and
+32 MiB of write buffers across live and deliberately retained allocations.
+AsyncWriter reserves its slots up front, leaving its ordinary write path free
+of budget operations. A retained allocation keeps its reservation forever, so
+constructing another Pipe or AsyncWriter cannot reset the safety cap. Full
+budgets refuse new allocations; existing owners can reclaim capacity after
+completion or normal destruction. Abandoned allocations have no background
+reaper and remain charged until process exit. Stuck handles are never closed to
+recover capacity. Each retained original handle has at least one charged record.
+
+The broker currently refuses a second device grant to the same process, opens
+ports exclusively and transfers handles with DUPLICATE_CLOSE_SOURCE. The budget
+does not rely on those restrictions: repeated wrappers or async writers still
+share the same limits.
+
+Tests cover a failed queued hint followed by a delivered hint, bounded repeated
+synchronous cancellation failures and handle retention during shutdown,
+repeated Pipe and AsyncWriter lifetimes sharing record and byte budgets,
+constructor rollback, and simulated Windows cancellations that never complete followed by a late completion. The
+simulation never submits the fabricated requests to a driver. Test evidence
+and guest measurements belong outside the repository.
