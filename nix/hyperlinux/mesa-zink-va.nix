@@ -1,18 +1,22 @@
-# Mesa with Zink's VA-API frontend (waycompose-design.md §112): video decode
-# through the forwarded GPU's Vulkan Video, offered to applications as VA-API,
-# which is the hardware decode path stock Firefox uses by default on Linux.
-#
-# Zink's frontend landed on Mesa main on 2026-10-16 (merge request 31517,
-# H.264 only so far) after 26.2 branched, so this is main (pinned below, after that merge) rather
-# than the release nixpkgs carries. No waycompose patch changes Mesa or Zink.
-# It is loaded per process
-# (__EGL_VENDOR_LIBRARY_FILENAMES, LIBGL_DRIVERS_PATH, LIBVA_DRIVERS_PATH) and
-# never installed as the system Mesa.
-#
-#   nix build --impure --expr '(builtins.getFlake "nixpkgs").legacyPackages
-#     .x86_64-linux.callPackage ./nix/mesa-zink-va.nix {}'
-{ mesa, fetchFromGitLab }:
-mesa.overrideAttrs (old: {
+# Unpatched upstream Mesa. Only Zink's Wayland/EGL and VA frontend are built;
+# the Linux Vulkan implementation is the separate ELF sv-icd package.
+{ mesa, fetchFromGitLab, lib,
+  meson, ninja, pkg-config, bison, flex, file, python3Packages, glslang,
+  wayland-scanner, patchelf, vulkan-loader }:
+let
+  base = mesa.override {
+    galliumDrivers = [ "zink" ];
+    vulkanDrivers = [];
+    vulkanLayers = [];
+    eglPlatforms = [ "wayland" ];
+    withValgrind = false;
+  };
+  unrelated = d: lib.any (p: lib.hasPrefix p (lib.getName d))
+    [ "clang" "llvm" "mesa-libclc" "spirv-llvm-translator" ];
+  omitFlag = f: lib.any (p: lib.hasPrefix p f) [ "-Dclang-libdir="
+    "-Dgallium-rusticl=" "-Dgallium-rusticl-enable-drivers=" "-Dteflon="
+    "-Dintel-rt=" "-Dmesa-clc=" "-Dprecomp-compiler=" ];
+in base.overrideAttrs (old: {
   pname = "mesa-zink-va";
   version = "26.3.0-devel-42c325ea";
   src = fetchFromGitLab {
@@ -22,15 +26,30 @@ mesa.overrideAttrs (old: {
     rev = "42c325ea02518276f08c5b44b487e37affc9fe69";
     hash = "sha256-R2WnUKhY6sg/tqGtA99DoClCOkQ3gwY1rxDVUcdFVbA=";
   };
-  # Two of nixpkgs' 26.2 flags main no longer takes as they are: the anti-lag
-  # layer is gone, and Venus's protocol headers became a meson subproject,
-  # which a sandboxed build cannot download (no GPU session uses Venus).
-  mesonFlags = map (
-    f:
-    if builtins.substring 0 16 f == "-Dvulkan-layers="
-    then "-Dvulkan-layers=device-select,intel-nullhw,overlay,screenshot"
-    else if builtins.substring 0 17 f == "-Dvulkan-drivers="
-    then builtins.replaceStrings [ ",virtio" ] [ "" ] f
-    else f
-  ) old.mesonFlags;
+  # nixpkgs patches OpenCL discovery. This package builds upstream Zink/VA only.
+  patches = [];
+  outputs = [ "out" ];
+  mesonFlags = builtins.filter (f: !omitFlag f) old.mesonFlags ++ [
+    "-Dgallium-va=enabled" "-Dgallium-rusticl=false" "-Dteflon=false"
+    "-Dintel-rt=disabled" "-Dllvm=disabled"
+  ];
+  buildInputs = builtins.filter (d: !unrelated d) old.buildInputs;
+  nativeBuildInputs = [ meson ninja pkg-config bison flex file patchelf
+    python3Packages.python python3Packages.packaging python3Packages.pycparser
+    python3Packages.mako python3Packages.ply python3Packages.pyyaml
+    (lib.getBin glslang) wayland-scanner ];
+  disallowedRequisites = [];
+  env = builtins.removeAttrs (old.env or {}) [ "MESON_PACKAGE_CACHE_DIR" ];
+  preConfigure = "";
+  postInstall = "";
+  postFixup = ''
+    for js in "$out"/share/glvnd/egl_vendor.d/*.json; do
+      substituteInPlace "$js" --replace-fail '"libEGL_' '"'"$out/lib/libEGL_"
+    done
+    rm -f "$out/lib/pkgconfig/dri.pc"
+    # Zink uses the unchanged guest Vulkan loader to reach the Linux ELF ICD.
+    for so in "$out"/lib/libgallium*.so; do
+      patchelf --add-rpath ${vulkan-loader}/lib "$so"
+    done
+  '';
 })
