@@ -2,9 +2,10 @@
 //!
 //! * **Who:** the pipe client's process id (`GetNamedPipeClientProcessId`)
 //!   and the user SID of its token (impersonating it for one query). The
-//!   process is then opened by that id and its own token's user must be the
-//!   same SID, so a pid reused in between is refused. SYSTEM is the only
-//!   admin.
+//!   process is opened once and its token must have the same SID. This
+//!   refuses cross-user PID reuse, but does not independently distinguish
+//!   same-SID PID reuse from the original pipe peer. Mapping and retirement
+//!   retain the same target process object. SYSTEM is the only admin.
 //! * **Liveness:** the process handle, waited on by the thread pool
 //!   (`RegisterWaitForSingleObject`); its exit is told once.
 //! * **Handles:** `DuplicateHandle` into the client's process; their values
@@ -22,6 +23,9 @@ pub mod ident;
 pub mod pipe;
 pub mod service;
 mod readiness;
+pub mod retirement;
+pub mod protected_range;
+pub mod service_identity;
 
 use crate::core::{ObjId, Peer, Pid, RegionInfo, User};
 use crate::server::{Give, Platform};
@@ -161,6 +165,45 @@ impl io::Read for Conn {
 pub struct Writer {
     pipe: Arc<ServerPipe>,
     process: Arc<Owned>,
+    user: User,
+}
+
+impl Writer {
+    /// Register an authenticated producer in a trusted allocation namespace.
+    /// The registration is never derived from shared directory words or PID
+    /// fields supplied by a client. The watch retains this writer's exact
+    /// process object even when the pipe and writer are dropped.
+    pub fn register_bar_process(
+        &self,
+        allocator: Arc<Mutex<crate::bar_control::Allocator>>,
+    ) -> io::Result<crate::bar_control::Process> {
+        let process = allocator.lock().unwrap_or_else(|e| e.into_inner())
+            .register_process(self.user.clone())?;
+        let on_death = Arc::clone(&allocator);
+        if let Err(error) = self.on_producer_death(move |_proof| {
+            // SAFETY: the non-forgeable certificate is constructed only after
+            // this exact retained process object is kernel-confirmed dead.
+            unsafe {
+                on_death.lock().unwrap_or_else(|e| e.into_inner()).process_dead(process);
+            }
+        }) {
+            allocator.lock().unwrap_or_else(|e| e.into_inner())
+                .cancel_unused_registration(process)?;
+            return Err(error);
+        }
+        Ok(process)
+    }
+
+    /// Register retirement against this connection's retained mapping-target
+    /// kernel process object. Pipe close, PID reuse and DLL teardown do not
+    /// trigger retirement. Capture the broker's trusted allocation record in
+    /// `retire`; shared BAR metadata is not an ownership authority.
+    pub fn on_producer_death(
+        &self,
+        retire: impl FnOnce(retirement::ProducerDeath) + Send + 'static,
+    ) -> io::Result<()> {
+        retirement::watch(Arc::clone(&self.process), Box::new(retire))
+    }
 }
 
 pub struct Windows {
@@ -168,6 +211,8 @@ pub struct Windows {
     devices: Vec<DeviceAt>,
     large_pages: bool,
     raw_device_paths: Option<BTreeMap<String, String>>,
+    protected_bar_mode: bool,
+    protected_bars: BTreeMap<String, Arc<protected_range::Device>>,
     region_init: Option<RegionInit>,
     holder: Option<Arc<holder::Link>>,
     /// Process handles opened at accept, for `watch`: the process the pid
@@ -184,6 +229,8 @@ impl Windows {
             devices,
             large_pages,
             raw_device_paths: None,
+            protected_bar_mode: false,
+            protected_bars: BTreeMap::new(),
             region_init: None,
             holder: None,
             opened: Arc::default(),
@@ -195,6 +242,30 @@ impl Windows {
     pub fn with_raw_device_paths(mut self, paths: BTreeMap<String, String>) -> Self {
         self.raw_device_paths = Some(paths);
         self
+    }
+
+    /// Reserve every BAR/path lending route before protected initialization.
+    /// A failed capability query never re-enables the legacy lending path.
+    /// This alone does not activate a pool or authorize client mappings.
+    pub fn reserve_bars_for_protected_mode(mut self) -> Self {
+        self.protected_bar_mode = true;
+        self
+    }
+
+    /// Retain the original service-owned protected device. Only service code
+    /// can use it; no request returns its raw HANDLE to a desktop process.
+    pub fn with_protected_bar(mut self, name: &str,
+        device: Arc<protected_range::Device>) -> io::Result<Self> {
+        if !self.protected_bar_mode || self.protected_bars.contains_key(name)
+            || !self.devices.iter().any(|d| d.name == name && matches!(d.loc, DeviceLoc::IvshmemSlot(_))) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "invalid protected BAR registration"));
+        }
+        self.protected_bars.insert(name.to_string(), device);
+        Ok(self)
+    }
+
+    pub fn protected_bar(&self, name: &str) -> Option<&Arc<protected_range::Device>> {
+        self.protected_bars.get(name)
     }
 
     /// Run `f` on every new region (§108.8's stamp plugs in here).
@@ -222,7 +293,11 @@ impl Windows {
 
     fn identify(&self, pipe: &ServerPipe) -> io::Result<(Peer, Arc<Owned>)> {
         let (pid, sid) = ident::pipe_client(pipe.handle)?;
-        let process = Arc::new(ident::open_process_checked(pid, &sid)?);
+        let process = Arc::new(if self.protected_bar_mode {
+            ident::open_protected_process_checked(pid, &sid)?
+        } else {
+            ident::open_process_checked(pid, &sid)?
+        });
         let admin = sid == ident::SYSTEM_SID;
         Ok((Peer { pid, user: User::sid(&sid), admin }, process))
     }
@@ -286,6 +361,33 @@ fn reap() {
     }
 }
 
+/// Retain the exact process object rather than reopening a process by PID.
+fn watch_process(process: Arc<Owned>, exited: Box<dyn FnOnce() + Send>) -> bool {
+    let w = Box::into_raw(Box::new(Watch {
+        exited: Mutex::new(Some(exited)),
+        process,
+        wait: Mutex::new(std::ptr::null_mut()),
+    }));
+    // SAFETY: `w` is live until reaped.
+    let wref = unsafe { &*w };
+    // The wait handle is stored before the callback can read it: the
+    // callback does not read it, and `reap` takes this lock.
+    let mut slot = wref.wait.lock().unwrap_or_else(|e| e.into_inner());
+    let mut wait: HANDLE = std::ptr::null_mut();
+    // SAFETY: a live process handle (kept by the Watch) and context.
+    let ok = unsafe {
+        RegisterWaitForSingleObject(&mut wait, wref.process.0, Some(on_exit), w.cast(), INFINITE, WT_EXECUTEONLYONCE)
+    };
+    if ok == 0 {
+        drop(slot);
+        // SAFETY: never registered; freed here once.
+        drop(unsafe { Box::from_raw(w) });
+        return false;
+    }
+    *slot = wait;
+    true
+}
+
 impl Platform for Windows {
     type Conn = Conn;
     type Writer = Writer;
@@ -302,7 +404,7 @@ impl Platform for Windows {
             }
         };
         self.opened.lock().unwrap_or_else(|e| e.into_inner()).insert(peer.pid, Arc::clone(&process));
-        Ok((Conn(Arc::clone(&pipe)), Writer { pipe, process }, peer))
+        Ok((Conn(Arc::clone(&pipe)), Writer { pipe, process, user: peer.user.clone() }, peer))
     }
 
     fn watch(&self, pid: Pid, exited: Box<dyn FnOnce() + Send>) -> bool {
@@ -322,29 +424,7 @@ impl Platform for Windows {
             }
             exited();
         });
-        let w = Box::into_raw(Box::new(Watch {
-            exited: Mutex::new(Some(exited)),
-            process,
-            wait: Mutex::new(std::ptr::null_mut()),
-        }));
-        // SAFETY: `w` is live until reaped.
-        let wref = unsafe { &*w };
-        // The wait handle is stored before the callback can read it: the
-        // callback does not read it, and `reap` takes this lock.
-        let mut slot = wref.wait.lock().unwrap_or_else(|e| e.into_inner());
-        let mut wait: HANDLE = std::ptr::null_mut();
-        // SAFETY: a live process handle (kept by the Watch) and context.
-        let ok = unsafe {
-            RegisterWaitForSingleObject(&mut wait, wref.process.0, Some(on_exit), w.cast(), INFINITE, WT_EXECUTEONLYONCE)
-        };
-        if ok == 0 {
-            drop(slot);
-            // SAFETY: never registered; freed here once.
-            drop(unsafe { Box::from_raw(w) });
-            return false;
-        }
-        *slot = wait;
-        true
+        watch_process(process, exited)
     }
 
     fn open_device(&self, name: &str) -> io::Result<Object> {
@@ -353,6 +433,10 @@ impl Platform for Windows {
             .iter()
             .find(|d| d.name == name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("device {name} has no location here")))?;
+        if self.protected_bar_mode && !matches!(d.loc, DeviceLoc::Port(_)) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "protected mode never lends a raw BAR or path alias"));
+        }
         let h = match &d.loc {
             DeviceLoc::IvshmemSlot(s) => match &self.raw_device_paths {
                 Some(paths) => {
@@ -523,6 +607,24 @@ impl Platform for Windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_mode_refuses_raw_bar_and_path_alias_lending() {
+        let path = format!(r"\\.\pipe\wc-protected-denial-{}", std::process::id());
+        let devices = vec![
+            DeviceAt { name: "arena".into(), loc: DeviceLoc::IvshmemSlot(0x1c) },
+            DeviceAt { name: "alias".into(), loc: DeviceLoc::Path("must-never-be-opened".into()) },
+        ];
+        let platform = Windows::bind(&path, PIPE_SDDL, devices).unwrap()
+            .reserve_bars_for_protected_mode();
+        for name in ["arena", "alias"] {
+            let error = match platform.open_device(name) {
+                Err(error) => error,
+                Ok(_) => panic!("protected mode lent a raw device"),
+            };
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
 
     #[test]
     fn a_device_location_parses_from_its_three_spellings() {
