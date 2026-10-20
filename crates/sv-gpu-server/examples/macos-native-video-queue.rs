@@ -4,7 +4,9 @@ fn main() {
     let cancel_waits = std::env::args().any(|a| a == "--cancel-waits");
     let sync2 = std::env::args().any(|a| a == "--sync2");
     let wire_recording = std::env::args().any(|a| a == "--wire-recording");
-    let result = if std::env::args().any(|a| a == "--advanced-pcm") {
+    let result = if std::env::args().any(|a| a == "--mutable-nv12-views") {
+        sv_gpu_server::native_video_queue_fixture::run_mutable_views()
+    } else if std::env::args().any(|a| a == "--advanced-pcm") {
         sv_gpu_server::native_video_queue_fixture::run_advanced(sync2)
     } else if cancel_waits {
         sv_gpu_server::native_video_queue_fixture::run_cancel_waits(sync2)

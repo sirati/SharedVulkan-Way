@@ -27,6 +27,12 @@ mod cancellation;
 mod event_prefix;
 #[path = "native_video_mixed_fixture.rs"]
 mod mixed_compute;
+#[path = "native_video_mutable_fixture.rs"]
+mod mutable_views;
+
+pub fn run_mutable_views() -> Result<(), String> {
+    mutable_views::run()
+}
 #[path = "native_video_normal_fixture.rs"]
 mod normal;
 #[path = "native_video_queue_wire_fixture.rs"]
