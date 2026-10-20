@@ -61,6 +61,24 @@ int hl_bpf_validate(const hl_sock_filter *p, size_t n) {
         if (!valid || a >= n || b >= n) { valid = 0; break; }
         if (reachable) { merge(mask, a, m); merge(mask, b, m); }
     }
+    /* Linux checks scratch initialization in linear instruction order, even
+     * following RET. Match that additional acceptance constraint for dead code. */
+    if (valid) {
+        for (size_t i=0;i<n;++i) mask[i]=0xffffU;
+        uint32_t m=0;
+        for (size_t i=0;i<n;++i) {
+            const hl_sock_filter *s=&p[i];
+            m &= mask[i];
+            if (s->code==0x02 || s->code==0x03) m |= 1U<<s->k;
+            else if (s->code==0x60 || s->code==0x61) {
+                if (!(m & (1U<<s->k))) { valid=0; break; }
+            } else if (s->code==0x05) {
+                mask[i+1+s->k] &= m; m=0xffffU;
+            } else if ((s->code & 7)==5) {
+                mask[i+1+s->jt] &= m; mask[i+1+s->jf] &= m; m=0xffffU;
+            }
+        }
+    }
     free(mask);
     return valid ? 0 : -1;
 }

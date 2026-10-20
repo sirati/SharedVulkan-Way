@@ -63,6 +63,8 @@ int main(void) {
     failed+=check(initialized,3,1);
     hl_sock_filter backwards[]={I(0x05,0xffffffffU),I(0x06,SECCOMP_RET_ALLOW)};
     failed+=check(backwards,2,0);
+    hl_sock_filter dead_scratch[]={I(0x06,SECCOMP_RET_ALLOW),I(0x60,0),I(0x06,SECCOMP_RET_ALLOW)};
+    failed+=check(dead_scratch,3,0);
     hl_sock_filter divzero[]={I(0x34,0),I(0x06,SECCOMP_RET_ALLOW)};
     failed+=check(divzero,2,0);
     hl_sock_filter shift[]={I(0x64,32),I(0x06,SECCOMP_RET_ALLOW)};
@@ -73,6 +75,6 @@ int main(void) {
     for (unsigned i=0;i<sizeof(ops)/sizeof(*ops);++i)
         for(unsigned j=0;j<sizeof(values)/sizeof(*values);++j)
             failed+=arithmetic(ops[i],values[j],0xf1234567U+j);
-    puts(failed ? "seccomp BPF reference FAILED" : "seccomp BPF reference passed: 9 verifier and 114 arithmetic cases");
+    puts(failed ? "seccomp BPF reference FAILED" : "seccomp BPF reference passed: 10 verifier and 114 arithmetic cases");
     return failed ? 1 : 0;
 }
