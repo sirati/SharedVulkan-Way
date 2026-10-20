@@ -217,6 +217,10 @@ impl PlaneTextures {
 impl Picture {
     /// Copy a completed decoder picture into this already imported allocation.
     /// This preserves the bound VkImage and never maps or reads pixel bytes.
+    /// It copies raw NV12 values without range conversion. Target storage can
+    /// predate stream discovery; retain the source's range/color attachments
+    /// and use the stream's Vulkan YCbCr conversion, not the target's allocation
+    /// fourcc, to interpret the copied values.
     ///
     /// # Safety
     /// The caller must retire every earlier GPU/display reader of `self`, hold
@@ -226,9 +230,8 @@ impl Picture {
     /// as a completed decode. Both pictures remain retained through completion.
     pub unsafe fn copy_from_gpu(self: &Arc<Self>, source: &Arc<Self>) -> Result<(), String> {
         if self.surface == source.surface { return Ok(()); }
-        if self.layout.width != source.layout.width || self.layout.height != source.layout.height
-            || self.range != source.range {
-            return Err("decoded picture and bound target dimensions/range differ".into());
+        if self.layout.width != source.layout.width || self.layout.height != source.layout.height {
+            return Err("decoded picture and bound target dimensions differ".into());
         }
         // Pitch and offsets may differ. Metal copies actual plane texels, not
         // inferred NV12 byte ranges, after each picture validated its layout.
