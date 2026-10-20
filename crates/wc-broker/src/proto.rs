@@ -48,6 +48,8 @@ pub enum Request {
     Connect { name: String },
     Sign(SignReq),
     Subscribe,
+    Owner,
+    ObserveOwner { run: u64, connection: u64, pid: u32 },
     Stats,
 }
 
@@ -157,6 +159,12 @@ impl Request {
                     seq: num(10)?,
                 })
             }
+            "owner" => { arity(1)?; Request::Owner }
+            "observe-owner" => {
+                arity(4)?;
+                Request::ObserveOwner { run: num(1)?, connection: num(2)?,
+                    pid: u32::try_from(num(3)?).map_err(|_| "owner PID too large")? }
+            }
             "subscribe" => {
                 arity(1)?;
                 Request::Subscribe
@@ -194,6 +202,8 @@ impl Request {
                 u8::from(s.gpu),
                 s.seq
             ),
+            Request::Owner => "owner".into(),
+            Request::ObserveOwner { run, connection, pid } => format!("observe-owner {run} {connection} {pid}"),
             Request::Subscribe => "subscribe".into(),
             Request::Stats => "stats".into(),
         }
@@ -304,6 +314,8 @@ mod tests {
                 gpu: true,
                 seq: 12,
             }),
+            Request::Owner,
+            Request::ObserveOwner { run: 7, connection: 123, pid: 456 },
             Request::Subscribe,
             Request::Stats,
         ] {

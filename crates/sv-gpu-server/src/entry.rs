@@ -879,11 +879,16 @@ pub fn run_main(_argv: Vec<String>) -> std::process::ExitCode {
 pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
     let r = match argv.get(1).map(String::as_str) {
         Some("guest" | "mem-guest") => mem_guest(&argv),
+        // §103.19: a Mac hosting the Linux VM serves every GPU session from
+        // one pool in a tagged POSIX shm object both sides map through
+        // virtio-fs DAX, using the same pool loop as Linux.
+        Some("pool-guest") => linux_pool_guest(&argv),
         Some("probe") => mac_probe(&argv),
         _ => {
             eprintln!(
                 "usage:\n  \
                  sv-gpu-server guest [--label NAME] [--region FILE] [--device N] [--arena BYTES] [--idle SECS] [--cold-wait SECS] [--bell SPEC]\n  \
+                 sv-gpu-server pool-guest --pool-file FILE [--device N] [--sessions N] [--idle SECS] [--bell SPEC]\n  \
                  sv-gpu-server probe [--device N]"
             );
             Err("no subcommand".into())
@@ -1198,6 +1203,12 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if mode == "mem-guest" {
         return mem_guest(&args);
     }
+    if mode == "pool-host" {
+        if arg("--grow-ram").is_some() || arg("--port").is_some() {
+            return Err("pool-host serves a fixed shared BAR through pool mailboxes; --grow-ram and --port are unsupported".into());
+        }
+        return linux_pool_guest(&args);
+    }
     if mode == "pool-guest" {
         return linux_pool_guest(&args);
     }
@@ -1236,7 +1247,7 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage: sv-gpu-server <serve|attach|guest|pool-guest|mem-guest> --socket <path> \
+                "usage: sv-gpu-server <serve|attach|guest|pool-guest|pool-host|mem-guest> --socket <path> \
                  [--device N] [--arena BYTES] [--clients N] [--slots N] [--pool BYTES] [--huge] [--bell PORT]"
             );
             Err("no subcommand".into())
@@ -1893,7 +1904,7 @@ pub fn report_missing_pub(fns: &sv_gpu_entry::DriverFns) {
 }
 
 /// The settings both pool entries take.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn pool_serve_args(args: &[String]) -> Result<sv_gpu_server::pool_guest::PoolServe, Box<dyn std::error::Error>> {
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
@@ -2001,7 +2012,7 @@ fn claim_singleton(name: &str) -> Result<(), String> {
 /// sv-gpu-server pool-guest --pool-file <path> [--device N] [--bell socket:PATH]
 ///                          [--sessions N] [--idle SECS] [--port <tcp>: debug only]
 /// ```
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::fd::AsFd;
     use std::sync::Arc;
@@ -2010,13 +2021,15 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let cfg = pool_serve_args(args)?;
     let path = arg("--pool-file").ok_or("--pool-file is required")?;
-    let f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+    // §103.19: on the Mac a tagged file is the shared memory object it names.
+    let f = sv_transport::region::open_shared(&path)?;
     let len = f.metadata()?.len();
     let boot = Arc::new(sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)?);
     eprintln!("[gpu] pool file {path}: {} MiB, the pool's region 0", len >> 20);
     // §108: `--grow-ram FILE` (or `memfd:MIB`, which the broker can make
     // udmabufs of) stands in for the Windows guest's RAM;
     // regions are scattered 2 MiB units of it, located by the host's probe.
+    #[cfg(target_os = "linux")]
     let grow = match arg("--grow-ram") {
         None => None,
         Some(ram) => {
@@ -2029,6 +2042,13 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }),
             })
         }
+    };
+    #[cfg(target_os = "macos")]
+    let grow = {
+        if arg("--grow-ram").is_some() {
+            return Err("--grow-ram is a Linux-only guest-RAM simulation option".into());
+        }
+        None
     };
     Ok(sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"), grow)?)
 }

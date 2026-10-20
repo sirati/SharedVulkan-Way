@@ -16,8 +16,8 @@
 #   wc-compositor.exe   under Wine on an Xvfb, as scripts/sv-firefox-wayland.sh
 #                       runs it: the Windows compositor, with real window
 #                       messages, real `ClipCursor` and real raw input
-#   wc-proxy            the game's Wayland server: `wl_shm` and nothing that
-#                       carries a descriptor, every buffer into an arena
+#   wc-proxy            the game's Wayland server: shared-memory buffers and
+#                       native dma-buf imports through the forwarded render node
 #   sv-gpu-server       the GPU side, on this machine's AMD iGPU (RADV) and
 #                       nothing else: the loader is only ever shown radeon_icd
 #   the game            Minecraft 1.21.11 in **demo mode**, a native Wayland
@@ -38,6 +38,9 @@
 #
 # ENVIRONMENT
 #
+#   SVMC_NODE      render node for the native dma-buf path, defaults to AMD
+#   SVMC_PCI       forwarded PCI ids for a CUSE node, VVVV:DDDD
+#   SVMC_MESA      upstream Mesa build, defaults to nix/mesa-zink-va.nix
 #   SVMC_DATA      where Prism's data dir and the captures live  (/tmp/svmc)
 #   SVMC_VALIDATE  1: VK_LAYER_KHRONOS_validation on the GPU side, VUIDs counted
 #   SVMC_VSYNC     1 to leave the game's vsync on (default off, to measure FPS)
@@ -46,6 +49,7 @@
 #   SVMC_MEM       the game's memory cap (6G); the heap is Prism's 3 GiB
 #   SVMC_GPU_ARENA_MIB  the GPU side's arena (512); the guest gives a session 64 or 240
 #   SVMC_GPU_POOL_MIB   lease from one pool of this size instead, as the guest does (§97)
+#   SVMC_GPU_MODE       serve (exported arena) or pool (shared host-memory fixture)
 . "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
@@ -67,7 +71,7 @@ die() { echo "FAIL: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "$1 is missing; run this inside 'nix develop'"; }
 
 # nixpkgs, from the registry, so the Prism here is the one deployed to the host.
-nixpath() { nix build --no-link --print-out-paths "nixpkgs#$1" 2>/dev/null | head -1; }
+nixpath() { nix build --max-jobs 2 --cores 8 --no-link --print-out-paths "nixpkgs#$1" 2>/dev/null | head -1; }
 PRISM=$(nixpath prismlauncher) || true
 JDK=$(nixpath jdk21) || true
 XDOTOOL=$(nixpath xdotool) || true
@@ -76,12 +80,34 @@ GLFW=$(nixpath glfw3-minecraft) || true
   && [ -e "$GLFW/lib/libglfw.so.3" ] || die "could not fetch prismlauncher, jdk21, xdotool and glfw3-minecraft"
 export PATH="$XDOTOOL/bin:$PATH"
 
+# Resolve every optional package while the caller still holds its build lock.
+# The runtime has no Nix builds and closes the lock fd before spawning children.
+MC_MESA=${SVMC_MESA:-}
+MC_VVL=""
+MC_PYTHON=""
+if [ "$CMD" = run ]; then
+  MC_PYTHON=$(nixpath python3)
+  if [ -z "$MC_MESA" ]; then
+    MC_MESA=$(nix build --max-jobs 2 --cores 8 --no-link --print-out-paths --impure --expr \
+      "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-zink-va.nix {}" 2>/dev/null | head -1)
+  fi
+  [ -n "$MC_MESA" ] || die "could not build nix/mesa-zink-va.nix"
+  if [ "${SVMC_VALIDATE:-0}" = 1 ] || [ "${SVMC_APP_VALIDATE:-0}" = 1 ]; then
+    MC_VVL=$(nixpath vulkan-validation-layers)
+  fi
+fi
+
+
 KIDS=()
+MC_POOL_FILE=""
 cleanup() {
   kill "${KIDS[@]}" 2>/dev/null
   [ -n "${WINEPREFIX:-}" ] && WINEPREFIX="$WINEPREFIX" wineserver -k 2>/dev/null
+  [ -n "$MC_POOL_FILE" ] && rm -f "$MC_POOL_FILE"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # A display of our own. A display number is a shared identity on this machine
 # (firefox-accel.md, "The Wayland WSI", §6), and **`-displayfd` is not enough
@@ -178,7 +204,7 @@ EOF
   # automated — the device-code flow started on its own, polled
   # login.microsoftonline.com and tried to open a browser — and nothing was
   # entered anywhere, but "nothing was entered" is not a property to rely on.
-  mkdir -p "$run/nobrowser"
+  mkdir -p "$run/nobrowser" "$run/home" "$run/config" "$run/data" "$run/state" "$run/cache"
   printf '#!/bin/sh\necho "refused: $0 $*" >>"%s/nobrowser/log"\nexit 1\n' "$run" >"$run/nobrowser/xdg-open"
   chmod +x "$run/nobrowser/xdg-open"
   for b in firefox chromium google-chrome sensible-browser www-browser; do
@@ -194,7 +220,9 @@ EOF
     # driver at all, so VulkanMod's first start fails cleanly after the
     # download rather than finding the workstation's NVIDIA card.
     systemd-run --user --scope --quiet -p MemoryMax="${SVMC_MEM:-6G}" \
-      env DISPLAY=":$XN" QT_QPA_PLATFORM=xcb WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 \
+      env HOME="$run/home" XDG_CONFIG_HOME="$run/config" XDG_DATA_HOME="$run/data" \
+      XDG_STATE_HOME="$run/state" XDG_CACHE_HOME="$run/cache" \
+      DISPLAY=":$XN" QT_QPA_PLATFORM=xcb WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 \
       __GLX_VENDOR_LIBRARY_NAME=mesa VK_DRIVER_FILES=/nonexistent.json \
       PATH="$run/nobrowser:$PATH" BROWSER="$run/nobrowser/xdg-open" \
       DBUS_SESSION_BUS_ADDRESS=disabled: \
@@ -263,15 +291,40 @@ kill_game() {
 # --------------------------------------------------------------------- run ---
 run() {
   local inst=$1 secs=${2:-150}
+  # All package and Mesa builds above are complete. Runtime children must not
+  # retain cg's inherited exclusive build lock after this run ends.
+  exec 9>&-
+
   need wine; need magick; need xwd
   [ -s "$CAP/$inst/stdin" ] || die "no recorded launch for $inst; run '$0 setup' first"
   local BIN=$ROOT/target/release WINBIN=${SVMC_WINBIN:-$ROOT/target/x86_64-pc-windows-gnu/debug}
   [ -x "$BIN/sv-gpu-server" ] && [ -x "$BIN/wc-proxy" ] && [ -f "$BIN/sv_icd.json" ] \
     && [ -x "$WINBIN/wc-compositor.exe" ] \
     || die "build first: cargo build --release -p sv-icd -p sv-gpu-server -p wc-proxy; cargo build --target x86_64-pc-windows-gnu -p wc-compositor"
+  [ -x "$BIN/sv-drm" ] || die "build sv-drm for the native render-node test"
+  local RENDER_NODE=${SVMC_NODE:-} n
+  if [ -z "$RENDER_NODE" ]; then
+    for n in /sys/class/drm/renderD*; do
+      [ "$(cat "$n/device/vendor" 2>/dev/null)" = 0x1002 ] && { RENDER_NODE=/dev/dri/${n##*/}; break; }
+    done
+  fi
+  [ -c "$RENDER_NODE" ] || die "no render node; set SVMC_NODE"
+  local PCI=${SVMC_PCI:-} minor=${RENDER_NODE##*renderD} vendor device
+  if [ -z "$PCI" ]; then
+    vendor=$(cat "/sys/class/drm/renderD$minor/device/vendor" 2>/dev/null)
+    device=$(cat "/sys/class/drm/renderD$minor/device/device" 2>/dev/null)
+    [ -n "$vendor" ] && [ -n "$device" ] && PCI="${vendor#0x}:${device#0x}"
+  fi
+  [[ "$PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] || die "need SVMC_PCI for the forwarded GPU"
+  local -a NS=("$BIN/sv-drm" ns --dev "$(stat -c '%Hr:%Lr' "$RENDER_NODE")" --minor "$minor" --pci "$PCI")
+  for n in /sys/class/drm/renderD* /sys/class/drm/card[0-9]; do
+    [ "$(cat "$n/device/vendor" 2>/dev/null)" = 0x10de ] && NS+=(--hide "/dev/dri/${n##*/}")
+  done
+  NS+=(--)
   local RUN; RUN=$(mktemp -d "$DATA/run-$inst-XXXX")
   local GAMEDIR; GAMEDIR=$(cat "$CAP/$inst/cwd")
-  mkdir -p "$RUN/xdg" "$RUN/keymaps" "$RUN/trace"; chmod 700 "$RUN/xdg"
+  mkdir -p "$RUN/xdg" "$RUN/keymaps" "$RUN/trace" "$RUN/home" "$RUN/config" "$RUN/data" "$RUN/state" "$RUN/cache"
+  chmod 700 "$RUN/xdg"
   say "run $inst for $secs s in $RUN"
 
   # The game's options: no accessibility onboarding, no pause when the window
@@ -314,8 +367,11 @@ run() {
     [ -n "$NODE" ] && break; sleep 0.2
   done
   [ -n "$NODE" ] || die "wc-compositor.exe never listened; see $RUN/wine.log"
+  # Wine prefixes can exceed the Unix socket pathname limit.
+  ln -s "$NODE" "$RUN/compositor.sock"
+  NODE="$RUN/compositor.sock"
   SV_ALLOW_FILE_ARENA=1 WC_FRAME_TRACE="$RUN/trace/%p.txt" "$BIN/wc-proxy" --upstream "$NODE" \
-    --socket svmc --runtime-dir "$RUN/xdg" --copy damage \
+    --socket svmc --runtime-dir "$RUN/xdg" --copy damage --dmabuf-node "$RENDER_NODE" \
     --transport arena --arena-path "$RUN/wc-arena" --arena-id 0 --arena-size "$WCARENA" \
     --accept-timeout 120 --timeout $((secs + 300)) >"$RUN/proxy.log" 2>&1 &
   KIDS+=($!)
@@ -325,10 +381,21 @@ run() {
   local GPU_ICD=${SVMC_GPU_ICD:-${SV_MESA:-/run/opengl-driver}/share/vulkan/icd.d/radeon_icd.x86_64.json}
   local -a GPU_ENV=(VK_DRIVER_FILES="$GPU_ICD")
   if [ "${SVMC_VALIDATE:-0}" = 1 ]; then
-    local VVL; VVL=$(nixpath vulkan-validation-layers)
+    local VVL=$MC_VVL
     GPU_ENV+=(VK_LAYER_PATH="$VVL/share/vulkan/explicit_layer.d" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
   fi
-  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 --arena $(( ${SVMC_GPU_ARENA_MIB:-512} << 20 )) ${SVMC_GPU_POOL_MIB:+--pool $(( SVMC_GPU_POOL_MIB << 20 ))} \
+  local -a GPU_ARGS=(serve --clients 16 --arena $(( ${SVMC_GPU_ARENA_MIB:-512} << 20 )))
+  local PORT=$((30000 + RANDOM % 20000))
+  if [ "${SVMC_GPU_MODE:-serve}" = pool ]; then
+    need socat
+    [ -x "$BIN/sv-hostd" ] || die "build sv-hostd for the pool fixture"
+    MC_POOL_FILE=/dev/shm/svmc-$$-gpu
+    truncate -s "$(( ${SVMC_GPU_POOL_MIB:-1024} << 20 ))" "$MC_POOL_FILE"
+    GPU_ARGS=(pool-guest --pool-file "$MC_POOL_FILE" --port "$PORT" --sessions 8)
+  elif [ -n "${SVMC_GPU_POOL_MIB:-}" ]; then
+    GPU_ARGS+=(--pool "$(( SVMC_GPU_POOL_MIB << 20 ))")
+  fi
+  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" "${GPU_ARGS[@]}" \
       --socket "$RUN/gpu.sock" --idle $((secs + 120)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" -v keep="${SVMC_KEEP_PIPELINE_TRACE:-0}" -v keepf="$RUN/gpu-pipelines.txt" '
@@ -344,28 +411,36 @@ run() {
         /^\[blob\]/ { next }
         { print; fflush() }' >"$RUN/gpu.log" &
   KIDS+=($!)
+  if [ "${SVMC_GPU_MODE:-serve}" = pool ]; then
+    for _ in $(seq 1 100); do grep -q "publishing the extent" "$RUN/gpu.log" && break; sleep 0.1; done
+    grep -q "publishing the extent" "$RUN/gpu.log" || die "pool GPU side never published its extent"
+    socat "UNIX-LISTEN:$RUN/cold.sock,fork,reuseaddr" "TCP:127.0.0.1:$PORT" >"$RUN/socat.log" 2>&1 &
+    KIDS+=($!)
+    "$BIN/sv-hostd" ivshmem-serve --region "$MC_POOL_FILE" --cold "$RUN/cold.sock" \
+      --socket "$RUN/gpu.sock" >"$RUN/hostd.log" 2>&1 &
+    KIDS+=($!)
+  fi
   for _ in $(seq 1 80); do [ -S "$RUN/gpu.sock" ] && [ -S "$RUN/xdg/svmc" ] && break; sleep 0.25; done
   [ -S "$RUN/gpu.sock" ] || die "the GPU side never listened; see $RUN/gpu.log"
   [ -S "$RUN/xdg/svmc" ] || die "wc-proxy never listened; see $RUN/proxy.log"
   KIDS+=($(cat "$RUN/gpu.pid"))
 
   # ---- the game, as Prism launched it, with the session's environment
-  local KM; KM=$(nix build --no-link --print-out-paths --impure --expr \
-    "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-kopper-wayland.nix {}" \
-    2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
-  [ -n "$KM" ] || die "could not build nix/mesa-kopper-wayland.nix"
+  local KM=$MC_MESA
   local LDP; LDP=$(sed -n 's/^LD_LIBRARY_PATH=//p' "$CAP/$inst/env")
   local -a GAME_ENV=(
-    XDG_RUNTIME_DIR="$RUN/xdg" WAYLAND_DISPLAY=svmc
+    HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/config" XDG_DATA_HOME="$RUN/data"
+    XDG_STATE_HOME="$RUN/state" XDG_CACHE_HOME="$RUN/cache"
+    XDG_RUNTIME_DIR="$RUN/xdg" WAYLAND_DISPLAY=svmc SV_DRM_NODE="$RENDER_NODE"
     # Our ICD, and only ours.
     VK_DRIVER_FILES="$BIN/sv_icd.json" SV_SOCKET="$RUN/gpu.sock"
     # Prism's own library path (OpenAL, GLFW, the Vulkan loader, libglvnd).
     LD_LIBRARY_PATH="$LDP"
-    # GL: Mesa's EGL from the patched Mesa, and Zink, through kopper with no
-    # DRM device (docs/design.md §0.28) — what gpu.env sets for Firefox.
+    # Stock upstream Mesa reaches Zink through the native DRM device.
     __GLX_VENDOR_LIBRARY_NAME=mesa
     __EGL_VENDOR_LIBRARY_FILENAMES="$KM/share/glvnd/egl_vendor.d/50_mesa.json"
-    MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=1
+    LIBGL_DRIVERS_PATH="$KM/lib/dri" GBM_BACKENDS_PATH="$KM/lib/gbm"
+    MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink
     WC_FRAME_TRACE="$RUN/trace/%p.txt"
   )
   if [ "${SVMC_SOUND:-0}" = 1 ] && [ -S "/run/user/$(id -u)/pulse/native" ]; then
@@ -377,7 +452,7 @@ run() {
   # GPU side's layer sees what the driver was handed. A VUID in both is the
   # application's; one only on the GPU side is ours.
   if [ "${SVMC_APP_VALIDATE:-0}" = 1 ]; then
-    local AVVL; AVVL=$(nixpath vulkan-validation-layers)
+    local AVVL=$MC_VVL
     GAME_ENV+=(VK_LAYER_PATH="$AVVL/share/vulkan/explicit_layer.d" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
   fi
   # `SVMC_GAME_ENV`: extra `NAME=value` words for the game alone (`SV_DEBUG=1`,
@@ -386,18 +461,12 @@ run() {
   GAME_ENV+=("${EXTRA_ENV[@]}")
   local ARGS=()
   [ -d "$GAMEDIR/saves/Demo_World" ] && ARGS=(--quickPlaySingleplayer Demo_World)
-  # **No `/dev/dri` for the game.** Mesa's EGL probes every DRM device it
-  # can open before it settles on the kopper path, and on this workstation the
-  # first one is the NVIDIA card other people's jobs run on (`pci id for fd
-  # 16: 10de:2b85`). It found no driver and let go, but the harness must not
-  # open that device at all; an empty `/dev/dri` is also exactly what the
-  # deployed host has, which has no GPU.
-  need bwrap
+  # The namespace exposes the selected node and hides NVIDIA devices leased
+  # by other jobs. The game uses its normal Wayland/DRM initialization.
   local -a ARGV; mapfile -t ARGV <"$CAP/$inst/argv"
   ( cd "$GAMEDIR" && { grep -v '^launch$' "$CAP/$inst/stdin"; for a in "${ARGS[@]}"; do echo "param $a"; done; echo launch; } \
       | systemd-run --user --scope --quiet -p MemoryMax="${SVMC_MEM:-6G}" \
-          bwrap --dev-bind / / --tmpfs /dev/dri -- \
-          env -u DISPLAY "${GAME_ENV[@]}" timeout "$secs" "${ARGV[@]}" ) >"$RUN/game.log" 2>&1 &
+          env -u DISPLAY "${GAME_ENV[@]}" "${NS[@]}" timeout "$secs" "${ARGV[@]}" ) >"$RUN/game.log" 2>&1 &
   local G=$!
   KIDS+=($G)
 
@@ -448,20 +517,18 @@ play() {
   # touching it.
   mark "steady begin"; sleep 30; mark "steady end"
   xdotool key Escape; sleep 2; shot "$RUN/p7-paused.png"; mark paused
-  # Quit the way a person on Windows does: the window's close button, which
-  # is `WM_CLOSE`, then `xdg_toplevel.close`, then Minecraft saving the world
-  # and exiting by itself.
-  # The button is found from where the compositor says the window is (Wine's
-  # virtual desktop has no X window per Win32 window to ask): the last
-  # "(window WxH at X,Y)" it logged, and the caption's close box 15 px in from
-  # the right edge and 16 down, which is Wine's default theme.
-  local geo; geo=$(grep -o "(window [0-9]*x[0-9]* at -\?[0-9]*,-\?[0-9]*)" "$RUN/compositor.log" | tail -1 | tr -dc "0-9x,\- \n" )
-  local ww wy wx
-  ww=$(echo "$geo" | sed -E 's/ *([0-9]+)x.*/\1/')
-  wx=$(echo "$geo" | sed -E 's/.* (-?[0-9]+),.*/\1/')
-  wy=$(echo "$geo" | sed -E 's/.*,(-?[0-9]+).*/\1/')
-  xdotool mousemove $((wx + ww - 15)) $((wy + 16)) click 1
-  mark "closed the window"
+  # Alt+F4 did not deliver a close in this isolated Wine desktop.
+  # Click the real caption close button using the live X window geometry.
+  local w X Y WIDTH HEIGHT SCREEN WINDOW
+  w=$(xdotool search --onlyvisible --name '^Minecraft ' 2>/dev/null | tail -1)
+  if [ -z "$w" ]; then mark "close failed: no visible Minecraft window"; return 1; fi
+  eval "$(xdotool getwindowgeometry --shell "$w")"
+  if [ "${WIDTH:-0}" -le 30 ] || [ "${HEIGHT:-0}" -le 30 ]; then
+    mark "close failed: invalid live window geometry"; return 1
+  fi
+  mark "close geometry window=$w x=$X y=$Y width=$WIDTH height=$HEIGHT"
+  xdotool mousemove $((X + WIDTH - 13)) $((Y + 14)) click 1
+  mark "clicked the window close button"
 }
 
 verdict() {
@@ -533,7 +600,7 @@ verdict() {
       || bad "F11 did not make the window fullscreen and back: $(grep -i fullscreen "$C" | tr '\n' ';')"
   fi
   # Frame pacing, from the ICD's own present timestamps in the trace.
-  local PY; PY=$(nixpath python3)/bin/python3
+  local PY=$MC_PYTHON/bin/python3
   if [ -x "$PY" ]; then
     "$PY" "$ROOT/scripts/sv-minecraft-fps.py" "$RUN/trace" "$RUN/marks.txt" >"$RUN/fps.txt" 2>&1
     sed 's/^/  /' "$RUN/fps.txt"

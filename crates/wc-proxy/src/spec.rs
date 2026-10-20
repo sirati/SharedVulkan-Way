@@ -229,6 +229,7 @@ impl Spec {
         // whose fd is an `sv_drm` token read and closed here, and the feedback's
         // `format_table`, a memfd this proxy makes.
         spec.load(include_str!("../protocols/linux-dmabuf-v1.xml"))?;
+        spec.load(include_str!("../protocols/wc-native-shm-v1.xml"))?;
         Ok(spec)
     }
 
@@ -382,7 +383,8 @@ mod tests {
         // presentation-time (two): 52.
         // §104 adds linux-dmabuf (three: the global, the params and the
         // feedback): 55.
-        assert_eq!(s.len(), 55, "interfaces: {:?}", s.names());
+        // §112 adds the proxy-local native SHM allocator.
+        assert_eq!(s.len(), 56, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,

@@ -306,6 +306,9 @@ pub struct State {
     pub dmabuf_images: HashMap<u64, crate::dmabuf::DmabufImage>,
     pub semaphores: HashMap<u64, crate::dmabuf::Semaphore>,
     pub sync_fences: HashMap<u64, u64>,
+    /// Fences completed by CPU-known swapchain acquisition, independently of
+    /// unrelated work on any application queue. Reset removes this payload.
+    pub acquired_fences: std::collections::HashSet<u64>,
     /// The fence record, its numbers and what the next submit waits for
     /// (§104.11).
     pub fences: crate::dmabuf::Fences,
@@ -334,6 +337,7 @@ impl State {
             dmabuf_images: HashMap::new(),
             semaphores: HashMap::new(),
             sync_fences: HashMap::new(),
+            acquired_fences: Default::default(),
             fences: Default::default(),
             allocator,
             arena_high_water: 0,
@@ -419,6 +423,8 @@ pub struct SharedVulkan {
     pub arena_len: u64,
     state: Mutex<State>,
     transport: Option<crate::transport::RingTransport>,
+    #[cfg(test)]
+    test_transport: Option<Box<dyn sv_icd_entry::Transport>>,
     /// What `vkEnumerateInstanceVersion` answers and what every instance this
     /// driver creates is stamped with.
     ///
@@ -495,6 +501,8 @@ impl SharedVulkan {
             arena_len,
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: None,
+            #[cfg(test)]
+            test_transport: None,
             // No driver behind us, so there is nothing to negotiate against and
             // the ceiling is the honest answer: a standalone driver implements
             // exactly the profile and no more.
@@ -514,12 +522,12 @@ impl SharedVulkan {
     /// *another process* — §5.2's segregated free lists and its slab-boundary
     /// rule stop being an implementation detail and start being the contract.
     ///
-    /// `endpoint` is a Unix socket path on Linux and a **session name** on
-    /// Windows, from which the pipe and the two section names are derived. One
+    /// `endpoint` is a Unix socket path on Linux, `broker-pci:POOL` on macOS,
+    /// or a session name on Windows, from which pipe and section names derive. One
     /// environment variable either way, because an ICD cannot be given
     /// arguments and adding a second variable for the same job is how a user
     /// ends up setting the wrong one.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub fn connected(endpoint: &str) -> Result<SharedVulkan, String> {
         let socket = endpoint;
         let attached = connect_waiting_for_slot(socket)?;
@@ -575,6 +583,8 @@ impl SharedVulkan {
             arena_len: attached.arena_len,
             state: Mutex::new(State::new(allocator)),
             transport: Some(attached.transport),
+            #[cfg(test)]
+            test_transport: None,
             api_version,
             device_api_version,
             device_extensions: Vec::new(),
@@ -593,7 +603,7 @@ impl SharedVulkan {
     /// beside it. A failure falls back to the standalone table's mask, which is
     /// the conservative direction: it can only *withhold* the decode extensions,
     /// never claim them.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn ask_queue_flags(&self) -> u32 {
         let fallback = crate::advertise::advertised_queue_flags();
         let Some(t) = self.wire() else { return fallback };
@@ -627,11 +637,8 @@ impl SharedVulkan {
     /// an empty list means an application that asks for an extension is told
     /// `VK_ERROR_EXTENSION_NOT_PRESENT`, which is a clean refusal rather than a
     /// driver that loads and then misbehaves.
-    // Same cfg as its one caller, `connected`. It was linux-only while the
-    // Windows transport did not exist; now that it does, a windows-gnu build
-    // fails to compile without this — the caller is compiled and the callee
-    // is not.
-    #[cfg(any(target_os = "linux", windows))]
+    // Keep this available on every platform that compiles `connected`.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn ask_device_extensions(&self) -> Vec<(&'static str, u32)> {
         let Some(t) = self.wire() else { return Vec::new() };
         let ask = |capacity: usize| {
@@ -863,7 +870,13 @@ impl SharedVulkan {
     }
 
     /// The transport, if this process is connected to a GPU side.
+    #[cfg(test)]
+    pub(crate) fn set_test_transport(&mut self, transport: Box<dyn sv_icd_entry::Transport>) {
+        self.test_transport = Some(transport);
+    }
     pub fn wire(&self) -> Option<&dyn sv_icd_entry::Transport> {
+        #[cfg(test)]
+        if let Some(transport) = &self.test_transport { return Some(transport.as_ref()); }
         self.transport.as_ref().map(|t| t as &dyn sv_icd_entry::Transport)
     }
 
@@ -1102,7 +1115,7 @@ mod tests {
 /// either when its application says so at exit or, for one that did not, when
 /// its heartbeat has been silent for `APP_GONE_AFTER` (5 s) and its leftovers
 /// are destroyed. Ten seconds covers the second case with room.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// When this process stops waiting for a slot, as milliseconds of the wall
@@ -1115,7 +1128,7 @@ const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The budget is kept in a file named by the pid in the temporary directory,
 /// which outlives an unload; a file left by an earlier process of the same pid
 /// holds a deadline in the past, which only means that process does not wait.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn slot_wait_deadline_ms() -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1140,7 +1153,7 @@ fn slot_wait_deadline_ms() -> u64 {
 /// reaches this side as text through `sv-hostd`, so it is matched by the
 /// guest's own words, `GPU session slots are taken`; anything else fails as
 /// before.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn connect_waiting_for_slot(socket: &str) -> Result<crate::transport::Attached, String> {
     let started = std::time::Instant::now();
     let mut deadline = None;

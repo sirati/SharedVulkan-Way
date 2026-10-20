@@ -115,6 +115,10 @@ set -uo pipefail
 # against the first install's wc-proxy (found by §83's session-0 run).
 BASE="${WC_LAUNCH_BASE:-$(cd "$(dirname "$0")" && pwd)}"
 BIN="$BASE/bin"
+UID_=$(id -u)
+# The mapped user's agent may use a private runtime directory. Capture its
+# manager's path before application-specific XDG directories replace it.
+USER_RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$UID_}"
 RUNROOT="${WC_LAUNCH_RUN:-/tmp/wc-launch}"
 ROOTC="${WC_LAUNCH_ROOTC:-$HOME/rootc}"
 # IVSHMEM ARENA. Made by the VM's own unit, 0660 root:wc-arena (§83).
@@ -131,7 +135,7 @@ WCBELL="${WC_LAUNCH_WCBELL:-/run/windows-vm/wc-arena/wcbell.sock}"
 # user unit wc-bell-hub.service (`sv-hostd bell-hub`, installed by deploy)
 # holds both for every session of every installation and serves them here.
 # Without it a session falls back to holding the port itself, said loudly.
-HUBDIR="${WC_LAUNCH_BELL_HUB:-/run/user/$(id -u)/wc-bell}"
+HUBDIR="${WC_LAUNCH_BELL_HUB:-$USER_RUNTIME/wc-bell}"
 SVHUB="$HUBDIR/sv.sock"
 WLHUB="$HUBDIR/wl.sock"
 # §111.10: THE BROKER. On a host whose session service runs as a system
@@ -166,10 +170,10 @@ hub_up() {
   if [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ]; then
     [ -S "$HUBDIR/sv.sock" ] || [ -S "$HUBDIR/wl.sock" ]; return
   fi
-  local sd="env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user"
-  $sd is-active --quiet wc-bell-hub.service || $sd start wc-bell-hub.service >/dev/null 2>&1 || return 1
+  local sd=(env "XDG_RUNTIME_DIR=$USER_RUNTIME" systemctl --user)
+  "${sd[@]}" is-active --quiet wc-bell-hub.service || "${sd[@]}" start wc-bell-hub.service >/dev/null 2>&1 || return 1
   for _ in $(seq 1 40); do
-    $sd is-active --quiet wc-bell-hub.service && [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
+    "${sd[@]}" is-active --quiet wc-bell-hub.service && [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
     sleep 0.05
   done
   return 1
@@ -182,12 +186,11 @@ wl_hub() {
   [ -n "$BROKERED" ] && return 0
   [ -S "$HUBDIR/wl.sock" ] || return 1
   [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ] && return 0
-  env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user is-active --quiet wc-bell-hub.service
+  env "XDG_RUNTIME_DIR=$USER_RUNTIME" systemctl --user is-active --quiet wc-bell-hub.service
 }
 wcbell_use() { if wl_hub || hub_up; then echo "$WLHUB"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
-UID_=$(id -u)
 GID_=$(id -g)
 
 # §94. The application definitions. One section per application the guest may
@@ -286,7 +289,7 @@ dir_of() { echo "$RUNROOT/$1"; }
 # when the manager says `inactive` or `failed` (a collected unit is
 # `inactive`); an unreachable manager is asked again, for up to
 # WC_LAUNCH_STOP_TRIES tenths of a second.
-sd_user() { XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user "$@"; }
+sd_user() { XDG_RUNTIME_DIR="$USER_RUNTIME" systemctl --user "$@"; }
 unit_state() { local s; s=$(sd_user is-active "$1" 2>/dev/null | head -n 1); echo "${s:-unknown}"; }
 stop_unit() {
   local U="$1" st=unknown i
@@ -619,7 +622,7 @@ audio_up() {
     printf '  -L %q >%q 2>&1\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1" "$D/pulse.log"
   } >"$D/pulse.sh"
   chmod 755 "$D/pulse.sh"
-  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  export XDG_RUNTIME_DIR="$USER_RUNTIME"
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pulse.sh" >/dev/null 2>&1; then
     echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
@@ -817,7 +820,7 @@ pw_up() {
   if ! WHY=$(pw_stack_write "$D"); then
     echo "none: $WHY" >"$D/audio.state"; return 0
   fi
-  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  export XDG_RUNTIME_DIR="$USER_RUNTIME"
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pipewire.sh" >/dev/null 2>&1; then
     echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
@@ -909,6 +912,108 @@ sound_ring_args() {
 # DBUS is passed so that a second launch reaches the first one's instance
 # instead of colliding on its profile lock -- which is what a second click on a
 # Windows application does too.
+# Remove only complete legacy blocks carrying wc-session's exact provenance.
+# A retained user declaration of the same key always wins over migration.
+clear_legacy_graphics_prefs() {
+  local profile=$1 stage
+  [ -f "$profile/user.js" ] || return 0
+  stage=$(mktemp -d "$profile/.wc-pref-upgrade-XXXXXX") || return 1
+  awk -v stage="$stage" '
+    { line[NR]=$0 }
+    END {
+      gfx="user_pref(\"gfx.webrender.all\", true);"
+      media="media.hardware-video-decoding-vulkan"
+      m1="user_pref(\"" media ".enabled\", true);"
+      m2="user_pref(\"" media ".force-enabled\", true);"
+      m3="user_pref(\"" media ".readback.enabled\", true);"
+      for(i=1;i<=NR;i++) {
+        if(line[i] ~ /^\/\/ Added by wc-session: this host forwards a GPU \(.+\)\.$/ && line[i+1]==gfx) {
+          gone[i]=gone[i+1]=1; owned["gfx.webrender.all"]=gfx
+        }
+        if(line[i]=="// Added by wc-session: Vulkan video decode, read back to host memory, on the forwarded GPU." && line[i+1]==m1 && line[i+2]==m2 && line[i+3]==m3) {
+          gone[i]=gone[i+1]=gone[i+2]=gone[i+3]=1
+          owned[media ".enabled"]=m1; owned[media ".force-enabled"]=m2; owned[media ".readback.enabled"]=m3
+        }
+      }
+      changed=0
+      for(i=1;i<=NR;i++) {
+        if(!gone[i]) print line[i]
+        else changed=1
+      }
+      if(changed) print "yes" > (stage "/changed")
+      for(key in owned) {
+        manual=0
+        for(i=1;i<=NR;i++) if(!gone[i] && index(line[i],"\"" key "\"")) manual=1
+        if(!manual) print owned[key] > (stage "/persisted")
+      }
+    }
+  ' "$profile/user.js" >"$stage/user.js" || { rm -rf "$stage"; return 1; }
+  if [ -f "$stage/changed" ]; then
+    chmod --reference="$profile/user.js" "$stage/user.js" || { rm -rf "$stage"; return 1; }
+    if [ -s "$stage/persisted" ] && [ -f "$profile/prefs.js" ]; then
+      awk 'NR==FNR { generated[$0]=1; next } !($0 in generated)' "$stage/persisted" "$profile/prefs.js" >"$stage/prefs.js" \
+        && chmod --reference="$profile/prefs.js" "$stage/prefs.js" \
+        || { rm -rf "$stage"; return 1; }
+      # Commit persisted values first. A later user.js failure leaves its
+      # provenance intact, so retry can safely complete the migration.
+      mv "$stage/prefs.js" "$profile/prefs.js" || { rm -rf "$stage"; return 1; }
+    fi
+    mv "$stage/user.js" "$profile/user.js" || { rm -rf "$stage"; return 1; }
+  fi
+  rm -rf "$stage"
+}
+
+# Preserve user content and replace only our complete bounded generated block.
+install_managed_profile_prefs() {
+  local profile=$1 rendered=$2 stage
+  stage=$(mktemp "$profile/.wc-managed-prefs-XXXXXX") || return 1
+  if [ -f "$profile/user.js" ]; then
+    awk '
+      { line[NR]=$0 }
+      END {
+        for(i=1;i<=NR;i++) {
+          if(line[i]=="// BEGIN wc-session managed preferences") {
+            stop=0
+            for(j=i+1;j<=NR;j++) if(line[j]=="// END wc-session managed preferences") { stop=j; break }
+            if(stop) { i=stop; continue }
+          }
+          print line[i]
+        }
+      }
+    ' "$profile/user.js" >"$stage" || { rm -f "$stage"; return 1; }
+    chmod --reference="$profile/user.js" "$stage" || { rm -f "$stage"; return 1; }
+  fi
+  echo '// BEGIN wc-session managed preferences' >>"$stage" \
+    && cat "$rendered" >>"$stage" \
+    && echo '// END wc-session managed preferences' >>"$stage" \
+    || { rm -f "$stage"; return 1; }
+  mv "$stage" "$profile/user.js"
+}
+
+stock_gpu_prerequisite_check() {
+  local NATIVE=0 STRICT=0 GTK_LIB="" EXPECT_GTK="" line
+  case "${DEF_EXEC##*/}" in firefox|firefox-bin|firefox-esr|.firefox-wrapped) ;; *) return 0 ;; esac
+  if [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
+    [ -n "$GPU_ON" ] && [ ${#NSWRAP[@]} -gt 0 ] \
+      || die "GPU Firefox requires its session GPU and sv-drm render-node namespace"
+    [[ "${PCI:-}" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
+      || die "GPU Firefox requires the guest GPU PCI identity"
+    NATIVE=0; STRICT=0; GTK_LIB=""
+    for line in "${GPUENV[@]}" "${DEF_ENV[@]}"; do
+      case "$line" in
+        WC_NATIVE_SHM=*) NATIVE=${line#WC_NATIVE_SHM=} ;;
+        WC_NATIVE_SHM_STRICT=*) STRICT=${line#WC_NATIVE_SHM_STRICT=} ;;
+        LD_LIBRARY_PATH=*) GTK_LIB=${line#LD_LIBRARY_PATH=}; GTK_LIB=${GTK_LIB%%:*} ;;
+      esac
+    done
+    EXPECT_GTK=$(readlink -f "$BASE/bin/gpu-gtk" 2>/dev/null)
+    [ "$NATIVE" = 1 ] && [ "$STRICT" = 1 ] && [ -n "$EXPECT_GTK" ] \
+      && [ "$GTK_LIB" = "$EXPECT_GTK/lib" ] && [ -f "$GTK_LIB/libgdk-3.so" ] \
+      && [ -s "$EXPECT_GTK/nix-support/wc-native-shm-abi" ] \
+      || die "GPU Firefox requires the deployment's matched shipped GTK and strict original allocation"
+  fi
+}
+
 start_app() {
   local ID="$1" DPI="$2" CAPTION="$3" R RO TITLEBAR PROFILE="$DEF_PROFILE"
   # An application's data directory, created on demand -- and *only* under this
@@ -965,17 +1070,8 @@ start_app() {
   # knows whether those paths exist; a guest that asked for acceleration from a
   # host without it would get a Firefox that cannot start its renderer.
   #
-  # **And the profile gets `gfx.webrender.all` with it, never without it.**
-  # Firefox decides software or hardware WebRender from one fact: whether Mesa's
-  # EGL device says `EGL_MESA_device_software`. With no DRM node on this host
-  # Mesa has only its software device to give, so Firefox files Zink-on-a-GPU
-  # as `mesa/software-unknown` and blocklists hardware WebRender
-  # (FEATURE_FAILURE_SOFTWARE_GL). The pref overrides exactly that entry. Set
-  # without the GPU it would put hardware WebRender on llvmpipe, which is slower
-  # than the software WebRender Firefox would otherwise choose, so the two go
-  # together or not at all.
-  #
-  # §94: and only for an application whose definition does not say `gpu = off`.
+  # Stock Firefox keeps its graphics and decoder defaults. A configured GPU
+  # Firefox start requires the render node and shipped native GTK allocation.
   GPUENV=()
   if [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1019,16 +1115,46 @@ start_app() {
       GPUENV=()
     fi
   fi
-  # HARDWARE VIDEO DECODE (§86, docs/video-decode.md §7.7): only a Firefox with
-  # the readback patch can decode on a forwarded GPU, and its package says so
-  # with a marker beside the browser. With it and a GPU, the decode prefs go
-  # into user.js and the RDD sandbox is lifted (it brokers connect() to the
-  # display sockets only, so the decoder could not reach the GPU side).
-  DECODE=""
-  if [ -n "$GPU_ON" ] && [ -e "$(dirname "$EXE")/../lib/firefox/.wc-vulkan-readback" ]; then
-    DECODE=1
-    GPUENV+=("MOZ_DISABLE_RDD_SANDBOX=1")
+  # THE RENDER NODE (§112). With a GPU and this installation's dma-buf node
+  # (`$BASE/dmabuf-node`, the userspace render node `sv-drm serve` provides),
+  # the application runs inside `sv-drm ns`, where libdrm sees that node as
+  # the GPU's render node -- a PCI device of the guest GPU's ids from
+  # `$BASE/gpu-pci` -- and the ICD hands out its frames as dma-bufs naming
+  # sections (SV_DRM_NODE). The application is stock and keeps its defaults:
+  # Firefox finds a hardware EGL device and chooses hardware WebRender and
+  # VA-API decode itself, inside its own sandbox, which reaches the GPU
+  # through the node as with any driver. Without a node, nothing changes.
+  NSWRAP=()
+  # Not for the nested desktop (§102): `atp-nested` goes through sudo, which a
+  # user namespace would refuse, and its seat runs KWin in `sv-drm ns` itself.
+  case "$DEF_DESKTOP" in atp-nested*) NESTED=1 ;; *) NESTED="" ;; esac
+  if [ -n "$GPU_ON" ] && [ -z "$NESTED" ] && [ -n "${DMABUF_NODE:-}" ] && [ -c "$DMABUF_NODE" ]; then
+    SVDRM=""
+    for c in "$BASE/bin/sv-drm" "$(command -v sv-drm 2>/dev/null)"; do
+      [ -n "$c" ] && [ -x "$c" ] && { SVDRM=$c; break; }
+    done
+    if [ -n "$SVDRM" ]; then
+      NODE_DEV=$(stat -L -c '%t:%T' "$DMABUF_NODE" 2>/dev/null)
+      NODE_DEV="$((16#${NODE_DEV%%:*})):$((16#${NODE_DEV##*:}))"
+      NSWRAP=("$SVDRM" ns --dev "$NODE_DEV" --minor "${DMABUF_NODE##*renderD}")
+      PCI=$(head -c 16 "$BASE/gpu-pci" 2>/dev/null | tr -d '[:space:]')
+      [[ "$PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] && NSWRAP+=(--pci "$PCI")
+      NSWRAP+=(--)
+      # The old wl_shm-only kopper override explicitly creates a software
+      # EGLDevice in our Mesa patch. With a render node, use Mesa's normal
+      # DRM path so native clients can discover the real hardware device.
+      # Filter old gpu.env files as well as newly generated deployments.
+      NODE_GPUENV=()
+      for line in "${GPUENV[@]}"; do
+        case "$line" in LIBGL_KOPPER_DRI2=*) ;; *) NODE_GPUENV+=("$line") ;; esac
+      done
+      GPUENV=("${NODE_GPUENV[@]}" "SV_DRM_NODE=$DMABUF_NODE")
+      echo "wc-session: $ID renders through the render node $DMABUF_NODE ($NODE_DEV${PCI:+, pci $PCI})" >>"$D/app.log"
+    else
+      echo "wc-session: NO RENDER NODE for $ID -- $DMABUF_NODE is there and sv-drm is not ($BASE/bin/sv-drm); frames are copied" | tee -a "$D/app.log" >&2
+    fi
   fi
+  stock_gpu_prerequisite_check
   # What `proxy` managed for this session's sound (§86). Read once, here.
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
   case "$AUDIO" in
@@ -1042,7 +1168,9 @@ start_app() {
   esac
   case "$PROFILE" in
     "$HOME"/.wc-launch/*)
-      cp "$R/user.js" "$PROFILE/user.js" 2>/dev/null
+      case "${DEF_EXEC##*/}" in
+        firefox|firefox-bin|firefox-esr|.firefox-wrapped) clear_legacy_graphics_prefs "$PROFILE" || die "could not upgrade generated graphics preferences" ;;
+      esac
       # NO "OPEN FIREFOX IN TROUBLESHOOT MODE?" (§86 item 6, §87). A launcher
       # session can end with Firefox still running -- `down`, the guest logging
       # off, the VM host's proxy going -- and Firefox counts a run that did not
@@ -1052,24 +1180,17 @@ start_app() {
       # count off. Every launcher profile, always: it is a property of how this
       # deployment ends Firefox, not of any one session.
       printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
-        >> "$PROFILE/user.js"
-      if [ ${#GPUENV[@]} -gt 0 ]; then
-        printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
-          >> "$PROFILE/user.js"
-      fi
-      if [ -n "$DECODE" ]; then
-        printf '\n// Added by wc-session: Vulkan video decode, read back to host memory, on the forwarded GPU.\nuser_pref("media.hardware-video-decoding-vulkan.enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.force-enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);\n' \
-          >> "$PROFILE/user.js"
-      fi
+        >> "$R/user.js"
       # AUDIO (§86): no server means Firefox's own null context, never a
       # Firefox that waits on an audio process for ever.
       case "$AUDIO" in
         pulse*|pipewire*|user-pipewire*|system*) ;;
         *)
           printf '\n// Added by wc-session: this session has no audio server (%s).\nuser_pref("media.cubeb.force_null_context", true);\n' "$AUDIO" \
-            >> "$PROFILE/user.js"
+            >> "$R/user.js"
           ;;
       esac
+      install_managed_profile_prefs "$PROFILE" "$R/user.js" || die "could not refresh managed preferences"
       ;;
   esac
 
@@ -1164,7 +1285,7 @@ start_app() {
     CONFIG_ENV=(XDG_CONFIG_HOME="$C")
   fi
   DBUS=""
-  [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
+  [ -S "$USER_RUNTIME/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=$USER_RUNTIME/bus"
   # §95: a crash reporter that is dismissed deletes its minidump, and four of
   # §95's crashes left nothing to read. Kept in the profile's minidumps/.
   KEEP_DUMPS="MOZ_CRASHREPORTER_NO_DELETE_DUMP=1"
@@ -1216,7 +1337,7 @@ start_app() {
     "${GPUENV[@]}" \
     "${DEF_ENV[@]}" \
     "${TESTENV[@]}" \
-    "${CMDV[@]}" >>"$D/app.log" 2>&1 &
+    "${NSWRAP[@]}" "${CMDV[@]}" >>"$D/app.log" 2>&1 &
   echo "run ok $! audio=${AUDIO%%[: ]*} titlebar=$DEF_TITLEBAR"
 }
 
@@ -1531,12 +1652,13 @@ proxy)
       # run already says what the session's frame should record. §89: and
       # its clock, so the proxy's half of an input timeline is on the
       # machine's monotonic counter like the compositor's. §105.14: and the
-      # control round trip's hops, on the same clock. The first of each.
+      # control round trip's hops, on the same clock. §112.10 also enables the
+      # original GTK allocator on this proxy. The first of each.
       if [ -f "$BASE/gpu.env" ]; then
         local_seen=" "
         while IFS= read -r ft; do
           case "$ft" in
-            WC_FRAME_TRACE=*|WC_FRAME_TRACE_CLOCK=*|WC_HOP_TRACE=*)
+            WC_FRAME_TRACE=*|WC_FRAME_TRACE_CLOCK=*|WC_HOP_TRACE=*|WC_NATIVE_SHM=*)
               [[ "$local_seen" == *" ${ft%%=*} "* ]] && continue
               local_seen="$local_seen${ft%%=*} "
               printf 'export %q\n' "$ft" ;;
@@ -1574,7 +1696,7 @@ proxy)
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
     stamp script
-    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    export XDG_RUNTIME_DIR="$USER_RUNTIME"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT (is this user's manager running? loginctl enable-linger)"
@@ -1660,7 +1782,7 @@ EOF
     # socket and /proc/<pid>/fd are this user's and neither the locate nor the
     # proxy needs root: a user unit, as on the ivshmem path. Pair it with
     # WC_LAUNCH_ROOTC=bash so `up` runs the locate as this user too.
-    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    export XDG_RUNTIME_DIR="$USER_RUNTIME"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$BASH" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT"
@@ -1982,7 +2104,7 @@ gpu)
         "$BIN/sv-hostd" "$QMP" "$VM_HINT" "mem:$LABEL" "$D/icd.sock" "$N" "$D/hostd.log"
     } >"$D/gpu.sh"
     chmod 755 "$D/gpu.sh"
-    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    export XDG_RUNTIME_DIR="$USER_RUNTIME"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/gpu.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT"
@@ -2015,6 +2137,11 @@ gpu)
     echo "wc-session: NO SHARED DOORBELL HUB ($HUBDIR): this session holds QEMU's doorbell port itself, and no other session can have it until this one is gone (§99)" >&2
     BELLARGS=$(printf -- '--bell %q --bell-hub %q' "$BELL" "$D/bell.sock")
   fi
+  # §112: the render node's service socket, when the host runs `sv-drm serve
+  # --services`: this session's GPU service registers there, so a sandboxed
+  # application (Firefox's decoder) reaches it through the node.
+  DRM_SERVICES=${WC_DRM_SERVICES:-/run/sv-drm/services.sock}
+  [ -S "$DRM_SERVICES" ] && BELLARGS="$BELLARGS $(printf -- '--drm-services %q' "$DRM_SERVICES")"
   {
     echo '#!/usr/bin/env bash'
     echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
@@ -2024,7 +2151,7 @@ gpu)
       "$BIN/sv-hostd" "$GPUREGION" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
   } >"$D/gpu.sh"
   chmod 755 "$D/gpu.sh"
-  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  export XDG_RUNTIME_DIR="$USER_RUNTIME"
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/gpu.sh" >/dev/null 2>&1 \
     || die "systemd-run --user could not start $UNIT"

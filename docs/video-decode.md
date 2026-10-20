@@ -1,5 +1,13 @@
 # Hardware video decode, measured
 
+Current path, 2026-10-20: see `waycompose-design.md` §112. The Firefox
+readback patch and its package and decode scripts have been removed.
+The readback experiments below are historical. Mesa main now includes
+Zink's VA-API frontend, so the earlier conclusion that no VA-API bridge
+exists is superseded for H.264. Stock Firefox must use its default VA-API
+path and sandbox through the render node. The final guest hardware proof
+remains open; the first stock comparison selected software rendering.
+
 What every driver in reach can decode, whether a frame actually decodes, and
 what stands between that and Firefox. Not documentation, not inference — the
 drivers' own answers, and where a thing did not work it says so.

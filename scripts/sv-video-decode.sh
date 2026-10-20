@@ -60,7 +60,7 @@ if [ -z "$ICDDIR" ]; then
   done
   ICDDIR=${ICDDIR:-/run/opengl-driver/share/vulkan/icd.d}
 fi
-RUNDIR="$(mktemp -d /tmp/sv-video-decode.XXXXXX)"
+RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/sv-video-decode.XXXXXX")"
 MANIFEST="$BIN/sv_icd.json"
 SOCK="$RUNDIR/gpu.sock"
 PROBE="$BIN/video-probe"

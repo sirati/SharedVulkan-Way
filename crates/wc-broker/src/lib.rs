@@ -23,15 +23,18 @@
 //! through the broker, and nothing is copied.
 
 pub mod client;
+pub mod bar_control;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod host;
 pub mod core;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod daemon;
 pub mod proto;
+pub mod raw_device;
 pub mod server;
 pub mod service_control;
 pub mod service_auth;
+pub mod service_bootstrap;
 pub mod sys;
 pub mod usermap;
 

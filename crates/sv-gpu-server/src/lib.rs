@@ -39,6 +39,10 @@ pub mod table;
 pub mod video_log;
 pub mod video_stable;
 pub mod video_views;
+pub mod video_nv12;
+pub mod metal_image;
+#[cfg(target_os = "macos")]
+pub mod iosurface;
 pub mod workload;
 
 /// The reserved object id for "the arena's own `VkDeviceMemory`".
@@ -76,7 +80,7 @@ pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 ///
 /// **5** since §104.11: `svFenceRecord`, `svFenceMark` and `svFenceWait`, the
 /// sync fd export that does not wait.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = sv_proto::GPU_WIRE_VERSION;
 
 /// The identity the two sides must agree on before a single ring is claimed.
 ///

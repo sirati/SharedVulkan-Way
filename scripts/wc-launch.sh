@@ -206,8 +206,10 @@ PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-skip}"
 # §111.8. `deploy` installs the broker service (`sv-guest broker`, LocalSystem,
 # from Program Files) and gives it this installation's key; the broker opens
 # the devices for the user's processes, so the per-user port grant above is
-# superseded and its task removed. `skip` keeps §91's grant and the key in the
-# user's install directory, as before §111.
+# superseded and its task removed. `key` only provisions this installation's
+# key in an already running broker, without changing its service or devices.
+# `skip` is for a machine without the broker; it keeps §91's grant and the
+# key in the user's install directory, as before §111.
 BROKER="${WC_LAUNCH_BROKER:-skip}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-${SITE_GUEST_USER}}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
@@ -221,7 +223,16 @@ DEBUG_SSH="${WC_LAUNCH_DEBUG_SSH_TRANSPORT:-0}"
 # allocated dynamically.
 GPU_ARENA_MIB="${WC_LAUNCH_GPU_ARENA_MIB:-64}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
-KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
+# The Mesa the GPU sessions load (a store path on the host): Zink, its EGL
+# and GBM, and since §112 its VA-API driver (nix/mesa-zink-va.nix).
+# WC_LAUNCH_KOPPER_MESA is the older name of the same setting.
+KOPPER_MESA="${WC_LAUNCH_GPU_MESA:-${WC_LAUNCH_KOPPER_MESA:-}}"
+# §112.10: a shipped GTK output already copied into the host's Nix store.
+# Its original-page allocator uses the installation's existing broker policy.
+GPU_GTK="${WC_LAUNCH_GPU_GTK:-}"
+# §112: the guest GPU's PCI ids, VVVV:DDDD, which `sv-drm ns` gives the
+# render node ($HOSTDIR/gpu-pci).
+GPU_PCI="${WC_LAUNCH_GPU_PCI:-}"
 # §104. WC_LAUNCH_DMABUF_NODE=/dev/dri/renderD128: the proxy offers
 # zwp_linux_dmabuf_v1 on that node ($HOSTDIR/dmabuf-node, read by wc-session)
 # — the nested KWin's userspace render node. WC_LAUNCH_ICD_STORE=1: the ICD
@@ -500,7 +511,7 @@ Type=notify
 NotifyAccess=main
 FileDescriptorStoreMax=8
 FileDescriptorStorePreserve=yes
-ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock,rings=/run/windows-vm/wc-arena/arena
+ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock,rings=/run/windows-vm/wc-arena/arena --drm-services /run/sv-drm/services.sock
 Restart=always
 RestartSec=2
 
@@ -662,7 +673,8 @@ deploy_scope_check() {
     case "$val" in
       install) asked="$asked $name" ;;
       skip|keep) ;;
-      *) echo "error: $name is install, skip or keep, not $val"; exit 2 ;;
+      key) [ "$name" = WC_LAUNCH_BROKER ] || { echo "error: key is only valid for WC_LAUNCH_BROKER"; exit 2; } ;;
+      *) echo "error: $name is install, skip, keep or (broker only) key, not $val"; exit 2 ;;
     esac
   done
   if [ -n "$test" ] && [ -n "$asked" ]; then
@@ -675,6 +687,38 @@ deploy_scope_check() {
   else
     echo "  this deploy changes this installation only (broker, port access, host services: left as they are)"
   fi
+}
+
+# A redeploy must not put an existing broker's signing key back in a desktop
+# user's directory. Check before stopping a session, building or copying files.
+broker_deploy_check() {
+  if [ "${LAYOUT:-user}" != system ] && { [ "$BROKER" = install ] || [ "$BROKER" = key ]; }; then
+    echo "error: privileged broker keys require the system host layout and protected key rotation"
+    return 2
+  fi
+  [ "$BROKER" = install ] && return 0
+  if [ "${LAYOUT:-user}" = system ] && [ "$BROKER" != key ]; then
+    echo "error: the system layout requires WC_LAUNCH_BROKER=key; its signing key must stay privileged"
+    return 2
+  fi
+  local state
+  state=$(g "powershell.exe -NoProfile -Command '\$s=Get-Service -Name waycompose-broker -ErrorAction SilentlyContinue; if (\$s) { \$s.Status.ToString() } else { Write-Output absent }'" | tr -d '\r')
+  case "$state" in
+    absent)
+      [ "$BROKER" != key ] && return 0
+      echo "error: WC_LAUNCH_BROKER=key requires an already running broker; it installs no service"
+      return 2 ;;
+    Running)
+      [ "$BROKER" = key ] && return 0 ;;
+    Stopped|StartPending|StopPending|Paused|PausePending|ContinuePending) ;;
+    *) echo "error: cannot determine broker service state; refusing to copy a signing key"; return 2 ;;
+  esac
+  if [ "$BROKER" = key ]; then
+    echo "error: WC_LAUNCH_BROKER=key requires the broker to be Running, not $state"
+  else
+    echo "error: the broker already exists; use WC_LAUNCH_BROKER=key to keep this installation's key privileged"
+  fi
+  return 2
 }
 
 # §111.10: the staged installation into the system layout, as root.
@@ -693,7 +737,7 @@ install_staged() {
     scp "${SSHOPT[@]}" "$LINUX_BIN/wc-arena-host" "$REL_LINUX/sv-hostd" "$HOST:$HOSTDIR/../sysbin/" >/dev/null \
       || { bad "scp of the services' binaries"; exit 1; }
     h "$HOST_ROOT install -m 0755 $HOSTDIR/../sysbin/wc-arena-host $HOSTDIR/../sysbin/sv-hostd /var/lib/waycompose/bin/ && \
-       $HOST_ROOT systemctl restart wc-bell-hub.service wc-sessiond.service" >/dev/null \
+       $HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh services-restart \$(id -un) auto $HOSTDIR $SESSION" >/dev/null \
       && ok "WC_LAUNCH_SYSTEM_BINS=install: the system hub and session service run this build (restarted)" \
       || bad "the system services' binaries were not replaced"
   else
@@ -701,11 +745,67 @@ install_staged() {
   fi
 }
 
+# Resolve the selected guest app ids through their real host-app definitions.
+# GPU sessions can also serve Minecraft or native apps, which need no GTK/VA.
+deployment_uses_gpu_firefox() {
+  local app hostapp definition exec gpu line
+  for app in ${WC_LAUNCH_INSTALL_APPS:-firefox}; do
+    hostapp=$app
+    if [ -n "${WC_LAUNCH_EXTRA_APP_BLOCKS:-}" ] && [ -f "$WC_LAUNCH_EXTRA_APP_BLOCKS" ]; then
+      definition=$(awk -v wanted="app.$app" '
+        /^[[:space:]]*\[/ { s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\].*$/,"",s) }
+        s==wanted && /^[[:space:]]*host-app[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/,""); sub(/[[:space:]]*$/ ,""); print; exit }
+      ' "$WC_LAUNCH_EXTRA_APP_BLOCKS")
+      [ -z "$definition" ] || hostapp=$definition
+    fi
+    exec=""; gpu=on
+    if [ "$hostapp" = firefox ]; then
+      exec=$FIREFOX
+    elif [ -n "${WC_LAUNCH_EXTRA_APPS:-}" ] && [ -f "$WC_LAUNCH_EXTRA_APPS" ]; then
+      definition=$(awk -v wanted="$hostapp" '
+        /^[[:space:]]*\[/ { s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\].*$/,"",s) }
+        s==wanted && /^[[:space:]]*(exec|gpu)[[:space:]]*=/ { print }
+      ' "$WC_LAUNCH_EXTRA_APPS")
+      while IFS= read -r line; do
+        case "$line" in
+          *exec*=*) exec=$(sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//' <<<"$line") ;;
+          *gpu*=*) gpu=$(sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//' <<<"$line") ;;
+        esac
+      done <<<"$definition"
+    fi
+    if [ "$gpu" = on ]; then
+      case "${exec##*/}" in firefox|firefox-bin|firefox-esr|.firefox-wrapped) return 0 ;; esac
+    fi
+  done
+  return 1
+}
+
+# GPU Firefox is stock only with the native allocation library and DRM node.
+# Fail before ending an existing session or changing either installation.
+gpu_prerequisite_check() {
+  [ "$GPU_SESSIONS" -gt 0 ] || return 0
+  deployment_uses_gpu_firefox || return 0
+  [ "$GPU_ENV_MODE" = write ] || { echo "error: GPU deployment requires WC_LAUNCH_GPU_ENV=write"; return 1; }
+  [[ "$GPU_GTK" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+    || { echo "error: GPU deployment requires the matched WC_LAUNCH_GPU_GTK store output"; return 1; }
+  [[ "$KOPPER_MESA" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+    || { echo "error: GPU deployment requires WC_LAUNCH_GPU_MESA"; return 1; }
+  [[ "$DMABUF_NODE" =~ ^/dev/dri/renderD[0-9]+$ ]] && [[ "$GPU_PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
+    || { echo "error: GPU deployment requires WC_LAUNCH_DMABUF_NODE and WC_LAUNCH_GPU_PCI"; return 1; }
+  local expected actual
+  expected=$(sha256sum "$ROOT/crates/wc-proxy/protocols/wc-native-shm-v1.xml" "$ROOT/crates/wc-native-shm/include/wc-native-shm.h" | cut -d' ' -f1)
+  actual=$(h "test -c $DMABUF_NODE && test -f $GPU_GTK/lib/libgdk-3.so && test -f $KOPPER_MESA/lib/dri/zink_drv_video.so && cat $GPU_GTK/nix-support/wc-native-shm-abi") \
+    || { echo "error: GPU render-node, Mesa or shipped GTK prerequisite is unavailable on $HOST"; return 1; }
+  [ "$actual" = "$expected" ] || { echo "error: shipped GTK protocol/C ABI differs from this proxy build"; return 1; }
+}
+
 do_deploy() {
   echo "== deploy =="
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
+  gpu_prerequisite_check || exit 2
   host_layout_check
   deploy_scope_check
+  broker_deploy_check || exit 2
   # A session from the last run holds both halves' binaries open. Ended through
   # the product's own verb, which kills by the pid in its own state file.
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --session-name $SESSION --stop" >/dev/null 2>&1
@@ -949,30 +1049,39 @@ APPS
   # first time, kept across deploys; it crosses to the guest once, over this
   # deploy channel, which is an administrator's and not the session's.
   local key
-  # §111.10: an installed installation's key is the service's; the staging
-  # copy is made from it, and install-staged keeps the installed one.
   if [ "$LAYOUT" = system ]; then
-    h "mkdir -p $HOSTDIR; k=\$($HOST_ROOT cat $SYSTEM_BASE/$SESSION/session.key 2>/dev/null); \
-       [ -n \"\$k\" ] && (umask 077; printf '%s' \"\$k\" >$HOSTDIR/session.key)" >/dev/null 2>&1
+    # The privileged candidate never enters the admin's staging directory.
+    # Failed broker provisioning leaves verifiers stopped and retry uses the
+    # same candidate. Legacy desktop-readable keys are never imported.
+    scp "${SSHOPT[@]}" "$ROOT/scripts/wc-users-migrate.sh" "$HOST:$HOSTDIR/../wc-users-migrate.sh" >/dev/null || exit 1
+    h "$HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh key-prepare \$(id -un) auto $HOSTDIR $SESSION" || exit 1
+    key=$(h "$HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh key-export \$(id -un) auto $HOSTDIR $SESSION") || exit 1
+  else
+    if [ "$BROKER" = install ] || [ "$BROKER" = key ]; then
+      echo "error: privileged broker keys require the system host layout and protected key rotation"
+      exit 1
+    fi
+    key=$(h "mkdir -p $HOSTDIR; test -s $HOSTDIR/session.key || \
+             (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
+             chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
   fi
-  key=$(h "mkdir -p $HOSTDIR; test -s $HOSTDIR/session.key || \
-           (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
-           chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no installation key on the VM host"; exit 1; }
-  if [ "$BROKER" = install ]; then
+  if [ "$BROKER" = install ] || [ "$BROKER" = key ]; then
     # §111.8: the key goes to the broker, which signs the boot record with
     # it and with the caller's identity; the user cannot read it, so a user
     # process cannot sign a record that claims another user.
     local ki
     ki=$(printf '%s' "$key" | g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
-          -File '$DIR_WIN\\wc-broker-install.ps1' -Action key -Install $SESSION" | tr -d '\r')
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action key -Install $SESSION" | tr -d '\r') || { key=""; bad "broker key provisioning failed; verifier remains stopped"; exit 1; }
     key=""
     echo "$ki" | sed 's/^/        /'
     if echo "$ki" | grep -q 'stored in'; then
       g "export MSYS_NO_PATHCONV=1; rm -f $DIR_MSYS/session.key" >/dev/null
+      h "$HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh key-confirm \$(id -un) auto $HOSTDIR $SESSION" || exit 1
       ok "the installation key is the broker's (ProgramData\\waycompose\\keys, SYSTEM and Administrators only); the user's copy is removed"
     else
       bad "the installation key did not reach the broker"
+      exit 1
     fi
   else
     printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
@@ -1055,6 +1164,12 @@ APPS
     "") h "rm -f $HOSTDIR/dmabuf-node" >/dev/null ;;
     *) echo "error: WC_LAUNCH_DMABUF_NODE is a /dev/dri/renderD<N> path"; exit 1 ;;
   esac
+  case "$GPU_PCI" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+      h "printf '%s' $GPU_PCI > $HOSTDIR/gpu-pci" >/dev/null ;;
+    "") h "rm -f $HOSTDIR/gpu-pci" >/dev/null ;;
+    *) echo "error: WC_LAUNCH_GPU_PCI is VVVV:DDDD"; exit 1 ;;
+  esac
   case "${WC_LAUNCH_COPY_SCOPE:-}" in
     buffer) h "printf buffer > $HOSTDIR/copy-scope" >/dev/null ;;
     ""|damage) h "rm -f $HOSTDIR/copy-scope" >/dev/null ;;
@@ -1070,8 +1185,8 @@ APPS
     *) bad "$HOSTDIR/apps.ini does not check: $apps"; exit 1 ;;
   esac
   if [ "$GPU_SESSIONS" -gt 0 ]; then
-    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so $HOSTDIR/bin/libsv_wlshim.so" >/dev/null 2>&1
-    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$REL_LINUX/libsv_wlshim.so" "$HOST:$HOSTDIR/bin/" >/dev/null \
+    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so $HOSTDIR/bin/libsv_wlshim.so $HOSTDIR/bin/sv-drm" >/dev/null 2>&1
+    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$REL_LINUX/libsv_wlshim.so" "$REL_LINUX/sv-drm" "$HOST:$HOSTDIR/bin/" >/dev/null \
       || { echo "error: scp of the GPU half to the VM host"; exit 1; }
     h "printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"%s\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' $HOSTDIR/bin/libsv_icd.so >$HOSTDIR/bin/sv_icd.json"
     deployed_is "$REL_LINUX/sv-hostd" "$HOSTDIR/bin/sv-hostd" h "re-run $0 deploy" || exit 1
@@ -1087,15 +1202,35 @@ APPS
     fi
     local genv
     genv="MESA_LOADER_DRIVER_OVERRIDE=zink
-LIBGL_KOPPER_DRI2=1
 __EGL_VENDOR_LIBRARY_FILENAMES=${KOPPER_MESA:-<mesa-kopper-wayland>}/share/glvnd/egl_vendor.d/50_mesa.json
 LIBGL_DRIVERS_PATH=${KOPPER_MESA:-<mesa-kopper-wayland>}/lib/dri
+LIBVA_DRIVER_NAME=zink
+LIBVA_DRIVERS_PATH=${KOPPER_MESA:-<mesa-zink-va>}/lib/dri
 VK_DRIVER_FILES=$icd_json"
+    if [ -n "$GPU_GTK" ]; then
+      case "$GPU_GTK" in
+        /nix/store/*) ;;
+        *) echo "error: WC_LAUNCH_GPU_GTK must name a GTK output in the host Nix store"; exit 1 ;;
+      esac
+      [[ "$GPU_GTK" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+        || { echo "error: WC_LAUNCH_GPU_GTK must name one store output"; exit 1; }
+      h "test -f $GPU_GTK/lib/libgdk-3.so && nix-store -r $GPU_GTK --add-root $HOSTDIR/bin/gpu-gtk --indirect >/dev/null" \
+        || { bad "$GPU_GTK is not on $HOST; copy the shipped GTK closure there first"; exit 1; }
+      genv="$genv
+LD_LIBRARY_PATH=$GPU_GTK/lib
+WC_NATIVE_SHM=1
+WC_NATIVE_SHM_STRICT=1"
+    fi
+    # Only the legacy wl_shm-only path needs a forced software EGLDevice.
+    if [ -z "$DMABUF_NODE" ]; then
+      genv="$genv
+LIBGL_KOPPER_DRI2=1"
+    fi
     if [ "$GPU_ENV_MODE" = write ] && [ -n "$KOPPER_MESA" ]; then
       printf '%b\n' "$genv" | h "cat >$HOSTDIR/gpu.env"
       echo "  wrote $HOSTDIR/gpu.env: sessions with GPU sides render on the guest's GPU"
     else
-      note "gpu.env NOT written (WC_LAUNCH_GPU_ENV=write and WC_LAUNCH_KOPPER_MESA enable it); it would be:"
+      note "gpu.env NOT written (WC_LAUNCH_GPU_ENV=write and WC_LAUNCH_GPU_MESA enable it); it would be:"
       printf '%b\n' "$genv" | sed 's/^/          /'
     fi
   fi

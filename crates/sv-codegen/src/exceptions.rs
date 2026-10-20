@@ -839,6 +839,12 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     ("vkGetImageMemoryRequirements", "as vkGetVideoSessionMemoryRequirementsKHR"),
     ("vkGetImageMemoryRequirements2", "as vkGetVideoSessionMemoryRequirementsKHR"),
     ("vkGetDeviceImageMemoryRequirements", "as vkGetVideoSessionMemoryRequirementsKHR"),
+    // §103.19: on a Mac a shared image is an IOSurface texture, so the
+    // host-allocation question is asked of the driver as an MTLTEXTURE one.
+    ("vkGetPhysicalDeviceImageFormatProperties", "uses the same native image storage contract as the 2 form"),
+    ("vkGetPhysicalDeviceImageFormatProperties2", "on macOS a host-allocation image query is asked as MTLTEXTURE"),
+    ("vkGetPhysicalDeviceFormatProperties", "on macOS LINEAR gains what an IOSurface-backed image allows"),
+    ("vkGetPhysicalDeviceFormatProperties2", "on macOS LINEAR gains what an IOSurface-backed image allows"),
     // --- 5. a handle the registry does not type as one --------------------
     //
     // `VkDebugUtilsObjectNameInfoEXT::objectHandle` is a `uint64_t` carrying

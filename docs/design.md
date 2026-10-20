@@ -3459,6 +3459,13 @@ easy fixes would have been a more satisfying deliverable and a less honest one.
 
 ### 0.21 Where a decoded frame lives, and the arena's answer is "not here"
 
+Current implementation: `waycompose-design.md` §112 exports shared sections
+as dma-bufs and uses Zink's upstream VA-API frontend for stock Firefox's
+default decoder. The former application readback patch has been removed.
+This section records the earlier design; the stock guest hardware and
+sandboxed decode proof is still required.
+
+
 Design, 2026-08-14. No code. §0.8 item 2 and §6 of `docs/video-decode.md` left
 one decision unmade — *whose memory holds the decoded picture* — and it is an
 arena question, so it is settled here before anything is built against a guess.

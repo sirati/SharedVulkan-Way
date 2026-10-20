@@ -202,15 +202,17 @@ stamps: a warm session pays it once instead of once per click.
 
 ```
 scripts/sv-video-decode.sh
-scripts/sv-firefox-vulkan-decode.sh       # with SVFD_FIREFOX=<patched firefox>
+scripts/sv-firefox-stock.sh               # stock Firefox: WebRender, WebGL, VA-API decode, zero copy
 ```
 
 **Hardware video decode through the forwarder.** The GPU side serves its
 driver's decode queue family, and `video-probe` and ffmpeg's own Vulkan decoder
 (H.264, H.265 8- and 10-bit, AV1, VP9) decode through it byte-identically to
-libavcodec. A Firefox 157 built with `nix/firefox-vulkan-readback.patch` decodes
-H.264 on the forwarded device and about:support lists it as hardware decoding;
-an unpatched Firefox decodes in software, cleanly. `docs/video-decode.md` §7 is
+libavcodec. The stock Firefox path uses VA-API through upstream Zink's VA driver (Mesa main,
+`nix/mesa-zink-va.nix`) over the forwarded Vulkan Video, the decoded frames
+handed to WebRender as dma-bufs that name guest sections (`docs/waycompose-design.md`
+§112). The final stock guest hardware/sandbox proof remains open. Both the
+Firefox readback patch and the Mesa kopper Wayland patch have been removed. `docs/video-decode.md` §7 is
 the account, with what is still unmeasured — NVIDIA and the guest's Intel among
 it.
 

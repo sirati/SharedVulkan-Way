@@ -114,35 +114,62 @@ crash therefore does not return these host-provided pages to the guest page
 allocator. The host must still retain live backing until acknowledged release.
 This does not solve crash safety for the separate wired guest-RAM backend.
 
-## Broker and ICD integration gates
+## Broker and ICD attachment
 
-The adapter selects/maps a subrange in the root broker and can request an owned
-Mach memory-entry send right for exactly that mapping. Kernel support for
-exporting this I/O mapping as a memory entry must be tested; an error is returned
-without falling back to a copy. Its Rust `MemoryEntry` is not an fd.
+The multi-user capability is held. The preparatory VM-wide single-uid gate
+below is mandatory and does not complete per-range ownership.
 
-The existing Unix broker protocol transfers fds with SCM_RIGHTS. It cannot
-transfer a Mach send right. Complete client attachment still needs:
+The root broker can publish an explicitly configured BAR2 slice with
+`serve --pci-slice UID:POOL:REGISTRY:OFFSET:LEN:EPOCH`. Integers accept decimal
+or `0x` hexadecimal. Registry IDs identify `WCIVSHMEM` devices, not arbitrary
+paths. Slices must contain whole driver pages, stay within BAR2, and not overlap
+another configured slice. The uid is root configuration, never client input.
+The same functionality is available to an embedding broker through
+`macos_pci::publish`.
 
-1. A shared-broker Mach-right handoff authenticated by the kernel audit token's
-   uid and pid, with existing core region ownership/lease decisions. No
-   parallel authorization daemon or caller-supplied uid is acceptable.
-2. A receiver mapping API that owns the Mach right and deallocates its mapping
-   only at epoch teardown. `SharedRegion::from_raw` alone does not transfer
-   the mapping owner's lifetime; `map_fd`/`map_fixed` cannot consume a Mach port.
-3. Host-side allocation/announcement of non-overlapping per-user BAR extents,
-   the existing MAPPED/RETIRING/UNMAPPED protocol, and retained region leases.
-4. A broker bell adapter that arms the kernel IRQ port, fans wake hints to
-   authorized sessions, and rescans rings after attach/reconnect/rearm.
-5. A macOS `RingTransport::connect` cold path using those mappings and bells.
-   `sv-icd/src/transport.rs` currently returns the Linux/Windows-only error on
-   macOS. `BEAT_INTERVAL` and `finish_attach` are also gated to those systems;
-   expand those gates only with a working macOS attach path.
+Publication probes public `mach_make_memory_entry_64` export before making the
+region visible. I/O-memory export can refuse on a target kernel. That refusal
+propagates to the caller, with no copied allocation or file substitute.
 
-The ICD build script now emits `./libsv_icd.dylib` in the macOS manifest. The
-explicit relative directory resolves beside the manifest, so a cross-built
-package can be copied without relying on dyld search paths. This filename fix
-alone does not enable client attachment.
+A client first obtains an ordinary `find` lease on the existing Unix broker
+connection. The reply marks a PCI piece `mach`, with no SCM_RIGHTS fd. A
+LaunchDaemon MachServices endpoint, `org.waycompose.broker.memory`, redeems
+that piece. The kernel audit trailer supplies the sender's effective uid and
+pid. The shared Core must find a connected, positive lease with that exact
+identity and epoch, including for root callers. The existing broker mutex
+remains held through memory-right transfer or a doorbell write. There is no
+second authorization manager, secret, or pending-token table.
+
+The Mach endpoint checks in through launchd and never falls back to registering
+an unprivileged service. Clients require a root audit identity on each reply,
+which rejects service substitution in a user's bootstrap namespace. Requests
+and replies use fixed sizes and validate descriptors, operation, nonce, epoch,
+and piece geometry. Rejected received messages destroy their attached rights.
+Successful receivers retain the Mach send right, a shared `mach_vm_map` view
+with `copy=false` and `VM_INHERIT_NONE`, and the ordinary broker connection.
+Every `SharedRegion` slice retains this owner. File-only APIs reject `mach`
+pieces instead of indexing an empty descriptor list.
+
+Set `SV_SOCKET=broker-pci:POOL` and `SV_BELL=pci:PEER:VECTOR` for the Intel macOS
+ICD path. It uses the existing pool mailbox and `poolattach::check` offer
+validation, including protocol IDs, pool nonce, geometry, bounds and stamps.
+The common attach function claims rings and starts heartbeats. Arena use must
+remain leased and entirely inside the selected aperture; host-region growth
+outside it is refused.
+
+Doorbell writes stay in the root broker and require the same lease. Application
+producer calls enqueue a coalesced hint without blocking on Mach IPC. One
+root IOKit async IRQ owner per PCI registry ID shares counted hints among its
+published slices. A bounded Mach wait retains the mapping while sleeping
+outside the Core lock, then rechecks the lease before replying. Eight wait
+workers have a separate bounded queue from two immediate-operation workers,
+so blocked IRQ waits cannot occupy redemption or outgoing-bell capacity. The client
+rescans its process-owned control set and cold mailbox on each changed IRQ
+count. Wait expiry does not release a mapping or a region lease. This entire
+Mach/IRQ path is offline-compiled only and requires the runtime proof below.
+
+The macOS manifest uses `./libsv_icd.dylib`, so the library resolves beside the
+manifest without relying on dyld search paths.
 
 ## Offline builds and runtime gates
 
@@ -179,3 +206,39 @@ stability over growth, GPU lease retirement, broker death/reconnect, MSI wake
 counts and idle round-trip latency. A real Mac or daily-use VM must not be used
 to bypass these gates. Stock applications, their sandbox, and stock Zink Mesa
 remain unchanged.
+
+## Preparatory ownership restriction: multi-user lending held
+
+Mach rights and receiver mappings can outlive the Unix lease and the broker.
+A guest reboot also does not drain persistent host backing or host GPU writers.
+The current ivshmem ABI has no trusted host-backing identity that survives
+registry/service aliases, PCI address relocation and guest boots. Registry IDs,
+BAR addresses, pool headers writable by clients, and boot IDs cannot establish
+that identity or prove safe reassignment.
+
+Consequently this candidate does **not** complete multi-user per-range lending.
+Publication and the Mach service fail closed unless the existing read-only
+`/Library/Application Support/waycompose/pci-vm-owner` anchor restricts every
+PCI backing in the VM permanently to one uid. This is deliberately broader
+than a device or slice. A different uid is refused even for disjoint ranges,
+new registry IDs, other devices, aliases, relocated BARs or another boot.
+The shared broker crate's immutable raw-device snapshot policy enforces it;
+there is no second daemon or watcher.
+
+The staging snapshot version is `wc-pci-vm-owner-preparatory-v1`, with exactly
+one tab-separated row binding `all-pci-backings` to a canonical `uid:N`.
+All ancestor directories must be root-owned and not writable by group/others;
+the anchor must be a root-owned regular 0400 file with one link. Nonempty macOS extended ACLs are also refused, including on ancestors. Symlinks,
+missing, malformed, oversized, ambiguous or untrusted state grant nothing.
+The broker never writes, provisions, clears, resets or reassigns this state.
+Initial provisioning or any change requires a separately admitted host drain,
+backing reset/zero proof and ownership migration; none is authorized or
+performed by this candidate. Deleting state disables lending, not enrollment.
+
+Completing the intended multi-user capability needs a trusted host-supplied
+canonical backing identity and relative physical range, outside client-writable
+memory, with identical identity for every alias and persistence across guest
+boots/PCI relocation. That identity must feed the shared broker's durable
+per-range uid policy before publication/export. Reassignment additionally needs
+a proven host GPU drain and backing reset/zero boundary. Until then the
+single-uid gate is preparatory and the multi-user capability remains held.

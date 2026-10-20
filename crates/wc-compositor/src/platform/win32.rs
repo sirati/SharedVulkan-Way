@@ -1266,6 +1266,8 @@ impl WindowState {
             vertical: v,
             v120_h,
             v120_v,
+            finger: false,
+            stop: false,
             time,
         });
     }
@@ -4365,8 +4367,27 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
     } else {
         w.placing.set(true);
         w.self_driven.set(true);
-        unsafe {
-            if !w.mapped.replace(true) {
+        if !w.mapped.replace(true) {
+            // Prevent painting CW_USEDEFAULT's larger initial rectangle, which
+            // leaves stale desktop pixels after resizing under Wine. Keep the
+            // default position until ShowWindow chooses Windows' cascade.
+            let (mut ww, mut wh) = (rc.right - rc.left, rc.bottom - rc.top);
+            if let Some(work) = work_area_of(w.hwnd()) {
+                ww = ww.min(work.right - work.left);
+                wh = wh.min(work.bottom - work.top);
+            }
+            // SAFETY: a live hidden window; placing/self_driven suppress the
+            // intermediate size echo. Frame recalculation remains below.
+            unsafe {
+                SetWindowPos(
+                    w.hwnd(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    ww,
+                    wh,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
                 ShowWindow(w.hwnd(), SW_SHOWNORMAL);
             }
         }
@@ -4409,10 +4430,10 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
                 ww,
                 wh,
                 // §46: `SWP_FRAMECHANGED` when this window's caption is folded, so
-                // that the one `SetWindowPos` at map both sizes the window and asks
+                // that this final `SetWindowPos` both places the window and asks
                 // `WM_NCCALCSIZE` again. `frame_glass` above did the DWM half and
-                // deliberately no `SetWindowPos` of its own — two of them at map is
-                // what made the Wine keyboard leg flaky.
+                // deliberately no frame recalculation of its own. An unguarded
+                // extra call caused size echoes that made Wine keyboard input flaky.
                 SWP_NOZORDER
                     | SWP_NOACTIVATE
                     | if w.frame.get().extend_top { SWP_FRAMECHANGED } else { 0 },
@@ -5916,7 +5937,7 @@ fn set_cursor(ui: &Rc<Ui>, spec: CursorSpec) {
             }
             (h, false, format!("{} ({})", icon.name(), stock.name))
         }
-        CursorSpec::Image { image, hotspot_x, hotspot_y } => {
+        CursorSpec::Image { image, hotspot_x, hotspot_y, .. } => {
             match make_cursor(image, *hotspot_x, *hotspot_y) {
                 Some(h) => (
                     h,
@@ -6282,6 +6303,8 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         },
         PumpInner { ui },
         primary_work_area(),
+        // §103.18: Windows' per-monitor DPI is not read yet.
+        1,
     ))
 }
 

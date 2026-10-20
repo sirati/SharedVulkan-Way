@@ -289,7 +289,10 @@ impl<P: Platform> Broker<P> {
 
     /// Serve one connection until it ends.
     pub fn client(&self, conn: P::Conn, writer: P::Writer, peer: Peer) {
-        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let Ok(id) = self.next_conn.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) else {
+            log("connection generations exhausted");
+            return;
+        };
         let writer = Arc::new(Mutex::new(writer));
         {
             let mut st = self.lock();
@@ -298,7 +301,9 @@ impl<P: Platform> Broker<P> {
         }
         let me = self.clone();
         let pid = peer.pid;
-        if !self.platform.watch(pid, Box::new(move || me.exited(pid))) {
+        let watched = self.platform.watch(pid, Box::new(move || me.exited(pid)));
+        self.lock().core.owner_watch_ready(id, watched);
+        if !watched {
             log(&format!("connection {id}: process {pid} cannot be watched; its connection stands for it"));
         }
         let mut rd = BufReader::new(conn);
@@ -503,6 +508,16 @@ impl<P: Platform> Broker<P> {
                     p.push(w, &format!("err {e}"))
                 }
             },
+            Request::Owner => match st.core.owner(id) {
+                Ok(connection) => p.push(w, &format!("ok owner {} {connection}", self.run)),
+                Err(r) => refused(w, r),
+            },
+            Request::ObserveOwner { run, connection, pid } => {
+                if *run != self.run { p.push(w, "err owner belongs to another broker run") }
+                else { match st.core.observe_owner(id, *connection, *pid) {
+                    Ok(()) => p.push(w, "ok"), Err(r) => refused(w, r),
+                } }
+            },
             Request::Subscribe => match st.core.subscribe(id) {
                 Ok(()) => p.push(w, "ok"),
                 Err(r) => refused(w, r),
@@ -594,6 +609,20 @@ impl<P: Platform> Broker<P> {
     /// the new lease and sends no handles. Checks must never call the broker.
     pub fn on_leased_checked(&self, f: LeaseCheck) {
         self.lock().on_leased_checked.push(f);
+    }
+
+    /// Redeem one piece over another OS-authenticated local channel. The
+    /// existing core lease is checked under the same lock that holds the
+    /// objects alive and serializes close/retire. The callback must not call
+    /// the broker. It must finish transferring the capability before return.
+    pub fn with_region_lease<T>(&self, peer: &Peer, id: ObjId, epoch: u64, piece: usize,
+        transfer: impl FnOnce(&P::Object, u64, u64) -> io::Result<T>) -> io::Result<T> {
+        let st = self.lock();
+        st.core.leased_region(peer, id, epoch).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.0))?;
+        let held = st.objs.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "region object missing"))?;
+        let (obj, (offset, len)) = held.iter().flat_map(|h| h.pieces.iter().map(move |p| (&h.obj, *p)))
+            .nth(piece).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "region piece missing"))?;
+        transfer(obj, offset, len)
     }
 
     /// The processes holding a lease on region `id` now, so that a

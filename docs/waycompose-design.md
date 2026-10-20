@@ -32627,7 +32627,7 @@ is added to the common modes. The mapping:
 | `Key`, `KeyboardFocus` | `keyDown:`/`keyUp:`/`flagsChanged:`; `kVK_*` to evdev table (written here from Apple's `Events.h`, not taken from cocoa-way) |
 | `Layout` | `TISCopyCurrentKeyboardLayoutInputSource`, read when a window becomes key and on the 250 ms timer, mapped to the compiled-in `us`/`gb`/`de`/`fr` |
 | `Resized`, `Activated`, `Minimized`, `CloseRequested` | `NSWindowDelegate`: `windowDidResize:`, `windowDidBecomeKey:`, `windowDidMiniaturize:`, `windowShouldClose:` (returns NO and asks the client) |
-| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x |
+| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x. Superseded by 103.18: the output's scale is the screen's, and the layer's `contentsScale` follows |
 | `IdleInhibit` | `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep)` |
 
 **The Cmd key.** A Mac user presses Cmd+C to copy, and a Linux application
@@ -33426,11 +33426,71 @@ the bell port: no ssh, socket, TCP or vsock in the session's path.
 * The proxy's microphone source failed to load (`mkfifo sound-2.fifo: File
   exists`) once the Mac's devices were re-announced.
 
+### 103.18 Output scale: Retina without blur
+
+Until this section every surface pixel was one Mac point, and on a Retina
+screen AppKit doubled the layer: correct and soft (103.7's table). Now the one
+output has an integer scale S, which the platform gives (`Started::scale`):
+the main screen's `backingScaleFactor`, rounded, at least 1, on macOS; 1 on
+Win32 and headless. `--output-scale N` overrides it, for a harness. It is read
+through `State::scale_for(surface)`, so a platform with a scale per monitor
+(Windows' per-monitor DPI) changes that function and the output setup, not the
+readers.
+
+**Logical stays logical.** Configure sizes, window geometry, input, pointer
+constraints, popup placement, `ToUi::Map`/`Resize`/`MovePopup` and the
+control socket's rectangles are in surface units, which are Mac points. Only
+pixels are in device pixels.
+
+**What a client sees at S > 1:**
+
+| | S = 1 (unchanged) | S > 1 |
+|---|---|---|
+| `wl_output.mode` | logical size | logical size × S |
+| `wl_output.scale` | not sent (1) | S |
+| `wl_compositor` | version 5 | version 6 |
+| `wl_surface.preferred_buffer_scale` | never | S, at `new_surface` |
+| a buffer of scale B ≠ 1 | drawn unscaled, and logged | honoured |
+
+**Pixels.** A surface's staging shadow, and so a window's shadow, is its
+logical size × S. A buffer with B = S is copied 1:1. Any other B is a view
+(`surface::view_of`, §102's path): the whole buffer resampled, nearest
+neighbour, to (buffer / B) × S, which is ×2 for an Xwayland or other B = 1
+client on S = 2. A viewport's destination is logical, so it is × S as well.
+Surface damage is mapped into buffer pixels (× B), buffer damage into the
+shadow by the view (S / B, widened by a pixel), and subsurface offsets (× S)
+when the tree is composed. Readers that want a size (bounds, hit test,
+pointer holds, the geometry-only commit, `mapped_windows`) divide by S
+(`State::surface_size`). The shadow carries its scale (`Shadow::scale`), so
+the platform knows how many points it is.
+
+**macOS.** The layer's `contentsScale` is set to the shadow's scale on every
+present, since AppKit resets it when a window changes screen; window and popup
+frames already come from logical sizes. The face's IOSurface pair is the
+shadow's size in pixels, and `ToFace::Surface` carries the scale. A client
+cursor's `NSImage` is sized in points (`image / B`, `CursorSpec::Image.scale`),
+with the hotspot in points; Win32 ignores the scale, as before.
+
+**Checked here (Linux, headless, `--output-scale 2`).** weston-terminal
+(version 5, told by `wl_output.scale` and `enter`) drew at B = 2 into a
+1484x854 shadow for a 742x427 window, after a first B = 1 frame that was
+doubled; foot (version 6) read `preferred_buffer_scale(2)` before its first
+frame; weston-presentation-shm stayed at B = 1 and was doubled. At S = 1
+weston-terminal's frame hashes were those of the binary before this section.
+The macOS half (`contentsScale`, the cursor's size, popup frames on a Retina
+screen) was compiled, not run.
+
+**Not built.** Fractional scale (`wp_fractional_scale_v1` with viewporter,
+for 125 % and 150 %), which this does not design out: the scale is per output
+and the view path already resamples. A scale that changes while running (a
+window moved to a screen of another scale): S is read once at start. Windows'
+per-monitor DPI. A filter better than nearest neighbour for B ≠ S.
+
 ### 103.12 Not built, and not proven
 
 * **Not built.** Drag and drop in either direction. IME and dead keys beyond
   what XKB composes in the client (no `NSTextInputClient`, no `text-input-v3`).
-  Retina scale above 1. SVG icons (the host's resolver
+  Fractional scale (integer Retina scale is 103.18). SVG icons (the host's resolver
   has no renderer, as on Windows). A frequent-pages section in the Dock menu
   (`macbundle::dock_items` takes them, and the launcher does not fetch
   `frequent` yet).
@@ -36961,8 +37021,9 @@ the Looking Glass B7 ivshmem driver leaves its devices
 process mapped the GPU device directly before the broker (`direct-opened`,
 `bw ... 4.97 GiB/s` as u1). After it, the same open is access denied. A port
 another process holds cannot be opened to change its descriptor (vioser is
-exclusive); it keeps its live descriptor until it is free, and the property
-takes over at its next start.
+exclusive). Startup refuses if the port's live or PnP protection cannot be
+verified. Security reads retry access-denied opens for up to two seconds to
+allow asynchronous driver closes to finish; unreadable protection still fails.
 
 **Regions.** Unnamed pagefile sections (`CreateFileMappingW` with no name,
 `SEC_COMMIT`), so no other process can open one by name; `large` adds
@@ -36988,7 +37049,10 @@ died is started again and given every region. So a region the host still
 maps is lost only if the broker, the holder and every provider die together;
 before the holder, the broker's crash while the provider was down was enough.
 An orderly stop of the service leaves the holder running (an upgrade keeps
-the regions); `sv-guest broker holder-quit` ends it, which uninstall does.
+the regions). `sv-guest broker holder-quit` atomically refuses while any
+region remains. Normal region release permits holder exit. On refusal,
+uninstall retains the binary, service, protections and recovery state, and
+restarts a previously running service to adopt retained regions.
 
 **Signing (§111.6).** `Platform::identity` is `os=windows
 user=<LookupAccountSidW name, %XX-escaped to one word> id=<SID>`. The keys are
@@ -37008,6 +37072,10 @@ device 0) and `wcbell`, the GPU process for `gpu` (its `--ivshmem-slot`) and
 `[wc-broker] device NAME: not from the broker (WHY); opening it directly`,
 and the open as before; `WC_BROKER=off` skips it. `wc-launch` needs no
 device.
+
+The following measurements describe the original broker. Its cross-SID raw
+BAR regrant and unconditional uninstall behavior are superseded by the
+ownership and checked-shutdown restrictions below.
 
 **Measured**, on a local test VM (the deployment host's QEMU 10.2.2, 3 GiB, 4 vCPUs,
 a 64 MiB ivshmem device at 0x1c and one at 0x1d, the Looking Glass B7
@@ -37045,14 +37113,78 @@ runs `wc-broker-install.ps1 -Action install` over its administrator channel:
 Program Files, the service, failure actions, the §91 task and its files
 removed, the service started. Then `-Action key -Install NAME` with the
 installation's key on stdin, and the user's `session.key` is deleted.
+`WC_LAUNCH_BROKER=key` registers only this installation's key in an already
+running broker. It never installs or restarts the service and is allowed for
+tests. The key and its protected parent directories belong to Administrators
+and grant access only to SYSTEM and Administrators. Provisioning replaces the
+key object using a protected temporary file, then replaces the whole DACL.
+An already-open handle to an old readable key cannot observe the rotated
+bytes. Reparse directories and key paths are refused. The service executable
+and recovery files also have privileged ownership. This matters because an
+owner can change a DACL even without a grant in that DACL.
+Installation does not trust SCM's transient Running state alone. The ready
+command opens an overlapped pipe, checks its kernel server PID against the
+current running SCM service and its token SID against SYSTEM, then checks
+hello/stats. While the verified process remains pinned, it independently
+checks both live and PnP protection for present BARs and doorbell ports, then
+rechecks process liveness and SCM before success. Each exchange has a one-second I/O deadline; cancellation is
+drained before its buffers disappear. Generic private/user broker clients
+keep their existing connection behavior.
+
 `WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
 and `broker-uninstall` (service deleted, devices' descriptors restored,
-holder ended, keys kept).
+holder ended, keys kept). A deploy with `skip` refuses if the broker already
+exists, before stopping a session or copying any files. Use `key` there;
+recreating a desktop-readable signing key would defeat the broker identity
+check. Unknown service status also refuses the deploy.
+
+**Rollback baseline and refusal.** The first broker start records each device's
+live DACL and PnP descriptor before changing either. Binary `SPDRP_SECURITY`
+includes the mandatory label. The five-column `devices.txt` and durable count
+checkpoint are flushed before mutation. Missing, truncated, unreadable or
+invalid installed history requires trusted recovery. A fresh install records
+an explicit empty baseline; restart cannot invent lost history. Independent
+startup verification requires both live and PnP descriptors on the BARs and
+doorbell ports to remain protected, even when securing failed or rollback history was lost. Unknown or
+permissive protection fails before the public pipe or signer is created.
+Missing optional devices are skipped. Protected devices with missing history
+can still recover retained holder sections; their uninstall stays refused.
+
+Uninstall checks before stopping the service whether either original raw BAR
+descriptor could expose old bytes. Anything beyond the exact protected SYSTEM
+and Administrators DACL refuses restoration. Direct `revert-acl` enforces the
+same check. Retaining the SID file cannot police direct opens through a
+permissive DACL. Uninstall is therefore unavailable for ordinary pre-broker
+permissive raw baselines and is not an application rollback procedure. The
+installer retains the original port task/files and all recovery state on
+refusal. Any saved legacy grant task, script or port map also refuses uninstall
+before service mutation. Such unreviewed code could undo safe raw descriptors
+later, so protected original ACLs alone do not make legacy task restoration safe. Only an empty holder and protected raw baseline permit removal.
+
+Raw BAR ownership is bound to the canonical physical PnP instance and a
+privileged reviewed SID policy. Process exit, holder or broker restart, and
+protocol alias changes cannot reassign it. Missing or untrusted policy denies
+access. There is no first-claim or reset API. This is a single-owner limitation
+until host/GPU drain can be proved.
+
+A private Windows clone proved old BAR bytes crossed SIDs before this policy.
+The corrected binary refuses the other SID after process exit, holder
+replacement and broker restart; the owner still reads its original bytes.
+Both ordinary users are denied direct raw opens. An actual-section proof
+retained `user1-secret` through refused uninstall and direct refused holder
+quit, recovered the same holder, then adopted/read and normally released it.
+Unsafe raw rollback and missing-baseline uninstall refuse before service
+mutation. Evidence is
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`, especially
+`raw-policy-clone.txt`, `raw-policy-alias.txt`,
+`uninstall-lifetime-proof.txt` and `uninstall-direct-open-denied.txt`.
+The final real Windows unit run passed all 30 tests in
+`uninstall-windows-units-final.txt`.
 
 **What remains.** Running the compositor and the GPU process on the VM under
-the broker end to end (the probe exercises the same calls, not the products);
-the stamping hook's implementation (windows-guest-ram's); a run on the deployment guest
-(not touched here).
+the broker end to end under the mapped Linux user (the probe exercises the
+same calls, not the products), and a run on the deployment guest (not touched
+here). The large-page stamping hook is implemented by `stamp_guest_ram`.
 
 ### 111.9 macOS
 
@@ -37147,9 +37279,27 @@ or an existing broker socket before changing either end's installed files;
 it no longer issues `launchctl bootout`. To upgrade, first end sessions and
 verify their host release, SIGTERM the daemon, wait for its exit, and prevent
 new sessions before unloading its job. Never force bootout of an old broker
-that still holds regions. A crash, explicit SIGKILL, or VM termination still
-removes this process's holds; crash-safe retention needs an independent
-holder and adoption, and is not implemented.
+that still holds regions.
+
+**Independent retention after broker death.** Before any region grant, a
+private retention process receives the already allocated shared-memory fd,
+creates its own shared mapping, independently calls `mlock`, and acknowledges
+success. It is another invocation of `wc-broker`, with no public socket,
+allocator or authorization endpoint. The broker alone decides grants and
+normal destruction. The holder uses a separate session/process group, and
+launchd's `AbandonProcessGroup` preserves it when the broker exits.
+
+Broker EOF never frees its mappings. The holder restores their metadata as
+orphans in the same `Core` lifetime engine, uses `Release::Probe { after: None }`,
+and frees only the matching user's pool when its boot page carries the host
+release word. Other pools remain wired. No deadline, signal handler or channel
+error unwinds existing holds. A missing or failed holder refuses new grants.
+This covers a broker-process crash with a surviving holder. It does not cover
+holder and broker failure together, VM termination, or the GPU server's own
+extent. A region never stamped with a boot release page may remain held
+indefinitely after broker death. New brokers do not yet re-adopt old holders;
+those holders independently wait for host release rather than freeing on
+restart.
 
 #### 111.9.4 Tests
 
@@ -37285,20 +37435,50 @@ Before upgrading the old service with live sessions, drain those sessions
 through their actual owner. Old global checkpoints cannot prove installation
 ownership and are not automatically migrated.
 
+**Independent-holder macOS runtime proof, 2026-10-20.** The disposable
+`wayland-host` VM ran at 3072 MiB under an exclusive run lease, using the
+vmhost-built broker from `5ec8367`. A native fixture allocated two 64 KiB regions
+in pool A and one in pool B, stamped them, closed every fd and mapping, and
+exited before the broker was killed. No GUI or application workload was used.
+
+The root LaunchDaemon broker PID 383 was SIGKILLed. Twelve seconds later its
+separate holder PID 385 remained, reparented to launchd. Native
+`mach_vm_region(..., VM_REGION_BASIC_INFO_64, ...)` inspection reported
+`user_wired_count=1` for all three independent holder mappings, at the same
+addresses observed before broker death. The host wrote sentinel values directly
+through QEMU's shared guest-RAM backend both before and after the broker kill;
+Mach reads of the holder's mappings verified both values.
+
+The host then wrote pool A's release word exactly once, stopped accessing that
+pool, and observed both A mappings disappear while B remained wired at the same
+address with its sentinel intact. Pool B's release ended the holder. A successful
+sudo process-table snapshot positively established its absence. Panic-file
+counts stayed 4 before and 4 after. This proves broker-process SIGKILL retention
+and per-pool host release in this macOS VM; it does not test simultaneous
+holder/broker death, a full graphical session or the GPU server's own extent.
+
+The VM was cleanly stopped, its exact prior 4096 MiB configuration restored, and
+the temporary job, binaries and socket removed. Both existing host units kept
+their PIDs and arguments throughout. Measured VM-unit MemoryPeak was
+5,239,672,832 bytes including QEMU/cache. Evidence is in
+`evidence/session-fixes/broker-mac/holder-vm/`. An earlier successful run is
+retained as `holder-vm-first`; the final run strengthened holder-exit observation
+with a successful full process-table query.
+
 #### 111.9.5 Limits
 
 * **One wcbell port.** The VM has one rings port, and a port has one holder.
   A second macOS user's session gets no doorbell: it polls its rings, and the
   host finds its record only by a periodic sweep (`--sweep-secs`). A port per
   user (`org.sirati.wcbell.N`, a chardev each on the hub) is the fix.
-* **A broker that dies loses its holds.** Normal SIGTERM retains every
-  live and orphan region until release, and launchd has no automatic
-  SIGKILL deadline, but a crash or explicit forced kill is still unsafe.
-  launchd restarts it, but the new
-  process holds none of the old one's regions: a main process that dies after
-  that, before its session's release, is the §103.15 case again. The broker
-  has no state to lose otherwise. A main process could hand its fds back to a
-  new broker (`adopt` with fds); not built.
+* **Independent holder limits.** A broker-process crash leaves its separate
+  wired holder alive until host release. Simultaneous holder/broker death or
+  VM termination still loses those wires. Restarted brokers do not re-adopt
+  the old holders, so old allocations remain private to their original
+  clients until host release; missing release pages retain memory indefinitely.
+  The disposable macOS VM proof above verifies independent wiring and
+  launchd survival for a broker-process SIGKILL. It does not establish safety
+  against failure of the holder itself or a terminated VM.
 * **The GPU server's own extent** is still its own superpages: kept by
   nothing if the GPU server itself crashes while `sv-hostd` serves it
   (§103.15's remaining case). Moving it into the broker would change its
@@ -37527,12 +37707,117 @@ generation with `services.waycompose`. For each installation it does this:
   for the admin and the desktop user are dropped and one for `waycompose` is
   added; the VM is not restarted;
 * `remove-old` deletes the admin's copies only after a session was seen
-  working; `rollback` puts the admin's units and links back.
+  working. `rollback` restores a previous protected installation snapshot
+  beneath the system layout, with its current trusted key. It keeps the
+  system services, user mapping and broker protection. It never restores
+  admin user units, desktop raw-resource ACLs or an exposed old key. A
+  missing confirmed snapshot refuses rollback. First migration preserves
+  the original `wc-launch` profile renderer and `libsv_wlshim.so` presentation
+  library while upgrading the broker-dependent launcher script, proxy, ICD
+  and transport services. The pre-broker installation is kept under
+  `legacy-original` as recovery history, not executable rollback.
 
-A dry run under `ROOT=` on a tree shaped like the VM host's (three
-installations, a profile with a lock file, Prism data with absolute paths and
-a binary file) gave the expected tree for plan, apply, rollback, apply again
-and remove-old. Not run on the VM host itself.
+  Run a real mapped-user product session successfully, end it, then invoke
+  `wc-users-migrate.sh baseline-confirm ADMIN DESKTOP unused INSTALL`.
+  This explicit operator confirmation snapshots that tested protected
+  installation. It does not run the product test itself. Replacing an
+  installation requires a confirmed baseline; deployments never overwrite it
+  automatically. Confirm a later candidate only after its own successful
+  product session. Root first installs the accepted stock-policy source hashes
+  in `/var/lib/waycompose/policy/stock-session.sources`, owned by root with
+  mode 0600 beneath a root-owned 0700 directory. Each line is
+  `stock-defaults-v1 SHA256`, from the exact script accepted by the real
+  mapped-user stock-policy proof. Deployment never creates this receipt.
+  Confirmation records that source hash alongside the tested snapshot;
+  deployment and rollback validate the actual script bytes against it.
+  Old pre-stock snapshots or a newly added version label alone cannot pass.
+  Adding a reviewed policy source requires its own successful product proof;
+  preserve an older receipt entry only while that source remains approved.
+  Rollback restores the accepted application's configuration
+  and binaries, including its known-working broker-aware transport baseline,
+  with the current trusted key. Shared services and user mapping stay in place.
+  Both confirmation and rollback require idle admin and mapped-user sessions.
+
+Before first-install SCM changes, the Windows installer creates a fresh
+privileged Data directory object and empty signer tree under a validated
+parent. It moves the entire old Data object into a newly protected recovery
+container without traversing or normalizing retired descendants. A retained
+old writable directory handle can change only that retired generation.
+Directory creation uses native atomic create-new semantics and supplies its
+owner/DACL at creation. Anchor validation walks from a verified local fixed
+HarddiskVolume root through every parent. It rejects ambiguous paths, SUBST,
+reparse ancestors and unprivileged replacement/ACL rights. Only DELETE alone
+on the verified volume root is exempt, since that object has no removable
+parent entry. The same right on any nonroot ancestor refuses. Existing raw security history refuses fresh replacement
+and requires trusted recovery.
+
+Existing-service installs require protected directory-generation receipts
+bound to current NTFS object IDs, plus per-install key enrollment receipts.
+The key action requires a valid fresh Data generation and creates each new key
+object with privileged security at creation. The executable directory similarly
+requires fresh generation provenance; unknown, exposed or reparse binary
+directories refuse before Data or SCM changes. Unknown keys and stale receipts
+cannot bless replacement objects merely through owner/DACL normalization.
+
+Actual Windows filesystem fixtures exercised writable old parent handles,
+retired ACL edits and relative injected-directory/key creation. The active
+Data/Keys object identities and ACLs remained unchanged. A retained writable
+old key handle prevented old-directory rename; the installer failed closed
+without publishing a new generation. Fixtures also verified native name
+collision, raw-history and unsafe-anchor refusals and binary-directory
+provenance/reparse checks. No actual family/service/device objects were touched.
+
+Migration replaces the running raw-resource ACLs completely and makes their
+owner/group root, with only the named service account allowed. It clears
+inherited default ACLs on the directory and removes base group grants, so
+processes retaining an old `wc-arena` supplementary group cannot reopen the
+BARs. A bounded real-UID fixture verified both fresh opens fail for an already
+running UID1000/GID982 process, while both retained shared mappings remain
+writable and the designated service UID can still open the files. It used
+isolated temporary files, not family BARs.
+
+A bounded native fixture now proves the service and signer at uid 1000 map
+an authenticated boot record to a real agent and application at uid 1001.
+The named stock `wayland-info` application reads the live registry through
+`wc-session`, the proxy and control rings. Its proxy holds the descriptor the
+broker opened while direct opens of the service-owned synthetic BARs fail.
+The private user manager and every application use synthetic HOME/XDG paths;
+family VM, render-node and DRM paths are masked in both fixture namespaces.
+
+The rollback fixture executes the actual installed original `wc-launch`
+profile renderer, confirms a baseline only after that mapped-user product
+session ends, deploys a broken renderer and changed preferences, then runs
+`rollback`. The original renderer bytes and false preference return and the
+real application runs again. Transport hashes, service/signer processes,
+current protected key and an independent shared mapping/sentinel remain
+unchanged. The original presentation shim is restored by hash; GPU presentation
+is not exercised. This is a native synthetic-BAR fixture, separate from the
+real Windows broker tests, and does not restore pre-broker transports.
+Evidence is `distinct-uid-original-renderer-rollback.txt` beneath
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`.
+Family migration and deployment remain pending review.
+
+The integrated stock-policy fixture uses exact `64caaa6a` launcher policy with
+accepted `e5e19fdb` runtime handling, frozen as `19a3819c` with script SHA256
+`7e793295d0d0fb8f52dffaf09d64601c3d3d7b33081333d2ce5d103d89dc3d13`.
+Both real mapped-user sessions, before baseline and after protected rollback,
+removed exact old generated graphics/readback blocks from `user.js` and their
+persisted values from `prefs.js`, preserving an unrelated manual custom
+preference. A deliberately broken original-renderer replacement prevented the
+application from starting; rollback restored the actual original renderer and
+real application success. Baseline-v2 and the private source receipt were
+created only after the initial successful session ended.
+
+The fixture wrapper is named `firefox` to select the actual Firefox policy
+branch, and executes the stock `wayland-info` payload through the live rings.
+It does not run a browser or exercise GPU presentation or VA decoding. Source,
+recipe and native input hashes were verified before execution, including the
+original-product renderer/shim manifest. The controller used 436.7 MiB peak,
+within a 512 MiB/2 CPU slice; both controller and private manager mask family
+BARs, render nodes and DRM registration paths. Fixture/input trees, processes,
+units, uploads and transient limits were removed. The host canonical mapped
+runtime remained absent. No production source receipt was created.
+
 
 **wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
 runs as the desktop user, like his applications. Its seat is still brought up
@@ -37564,8 +37849,9 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   (`WC_LAUNCH_HOST_ROOT`, default `sudo -n`; `sudokey run --` on the deployment
   host), replaces `/var/lib/waycompose/installs/<name>` by it. The stage's
   paths become the installation's, the admin's home becomes `~/` (the mapped
-  user's), the GC roots are registered at their new path, an installed key is
-  kept, and the stage's copy of the key is deleted;
+  user's), and the GC roots are registered at their new path. Only a
+  root-generated, broker-confirmed key is installed. A legacy stage key is
+  discarded;
 * the deploy is refused unless `users.conf` maps the installation to a user. A
   test installation is named in the host's `wctestInstalls`, so it runs as
   `wctest`, with its profile in that user's home;
@@ -37573,6 +37859,42 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   left alone. `WC_LAUNCH_SYSTEM_BINS=install` replaces them and restarts both,
   which is a doorbell blip of about a second for every session;
 * the debug ssh transport is not available with it.
+
+Before the first privileged-identity migration, `key-prepare` stops both
+legacy and system verifiers after refusing active sessions. It disables the
+legacy admin units and removes retired verifier keys before provisioning,
+so a restart or reboot cannot revive exposed trust. It generates a
+fresh key beneath root-owned `/var/lib/waycompose/key-trust/<name>` with
+0700 directories and 0600 files. `key-export` sends that candidate directly
+to the deploy channel, never into the admin's staging tree. The Windows
+broker's privileged key provisioning must succeed before `key-confirm`
+records protected provenance. `apply` and `install-staged` refuse keys
+without that provenance. They never infer historical secrecy from a key's
+current owner or mode. Failure keeps the old verifier stopped; retry uses
+the same protected candidate. Already protected deployments reuse their
+key. Every script-managed shared-verifier restart first checks that all
+installed directories have protected broker-confirmed provenance and match
+their registry key; a partially migrated directory leaves services stopped. Privileged broker provisioning through the old user layout is refused.
+Generation provenance is written only when the helper actually generates a
+candidate. A preexisting key with root ownership and 0600 mode but no such
+provenance is refused, not relabelled. A lost candidate cannot inherit an old
+broker confirmation. A generated candidate interrupted before broker
+confirmation can be retried unchanged. Generation is serialized.
+
+The focused fixture reproduces a first migration whose candidate `wc-session`
+exits 91, then runs the restored original executable after protected rollback.
+It checks normalized system paths and the current trusted key. This is an
+isolated filesystem fixture, not a live mapped-user application session.
+The private Windows clone additionally passed real broker signing and host
+boot-record verification with the replacement key while rejecting the retired
+key. An already-open handle to the previously readable key retained only the
+retired bytes after replacement. The replacement object allowed only SYSTEM
+and Administrators. Evidence and the recipe are outside git in
+`evidence/session-fixes/broker-rollback/key-rotation-proof.txt` and
+`key-rotation-proof.ps1`; neither records key bytes or fingerprints.
+
+The root helper and privileged deployment channel are trusted administration
+interfaces, not interfaces exposed to desktop clients.
 
 `scripts/wc-users-migrate-test.sh` runs `install-staged` in a dry tree
 (paths, key kept across a redeploy, the mapped user, refusals) and deploy's
@@ -37626,104 +37948,144 @@ installation and on a plain host).
   (§110's `region_path` of a `broker:` boot name) are not reachable through
   the broker yet. That is the guest-RAM continuation's `find("gpu.<k>")`.
 
-## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
-
-**The fault.** On testhost on 2026-10-20 sessions ended twice ("its proxy
-is silent", 08:36 and 09:25). The Windows guest had not crashed: for six to
-ten seconds no vCPU halted while the passed-through iGPU came out of D3. The
-guest's runtime power management wakes it about once a minute. pci.sys then
-restores its config space through `0xcf8/0xcfc`, and every one of those
-exits waits for QEMU's BQL. The other vCPUs spin behind it. The 5 s lease
-(§103.14) then ended the proxy, and the session went down with it. Evidence,
-host traces and the proposal for the stall itself are outside git, in
-/mnt/datasets/builds/evidence/frozen-guest/.
-
-**Three witnesses, and what each decides.**
-
-1. **This session's pings**, every 500 ms, as before.
-2. **The guest's heartbeat.** The compositor beats the owner word of the
-   ring control region every 100 ms on a thread of its own (`ringlink.rs`,
-   `start_guest_beat`). Every session's proxy can read it. If the heartbeat
-   moves while this session's pings have stopped, the guest runs and only
-   this session's side is gone, so the lease ends after 5 s, as before.
-3. **The VM's process on the host.** The proxy finds it through
-   `WC_LAUNCH_VM_PID`, `WC_LAUNCH_VM_PIDFILE` or `WC_LAUNCH_VM_UNIT` (a system
-   unit whose main process is QEMU) and reads `/proc/PID/task/*/stat`. This
-   needs no privilege and touches nothing in the VM. It is asked only while
-   pings and heartbeat have both stopped:
-   - a stopped thread, or at least two threads busy for the whole window
-     (vCPUs that never halt), means the guest is stalled. The lease holds it
-     for up to `WC_LAUNCH_LEASE_FROZEN_SECS` (60).
-   - a process that is gone, or one that is mostly idle, means the guest
-     runs but its compositor does not. The lease ends after 5 s.
-
-Without a VM witness, a silent guest is held for up to
-`WC_LAUNCH_LEASE_BLIND_SECS` (20). A guest build before §113 never beats, so
-it keeps the old 5 s. When the heartbeat comes back after a silence, the
-session's pinger gets a fresh 5 s. A gap in the proxy's own 250 ms ticks is
-the proxy stalling, not the guest, and restarts the clocks. The lease clock
-is monotonic now; it used to be the wall clock. The policy is
-`wc_proxy::lease::Judge`: pure, clocked by its caller, and unit-tested for
-each of these cases.
-
-**The guest's half.** A session's `watch` (§107) probes `rtt` every two
-seconds and ends the session at the second miss. A probe that took longer
-than its own 2 s wait plus a second was stalled in, so it is not a miss. A
-gap of over a second between two 250 ms turns of the loop clears the misses
-before it and is logged.
-
-**What is still slow.** A compositor that crashes on a guest that is itself
-busy (two or more threads running flat out) is taken for a stall and held
-for up to 60 s. Without a VM witness, any compositor crash is held for up to
-20 s. Its memory is safe in the meantime: the arena is the ivshmem BAR, or
-the keeper holds it (§103.15).
-
-**Proved.**
-- `wc_proxy::lease` tests: a session dying while the guest beats; an 8 s
-  freeze ridden out; a fresh lease after the freeze; a dead compositor on an
-  idle VM; a gone VM; the 60 s and 20 s bounds; a guest that never beats; a
-  stall of the proxy itself.
-- `session_svc` `probes_ride_out_a_stall_of_this_process`.
-- `scripts/wc-no-ssh.sh` leg 3a: the compositor is SIGSTOPped for 8 s, the
-  proxy holds, and the session answers afterwards. Leg 3 then kills it with
-  -9, and the lease ends in 5 s ("its VM process is gone").
-- `scripts/wc-multi-install.sh` leg 3b: the same 8 s stall under three
-  sessions of one compositor, and none of them ends.
-
-**Deploying it** needs a guest build (for the heartbeat) and, for the VM
-witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
-on testhost (nix-config). Without the guest build the old lease stands;
-without the unit the 20 s bound applies.
-
-**The QEMU cause and live recovery.** A configuration switch restarted the
-host's input-injection daemon. Its old evdev node disappeared while QEMU
-still held it open. `virtio_input_host_event` returned from `read` with
-`ENODEV` but left its fd handler registered, so the main loop repeatedly
-polled the dead device and starved vCPU requests for the BQL. The host
-configuration now has a staged patch that unregisters that handler on a
-permanent read error, and prevents switches from restarting the daemon.
-The QEMU patch takes effect at the next planned VM start.
-
-On 2026-10-20 the approved live recovery removed only the dead input PCI
-device through QMP, waited for `DEVICE_DELETED`, and re-added it against
-the current evdev node with the same device ID, PCI bus and slot. The VM
-process and desktop session stayed running. Main-thread CPU fell from
-99.8% to 3.2% over five-second samples. The replacement retained its BAR
-addresses, Windows reported its driver ready, and the guest consumed the
-input queue descriptors. Desktop input delivery still needs a visible
-check. This operation did not change the GPU or its power state.
-
-The following thirty-minute observation contained 13 complete GPU D0
-dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
-the busy-loop recovery under that workload. The process that triggers the
-periodic GPU wake remains unidentified.
-
 ## 112. Stock Firefox on the dma-buf path
+2026-10-20, branch `stock-firefox` (with `kwin-gpu-zero-cost` merged into
+master first as its own merge, and `sf-relay` merged into this branch). The
+user: "it needs to remove the Firefox patch. That's not okay and it should use
+the DMA buffer we implemented." And then, for every application: "the test for
+a correct implementation is that we can run applications natively without
+having to do any weird shit, like having to switch off a sandbox." So the
+applications are stock, with their default settings and their own sandboxes;
+sv-icd and sv-drm provide the hardware interfaces. Firefox and Zink's Mesa
+run without waycompose patches, as required by the later stock-Mesa rule.
 
-This branch provides the render-node relay prerequisite only. The stock
-Firefox swapchain, default-settings hardware selection and guest video proof
-remain on the separate stock-firefox branch. No application patch or sandbox
-exception is introduced here.
+### 112.1 What changed, in one paragraph
+
+This is the intended path implemented on this branch. The final guest proof
+is still open. The first stock guest measurement used software rendering;
+§112.9 records that failed gate. The following description does not establish
+that the guest has selected hardware acceleration.
+
+Firefox is the nixpkgs package, unpatched, with no preference set for its
+graphics or its decoder, and its RDD sandbox on. It runs inside `sv-drm ns`,
+where the userspace render node of §104 is a PCI device with the guest GPU's
+ids (`--pci`), so Firefox's own probe finds a hardware EGL device and chooses
+hardware WebRender by itself. Its frames reach the compositor without a copy:
+sv-icd's `VK_KHR_wayland_surface` now presents swapchain images that are
+shared sections (112.3). Video decode is VA-API, Firefox's default on Linux,
+through Zink's VA-API driver in our Mesa (112.4) over the forwarded Vulkan
+Video, and the decoded frames are dma-bufs naming sections (112.5). The decoder
+runs in Firefox's sandbox and reaches its GPU session through the render node
+(112.x). The readback patch, its package script, the `.wc-vulkan-readback`
+marker, `wc-session`'s decode branch and `MOZ_DISABLE_RDD_SANDBOX` are gone
+(112.8).
+
+### 112.2 Why the readback patch is not needed any more
+
+§86 and docs/video-decode.md §7.7 patched Firefox for three reasons, and each
+was a consequence of the host having no DRM device:
+
+1. Firefox's Vulkan decoder ends in `vkGetMemoryFdKHR(DMA_BUF)`, which a
+   forwarded device could not answer. §104 answers it: the fd is a token
+   naming a section.
+2. glxtest said the GL was software (Mesa's EGL on a host without a DRM node
+   reports `EGL_MESA_device_software`), so Firefox never tried hardware
+   decode. With the node, the EGL device is a DRM device.
+3. `gfxPlatformGtk` drops hardware decode when the compositor offers no
+   dma-buf. wc-proxy offers `zwp_linux_dmabuf_v1` on the node since §104.
+
+And the decode path is no longer Vulkan Video in Firefox at all. Firefox 157
+release turns its Vulkan decoder off twice (`media.hardware-video-decoding-
+vulkan.enabled` is `@IS_NIGHTLY_BUILD@`, and `GfxInfo.cpp` blocklists
+`FEATURE_HARDWARE_VIDEO_DECODING_VULKAN` on every device), so with default
+settings Firefox decodes through VA-API, and the VA-API driver is ours.
+
+### 112.3 Swapchains whose images are the frames
+
+`crates/sv-icd/src/wsi.rs` (`zero_copy`), `present.rs`
+(`wayland::dmabuf`). With `SV_DRM_NODE` set, a Wayland surface, a
+`B8G8R8A8` format and a GPU side that keeps fence records (§104.11), each
+swapchain image is a LINEAR image on an exportable allocation, which the ICD
+makes a section (§104.4). At creation every image is handed to the compositor
+once, as a `zwp_linux_dmabuf_v1` buffer (version 3, `create_immed`, ARGB8888
+or XRGB8888 by the swapchain's alpha) whose fd is the image's token. A present
+is then one empty submit that waits for the application's semaphores and
+signals one of ours, a mark numbering that signal for the compositor (the
+token's sync page and `svFenceMark`, exactly as Zink's own export of a dma-buf
+frame, §104.11), and `attach`, `damage_buffer`, `commit` on the application's
+surface. No `vkCmdCopyImageToBuffer`, no memcpy into `wl_shm`, no copy in
+wc-proxy: the proxy sends the section's name and `wc_gpu_fence_v1.wait`, and
+the compositor draws the section (§104.12). `vkAcquireNextImageKHR` hands out
+an image the compositor has released (`wl_buffer.release`, on a queue of our
+own); with three images it does not wait in practice. Anything that does not
+fit (no `zwp_linux_dmabuf_v1`, a refused buffer, an `R8G8B8A8` swapchain, no
+fence record) falls back to the copy path, said once; `SV_WSI_ZERO_COPY=0`
+forces it.
+
+This reverses the choice `wsi.rs`'s header defended (render targets in
+host-visible LINEAR memory). The argument there was about a discrete GPU; the
+guest's GPU is integrated, its "device-local" memory is the same RAM, and §104
+already renders KWin's frames this way.
+
+### 112.4 Mesa with Zink's VA-API frontend
+
+`nix/mesa-zink-va.nix` pins Mesa main at
+`42c325ea02518276f08c5b44b487e37affc9fe69`, which includes the Zink
+VA-API frontend merged upstream on 2026-10-16. The build contains
+`zink_drv_video.so`. Its initial supported decode codec is H.264. H.265
+and AV1 are separate gates and are not established by an H.264 result.
+Applications and Zink's Mesa remain unpatched. The former kopper Wayland
+patch and its derivation have been removed. Native clients use the render
+node instead of that old software-device override.
+
+### 112.5 Decoded frames and their planes
+
+The ICD reports the actual plane count for LINEAR modifiers and accepts
+explicit layouts for each plane. It translates `MEMORY_PLANE_i` to
+`PLANE_i`, validates offsets and applies the common aligned bind offset.
+The NV12 export probe produces one object with R8 and GR88 layers.
+`sv-dmabuf-e2e` checks reimport of those planes at distinct offsets.
+A successful VA context or exported allocation alone is not proof of
+Firefox hardware decode. The guest gate needs RDD VA-API frame logs,
+about:support hardware codec support and default sandbox settings.
+
+### 112.6 Why the first guest run selected software
+
+The deployment wrote `LIBGL_KOPPER_DRI2=1` even when a render node existed.
+Our `mesa-kopper-wayland.patch` handles that override by taking the swrast
+initialization route and calling `dri2_setup_device` with software forced.
+Firefox therefore sees a software EGLDevice despite the real GPU behind
+Zink. This contradicts the purpose of the render node.
+
+Node deployments now omit that legacy override. `wc-session` also filters
+it from old `gpu.env` files when it successfully installs the render-node
+namespace. The wl_shm-only legacy path retains its existing configuration.
+This fixes the conflicting driver configuration without changing Firefox's
+preferences. Guest confirmation of hardware selection remains required.
+
+### 112.7 Measurement requirements
+
+The initial comparison in §112.9 is a failed hardware gate and cannot measure
+the GPU implementation's performance. Repeat scroll, H.264 video and idle
+windows only after hardware WebRender, WebGL and sandboxed VA-API decode are
+proven on the same tree. Record browser and compositor CPU separately,
+frame intervals and dropped video frames, with isolated HOME and XDG paths.
+The local lavapipe stand-in cannot prove hardware video decode or the
+Intel direct-present path in §104.12.
+
+### 112.8 Removed application modifications and regression harness
+
+The Firefox readback patch, its package and decode scripts, marker detection
+and sandbox override were removed. The Mesa kopper Wayland patch and its
+patched derivation were also removed; the pinned Mesa-main build uses its
+upstream Zink VA frontend without waycompose patches. Historical readback measurements in
+`video-decode.md` describe the former implementation, not the supported path.
+`sv-firefox-stock.sh` now uses WebDriver to read page results and runs video
+in the foreground. It does not force the hardware decoder or enable Firefox's
+Nightly-only Vulkan decoder. Its only normal profile preference configures
+the automation port. The explicit lavapipe WebRender override is test-only
+and cannot count as the stock guest gate. Missing sandbox data and any copied
+Firefox commits fail the harness.
 
 
 ### 112.x The render node introduces a sandboxed client to its GPU services
@@ -37859,6 +38221,29 @@ local pool has one region; the ICD's path is the same call with another `k`);
 which do not register; an `ANY-UID` registration accepted (the tests run as a
 user; the rule is a pure function, tested).
 
+
+### 112.9 Status at handover (2026-10-20 11:00)
+
+Done and checked locally (evidence `/mnt/datasets/builds/evidence/stock-firefox/local/`):
+zero-copy Wayland swapchains (5372 of Firefox's commits as sections on
+lavapipe, pixels identical to the copy path), multi-plane LINEAR dma-bufs and
+per-plane imports (sv-dmabuf-e2e's NV12 step), `sv-drm ns --pci/--hide`, the
+render-node relay (112.x), our Mesa on main 42c325ea with Zink's VA-API driver
+(vainfo and a VA decode context through sv-icd; the export asks for exactly
+our LINEAR dma-buf), nested-kwin-gpu and nested-waycompose-gpu (clientGpu)
+passing with this branch's binaries.
+
+**Not yet shown on the guest.** One before/after run (test installations,
+default prefs, default sandbox; evidence `…/stock-firefox/guest/`): both
+held 60 fps scroll (mean 16.7/16.8 ms, p99 18 ms) and played 1200 of 1200
+1080p frames with none dropped. But the stock Firefox ("after") never loaded
+`libsv_icd.so` or Zink: the proxy saw 0 dma-buf buffers, and the host's
+Firefox CPU was 52 % (scroll) and 48 % (video) of a core against 19 % and
+28 % for the readback build, i.e. software WebRender and software decode.
+Its environment had `SV_DRM_NODE`, `VK_DRIVER_FILES`, the Mesa paths and ran
+inside `sv-drm ns --pci 8086:a7a8`. Why Firefox chose software is the next
+step (about:support's graphics failures, glxtest's output, `MOZ_LOG`).
+
 #### 112.x.2 System broker entry for mapped sandboxed clients
 
 A system bell hub keeps its direct relay restricted to its own uid. Desktop
@@ -37879,6 +38264,272 @@ backends unchanged. Regression tests send a real forwarded socket through the
 broker protocol: mapped access receives a hub fd, unmapped access is refused,
 and forged uid or pid metadata never reaches the broker's incoming queue.
 
+### 112.10 Original GTK backing before Cairo paints
+
+The corrected unpatched-Mesa local run still copied two real 5,818,176-byte
+GTK parent buffers. Its GPU child already used shared dma-bufs. Those parent
+pixels must not be dropped or excluded from the strict zero-copy check.
+An already-created ordinary Linux memfd cannot be relabeled as guest RAM.
+
+The shipped GTK3 integration changes `create_shm_pool` in GDK's Wayland
+backend, before mmap or Cairo painting. Firefox and Mesa/Zink source remain
+upstream. `nix/gtk-native-shm.nix` builds the GTK library and the
+`wc-native-shm` mapping/lease helper. GTK discovers the proxy-local
+`wc_native_shm_v1` allocator, obtains original backing metadata, opens its own
+authenticated broker lease, and paints directly into the bounded udmabuf.
+It passes that same fd through normal `wl_shm.create_pool`. The proxy chooses
+an extent from its existing transport allocator, retains its registered
+backing, and recognizes the SCM_RIGHTS fd with Linux `KCMP_FILE`. Caller
+region names and matching anon-inode stat numbers do not establish identity.
+The broker run and region epoch accompany every allocation. Before sending
+them to GTK, the proxy reopens that generation and compares its fd with the
+exact descriptor retained from its own transport mapping. Registered contiguous
+BAR plans map those retained descriptors directly and check the actual opened
+BAR header. Broker restart, id reuse, a changed offset or an unrelated file
+cannot substitute pages. A bound allocator rejects unknown pool fds without
+entering the copied SHM path. The translation changes the upstream descriptor
+and buffer offset, never the pixel payload. A separately selected named-file fixture uses live regular
+file identity and is not evidence of cross-VM udmabuf mapping.
+
+GTK keeps its mapping and independent broker lease through Cairo destruction.
+The proxy additionally waits for toolkit release, pool destruction, explicit
+compositor `wl_buffer.release`, and buffer deletion before recycling an
+extent. `delete_id` alone is not proof of compositor drain. A premature destroy
+or disconnected client with unproved drain leaves the extent reserved until
+the transport ends and is logged. It never authorizes guessed reuse. The
+compositor's direct path releases after `FromUi::DirectShown`; its shadow path
+releases after its read. Existing broker guest-RAM retirement still waits for
+all region holders before `UNMAPPED` and guest reuse.
+
+`WC_NATIVE_SHM=1` enables the local proxy allocator. GTK strict mode is
+`WC_NATIVE_SHM_STRICT=1`: missing allocation support or refusal fails visibly,
+without a copied allocation fallback. `WC_NATIVE_SHM_FIXTURE=1` explicitly
+permits disposable named-file backing on both fixture participants. Production
+allocations require existing broker-leased guest RAM or registered contiguous
+BAR backing and the existing mapped user policy. No new sandbox exception, broker authorization policy, or raw
+QEMU RAM descriptor is introduced.
+
+After reviewed master `cad1f9bf` is merged as `ee45a51`, all workspace tests
+pass: 3,465 passed, zero failed, ten ignored. Clippy completes with existing warnings; Windows workspace and
+selected macOS checks pass. The native regressions cover original-page
+painting, SCM_RIGHTS identity and lifetime, broker retirement through mapping
+use, broker run/epoch rejection, foreign anon-inode rejection with matching
+stat metadata, mismatched transport-source rejection, registered BAR mapping
+and actual-header validation, dual-lifetime reclamation, and refusal to guess
+drain after premature destruction. The GTK package, Linux releases and Windows releases build.
+
+The disposable NixOS kernel test passes as ordinary user `alice`, with normal
+`ptrace_scope=1`. Actual udmabufs pass duplicate identity and reject a foreign
+fd and an out-of-bounds mmap. Painting through the mapped fd and SCM_RIGHTS
+changes the original backing pages. Independent proxy and Cairo broker leases
+both block retirement. No family guest or host kernel change is involved.
+This proves the bounded-fd mapping contract, not cross-VM app rendering.
+The real local Firefox run `run-eAhdW9` loads that shipped GDK and passes the
+strict startup-copy check: 4,453 zero-copy commits, zero copied commits. The
+GTK parent surface 38, buffer 51, appears twice with `copied=0`; it is neither
+suppressed nor excluded. Upstream Mesa/Zink supplies WebRender and WebGL.
+H.264 presents 290 frames with one drop and no media error; the content sandbox
+remains level 6, and the RDD has seccomp filtering and NoNewPrivs. This uses the
+explicit named-file/lavapipe fixture and its WebRender test preference.
+Hardware VA decode remains unavailable on lavapipe, so the overall harness
+correctly fails its hardware-decode checks. Default guest hardware gates remain
+open.
+
+The stock Minecraft GL local regression also passes with upstream Mesa/Zink
+and the pool/lavapipe fixture: 4,968 presents, pointer lock and 30 raw motions,
+release, F2 screenshot, no crash, and clean exit 0 after the caption close
+button produces `xdg_toplevel.close` and Minecraft logs `Stopping!`. The
+fixture measures the live X window geometry for that click. The older log
+geometry parser and the attempted Alt+F4 did not deliver a close request.
+Its local FPS under concurrent tests is not a hardware benchmark.
+
+The local screenshot's black rectangle outside Firefox belongs to Wine's
+1920x1200 Explorer desktop, not the 1288x1044 compositor window. Before/after
+window trees, PID properties and images establish that ownership. Wine retains
+uncovered pixels after child windows resize or leave. Successful `RedrawWindow` and `PaintDesktop` return values did not clear the
+black strip: direct pixel checks still show RGB 0,0,0 outside the application.
+The ineffective repaint helper was removed. A minimal same-style Win32 fixture
+isolates the cause without Firefox, GTK or Vulkan: showing the initial
+`CW_USEDEFAULT` 1440x900 rectangle before resizing to 1288x1044 leaves pixel
+1300,100 black, while sizing the hidden window first leaves it desktop blue.
+Both final windows have identical geometry and no custom window shape.
+
+Normal mapping now pre-sizes the hidden window with `SWP_NOMOVE`, bounded to
+the work area, before showing it. It keeps the existing post-show origin and
+placement logic for Windows' cascade, and suppresses intermediate size echoes
+with the existing placement guards. The maximized path is unchanged. Actual
+Firefox run `run-orLiEJ` confirms RGB 37,111,149 at both 1300,100 and 1500,100;
+the full screenshot was also inspected. Its Win32 window is 1288x1044 with a
+1280x1040 client, no custom region and the expected DC clip. A separate geometry
+capture, `run-RAFYwl`, confirms the actual X11 child is also 1288x1044 with no
+window or border shape on the 1920x1200 Wine desktop. All 3,997 commits in
+`run-orLiEJ` remain zero-copy with zero copied commits, including both real GTK parent
+surface 38/buffer 51 commits. WebRender/WebGL and sandbox checks pass; H264
+presents 298 frames with one drop at verdict. The overall lavapipe run still
+fails only its hardware VA checks. This local result does not replace native
+guest placement, hardware decode or performance gates.
+
+GPU Firefox deployment requires `WC_LAUNCH_GPU_GTK`, a shipped GTK store output
+already copied to the host, plus the render node, guest PCI identity and Zink
+VA driver. Before ending an existing session, deployment checks those inputs
+and compares the GTK output's protocol XML/C-header hashes with its proxy
+source. It retains the output with a GC root and writes its library path and
+strict allocation settings into `gpu.env`. The session enables the allocator
+on the proxy and refuses GPU Firefox startup without the matching library,
+namespace and PCI prerequisites. It never writes a WebRender force preference;
+it migrates only exact wc-session-generated graphics and Vulkan readback
+comment/preference blocks, preserving manually authored settings and unrelated
+profile content. Persisted values clear only when that provenance exists and
+no retained user declaration claims the same key.
+Lavapipe's explicit force preference exists only in the test fixture.
+
+These GTK/VA checks apply to the selected GPU Firefox applications: selected
+guest app ids resolve through their `host-app` aliases and host `exec`/`gpu`
+definitions. Minecraft, native apps and Firefox with `gpu=off` acquire no GTK/VA
+dependency. Tests cover these cases, missing prerequisites, ABI mismatch and
+per-app environment overrides. Fixture mode is never enabled by deployment.
+Current broker migration and mapped-user authorization guards still apply.
+Family deployment remains held for review.
+
+### 112.11 Image ownership and hardware decode gates
+
+An acquired swapchain image is reserved before its index is returned. In the
+zero-copy path, its states are available, acquired, submitting, compositor-owned
+and quarantined. Only `wl_buffer.release` can move compositor-owned back to
+available. A release cannot revoke an unpresented acquisition, and submission,
+numbering or commit failures quarantine the image instead of returning it to
+the application. The copy path also reserves acquired images and releases them
+only after its present finishes successfully. Its former ten-second wait no
+longer grants ownership of an image that remains in use.
+
+Acquisition honors zero-timeout `VK_NOT_READY` and finite `VK_TIMEOUT` results.
+One deadline covers contention for the WSI state lock and the event wait. A
+prepared Wayland read spans the unlocked poll/read interval; timeout, error,
+wake and write-only readiness cancel it. This prevents another application
+reader from draining a release into the private queue immediately before the
+WSI waits on an empty socket. Actual libwayland two-reader/private-queue tests
+exercise this handshake. `wl_display_read_events` still synchronizes with other
+application readers; the deadline does not bound an arbitrarily stalled
+application thread inside libwayland's reader protocol.
+
+Swapchain destruction checks GPU completion and compositor ownership separately.
+A GPU idle result is not a compositor release, nor is destroying a `wl_buffer`.
+If completion is unproved, destruction retains the complete proxy, callback
+storage and original backing instead of freeing or recycling it. This is a
+fail-closed retention limit: the last displayed image, and the swapchain's
+other retained objects, can remain allocated until process exit. It is not an
+automatic retirement implementation. Detaching an old swapchain from the
+borrowed `wl_surface` would risk removing a newer swapchain's frame and is not
+used to manufacture a drain proof.
+
+Explicit dma-buf image origins are preserved across create, requirements,
+allocation, bind and both layout query APIs. Requirement sizes include the
+translated origin; binding checks the complete extent and alignment against
+the actual tracked allocation with checked arithmetic. A zero-copy swapchain
+whose backend reports a nonzero image origin is refused, because its current
+Wayland image tuple has no offset field. It does not advertise an offset of
+zero for different bytes.
+
+devhost's RTX 5090 with NVIDIA driver 595.104.02 reports H264, H265, AV1 and VP9
+Vulkan Video decode support. A bounded four-frame H264 test at 320x180 decodes
+345,600 NV12 bytes identically to libavcodec both directly and through the
+forwarder. All 81 H264/H265/AV1 capability lines also match byte for byte,
+excluding the ICD's timing footer. This test uses no swapchain and proves
+Vulkan Video forwarding, not stock Firefox VA-API selection or a benchmark.
+Its evidence is in `evidence/stock-firefox/hardware/`. No family guest or GPU
+assignment changes were made.
+
+## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
+
+**The fault.** On testhost on 2026-10-20 sessions ended twice ("its proxy
+is silent", 08:36 and 09:25). The Windows guest had not crashed: for six to
+ten seconds no vCPU halted while the passed-through iGPU came out of D3. The
+guest's runtime power management wakes it about once a minute. pci.sys then
+restores its config space through `0xcf8/0xcfc`, and every one of those
+exits waits for QEMU's BQL. The other vCPUs spin behind it. The 5 s lease
+(§103.14) then ended the proxy, and the session went down with it. Evidence,
+host traces and the proposal for the stall itself are outside git, in
+/mnt/datasets/builds/evidence/frozen-guest/.
+
+**Three witnesses, and what each decides.**
+
+1. **This session's pings**, every 500 ms, as before.
+2. **The guest's heartbeat.** The compositor beats the owner word of the
+   ring control region every 100 ms on a thread of its own (`ringlink.rs`,
+   `start_guest_beat`). Every session's proxy can read it. If the heartbeat
+   moves while this session's pings have stopped, the guest runs and only
+   this session's side is gone, so the lease ends after 5 s, as before.
+3. **The VM's process on the host.** The proxy finds it through
+   `WC_LAUNCH_VM_PID`, `WC_LAUNCH_VM_PIDFILE` or `WC_LAUNCH_VM_UNIT` (a system
+   unit whose main process is QEMU) and reads `/proc/PID/task/*/stat`. This
+   needs no privilege and touches nothing in the VM. It is asked only while
+   pings and heartbeat have both stopped:
+   - a stopped thread, or at least two threads busy for the whole window
+     (vCPUs that never halt), means the guest is stalled. The lease holds it
+     for up to `WC_LAUNCH_LEASE_FROZEN_SECS` (60).
+   - a process that is gone, or one that is mostly idle, means the guest
+     runs but its compositor does not. The lease ends after 5 s.
+
+Without a VM witness, a silent guest is held for up to
+`WC_LAUNCH_LEASE_BLIND_SECS` (20). A guest build before §113 never beats, so
+it keeps the old 5 s. When the heartbeat comes back after a silence, the
+session's pinger gets a fresh 5 s. A gap in the proxy's own 250 ms ticks is
+the proxy stalling, not the guest, and restarts the clocks. The lease clock
+is monotonic now; it used to be the wall clock. The policy is
+`wc_proxy::lease::Judge`: pure, clocked by its caller, and unit-tested for
+each of these cases.
+
+**The guest's half.** A session's `watch` (§107) probes `rtt` every two
+seconds and ends the session at the second miss. A probe that took longer
+than its own 2 s wait plus a second was stalled in, so it is not a miss. A
+gap of over a second between two 250 ms turns of the loop clears the misses
+before it and is logged.
+
+**What is still slow.** A compositor that crashes on a guest that is itself
+busy (two or more threads running flat out) is taken for a stall and held
+for up to 60 s. Without a VM witness, any compositor crash is held for up to
+20 s. Its memory is safe in the meantime: the arena is the ivshmem BAR, or
+the keeper holds it (§103.15).
+
+**Proved.**
+- `wc_proxy::lease` tests: a session dying while the guest beats; an 8 s
+  freeze ridden out; a fresh lease after the freeze; a dead compositor on an
+  idle VM; a gone VM; the 60 s and 20 s bounds; a guest that never beats; a
+  stall of the proxy itself.
+- `session_svc` `probes_ride_out_a_stall_of_this_process`.
+- `scripts/wc-no-ssh.sh` leg 3a: the compositor is SIGSTOPped for 8 s, the
+  proxy holds, and the session answers afterwards. Leg 3 then kills it with
+  -9, and the lease ends in 5 s ("its VM process is gone").
+- `scripts/wc-multi-install.sh` leg 3b: the same 8 s stall under three
+  sessions of one compositor, and none of them ends.
+
+**Deploying it** needs a guest build (for the heartbeat) and, for the VM
+witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
+on testhost (nix-config). Without the guest build the old lease stands;
+without the unit the 20 s bound applies.
+
+**The QEMU cause and live recovery.** A configuration switch restarted the
+host's input-injection daemon. Its old evdev node disappeared while QEMU
+still held it open. `virtio_input_host_event` returned from `read` with
+`ENODEV` but left its fd handler registered, so the main loop repeatedly
+polled the dead device and starved vCPU requests for the BQL. The host
+configuration now has a staged patch that unregisters that handler on a
+permanent read error, and prevents switches from restarting the daemon.
+The QEMU patch takes effect at the next planned VM start.
+
+On 2026-10-20 the approved live recovery removed only the dead input PCI
+device through QMP, waited for `DEVICE_DELETED`, and re-added it against
+the current evdev node with the same device ID, PCI bus and slot. The VM
+process and desktop session stayed running. Main-thread CPU fell from
+99.8% to 3.2% over five-second samples. The replacement retained its BAR
+addresses, Windows reported its driver ready, and the guest consumed the
+input queue descriptors. Desktop input delivery still needs a visible
+check. This operation did not change the GPU or its power state.
+
+The following thirty-minute observation contained 13 complete GPU D0
+dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
+the busy-loop recovery under that workload. The process that triggers the
+periodic GPU wake remains unidentified.
 ## §114. Doorbell writer recovery
 
 A shared compositor outlives its installations. A failed doorbell write must

@@ -3,7 +3,7 @@
 //! §104)
 //!
 //! ```text
-//! sv-extimg-probe [--device N] [--width W] [--height H] [--image] [--render]
+//! sv-extimg-probe [--device N] [--width W] [--height H] [--image] [--render] [--video]
 //! ```
 //!
 //! KWin's frames are to live in a section the GPU process creates and the
@@ -109,6 +109,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { driver.instance.get_physical_device_properties2(driver.pd, &mut p2) };
     let align = host_props.min_imported_host_pointer_alignment.max(4096) as usize;
     println!("minImportedHostPointerAlignment {}", host_props.min_imported_host_pointer_alignment);
+
+    // ---- 0. §112, --video: queries only, for a decoded frame's images ----
+    if flag("--video") {
+        video_queries(&driver);
+        return Ok(());
+    }
 
     // ---- 1. queries ------------------------------------------------------
     let mut importable = None;
@@ -374,4 +380,62 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         dev.free_memory(memory, None);
     }
     Ok(())
+}
+
+/// §112, `--video`: what a VA-API decode through Zink needs of the driver,
+/// asked and never created. A decoded NV12 frame that leaves the GPU process
+/// as a dma-buf is a LINEAR image on host-allocation memory (a section), and
+/// the compositor's side imports its planes as R8 and R8G8 images. Each is
+/// asked with `HOST_ALLOCATION` for the transfer and sampling usages, and
+/// NV12 also as a decode target with an H.264 profile list, as Zink asks.
+/// Every query here is valid usage; nothing touches the device.
+fn video_queries(driver: &Driver) {
+    let plain = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+    let mut h264 = vk::VideoDecodeH264ProfileInfoKHR::default()
+        .std_profile_idc(vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH)
+        .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+    let profile = vk::VideoProfileInfoKHR::default()
+        .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+        .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+        .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+        .push_next(&mut h264);
+    let profiles = [profile];
+    for (format, fname, usage, video) in [
+        (vk::Format::G8_B8R8_2PLANE_420_UNORM, "NV12", plain, false),
+        (vk::Format::G8_B8R8_2PLANE_420_UNORM, "NV12 +DECODE_DST", plain | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR, true),
+        (vk::Format::R8_UNORM, "R8", plain, false),
+        (vk::Format::R8G8_UNORM, "R8G8", plain, false),
+    ] {
+        for (tiling, tname, host) in [
+            (vk::ImageTiling::LINEAR, "LINEAR host", true),
+            (vk::ImageTiling::LINEAR, "LINEAR", false),
+            (vk::ImageTiling::OPTIMAL, "OPTIMAL", false),
+        ] {
+            let mut ext_info =
+                vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+            let mut info = vk::PhysicalDeviceImageFormatInfo2::default().format(format).ty(vk::ImageType::TYPE_2D).tiling(tiling).usage(usage);
+            if host {
+                info = info.push_next(&mut ext_info);
+            }
+            if video {
+                info = info.push_next(&mut list);
+            }
+            let mut ext_props = vk::ExternalImageFormatProperties::default();
+            let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+            // SAFETY: a query on the driver's own physical device, valid chains.
+            let r = unsafe { driver.instance.get_physical_device_image_format_properties2(driver.pd, &info, &mut props) };
+            let max = props.image_format_properties.max_extent;
+            let _ = props;
+            let em = ext_props.external_memory_properties;
+            println!(
+                "VIDEO {fname} {tname}: {:?} maxExtent {}x{} externalMemoryFeatures {:?}",
+                r.err().unwrap_or(vk::Result::SUCCESS),
+                max.width,
+                max.height,
+                em.external_memory_features
+            );
+        }
+    }
 }

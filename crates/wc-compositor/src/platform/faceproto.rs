@@ -30,8 +30,10 @@ pub enum ToFace {
     Icon { id: WindowId, icons: Vec<IconImage> },
     MovePopup { id: WindowId, x: i32, y: i32, w: i32, h: i32 },
     /// A new pair of IOSurfaces for the window, generation `generation`, whose mach
-    /// ports were sent ahead of this message.
-    Surface { id: WindowId, generation: u32, w: i32, h: i32, alpha: bool },
+    /// ports were sent ahead of this message. `w`x`h` are device pixels and
+    /// `scale` the shadow's pixels per point (§103.18): the layer's
+    /// `contentsScale`.
+    Surface { id: WindowId, generation: u32, w: i32, h: i32, alpha: bool, scale: i32 },
     /// Show surface `buffer` (0 or 1) of the current pair.
     Present { id: WindowId, buffer: u8 },
     ShiftOrigin { id: WindowId, dx: i32, dy: i32 },
@@ -245,8 +247,8 @@ impl ToFace {
             ToFace::MovePopup { id, x, y, w: ww, h } => {
                 w.u8(5).u64(*id).i32(*x).i32(*y).i32(*ww).i32(*h);
             }
-            ToFace::Surface { id, generation, w: ww, h, alpha } => {
-                w.u8(6).u64(*id).u32(*generation).i32(*ww).i32(*h).bool(*alpha);
+            ToFace::Surface { id, generation, w: ww, h, alpha, scale } => {
+                w.u8(6).u64(*id).u32(*generation).i32(*ww).i32(*h).bool(*alpha).i32(*scale);
             }
             ToFace::Present { id, buffer } => {
                 w.u8(7).u64(*id).u8(*buffer);
@@ -274,8 +276,8 @@ impl ToFace {
                 match spec {
                     CursorSpec::Hidden => w.u8(0),
                     CursorSpec::Named(icon) => w.u8(1).str(icon.name()),
-                    CursorSpec::Image { image, hotspot_x, hotspot_y } => {
-                        w.u8(2).icon(image).i32(*hotspot_x).i32(*hotspot_y)
+                    CursorSpec::Image { image, hotspot_x, hotspot_y, scale } => {
+                        w.u8(2).icon(image).i32(*hotspot_x).i32(*hotspot_y).i32(*scale)
                     }
                 };
             }
@@ -332,7 +334,14 @@ impl ToFace {
                 ToFace::Icon { id, icons }
             }
             5 => ToFace::MovePopup { id: r.u64()?, x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()? },
-            6 => ToFace::Surface { id: r.u64()?, generation: r.u32()?, w: r.i32()?, h: r.i32()?, alpha: r.bool()? },
+            6 => ToFace::Surface {
+                id: r.u64()?,
+                generation: r.u32()?,
+                w: r.i32()?,
+                h: r.i32()?,
+                alpha: r.bool()?,
+                scale: r.i32()?,
+            },
             7 => ToFace::Present { id: r.u64()?, buffer: r.u8()? },
             8 => ToFace::ShiftOrigin { id: r.u64()?, dx: r.i32()?, dy: r.i32()? },
             9 => ToFace::Map { id: r.u64()?, w: r.i32()?, h: r.i32()?, fold: r.bool()? },
@@ -344,7 +353,12 @@ impl ToFace {
                 spec: match r.u8()? {
                     0 => CursorSpec::Hidden,
                     1 => CursorSpec::Named(r.str()?.parse().unwrap_or_default()),
-                    2 => CursorSpec::Image { image: r.icon()?, hotspot_x: r.i32()?, hotspot_y: r.i32()? },
+                    2 => CursorSpec::Image {
+                        image: r.icon()?,
+                        hotspot_x: r.i32()?,
+                        hotspot_y: r.i32()?,
+                        scale: r.i32()?,
+                    },
                     t => return Err(bad(&format!("cursor {t}"))),
                 },
             },
@@ -421,13 +435,15 @@ impl FromFace {
                     FromUi::PointerButton { id, button, pressed, time } => {
                         w.u8(11).u64(*id).u32(*button).bool(*pressed).u32(*time)
                     }
-                    FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, time } => w
+                    FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, finger, stop, time } => w
                         .u8(12)
                         .u64(*id)
                         .f64(*horizontal)
                         .f64(*vertical)
                         .i32(*v120_h)
                         .i32(*v120_v)
+                        .bool(*finger)
+                        .bool(*stop)
                         .u32(*time),
                     FromUi::PointerRelative { id, dx, dy, time } => w.u8(13).u64(*id).f64(*dx).f64(*dy).u32(*time),
                     _ => return None,
@@ -482,6 +498,8 @@ impl FromFace {
                     vertical: r.f64()?,
                     v120_h: r.i32()?,
                     v120_v: r.i32()?,
+                    finger: r.bool()?,
+                    stop: r.bool()?,
                     time: r.u32()?,
                 },
                 13 => FromUi::PointerRelative { id: r.u64()?, dx: r.f64()?, dy: r.f64()?, time: r.u32()? },
@@ -561,12 +579,14 @@ mod tests {
         round(ToFace::Create { id: 7, title: "Wéb".into(), app_id: "firefox".into(), popup: None });
         round(ToFace::Create { id: 8, title: String::new(), app_id: String::new(), popup: Some((7, -3, 40)) });
         round(ToFace::Icon { id: 7, icons: vec![IconImage { width: 2, height: 1, pixels: vec![1, 2, 3, 4, 5, 6, 7, 8] }] });
-        round(ToFace::Surface { id: 7, generation: 3, w: 1280, h: 709, alpha: true });
+        round(ToFace::Surface { id: 7, generation: 3, w: 2560, h: 1418, alpha: true, scale: 2 });
         round(ToFace::Present { id: 7, buffer: 1 });
         round(ToFace::Map { id: 7, w: 640, h: 480, fold: true });
         round(ToFace::SetWindowState { id: 7, maximized: Some(true), minimized: None });
         round(ToFace::Cursor { spec: CursorSpec::Named(CursorIcon::EwResize) });
         round(ToFace::Cursor { spec: CursorSpec::Hidden });
+        let image = IconImage { width: 2, height: 2, pixels: vec![9; 16] };
+        round(ToFace::Cursor { spec: CursorSpec::Image { image, hotspot_x: 1, hotspot_y: 0, scale: 2 } });
         round(ToFace::PointerHold { id: 7, hold: Some(PointerHold::Confined(Rect::new(1, 2, 3, 4))) });
         round(ToFace::BeginResize { id: 7, edge: Edge::BottomRight });
         round(ToFace::SizeHints { id: 7, min: (500, 120), max: (0, 0) });
@@ -581,10 +601,19 @@ mod tests {
             FromFace::Ui(FromUi::Key { id: 3, keycode: 30, pressed: true, time: 99 }) => {}
             other => panic!("{other:?}"),
         }
-        let a = FromFace::Ui(FromUi::PointerAxis { id: 1, horizontal: 0.5, vertical: -10.0, v120_h: 0, v120_v: -120, time: 5 });
+        let a = FromFace::Ui(FromUi::PointerAxis {
+            id: 1,
+            horizontal: 0.5,
+            vertical: -10.0,
+            v120_h: 0,
+            v120_v: -120,
+            finger: true,
+            stop: true,
+            time: 5,
+        });
         assert!(matches!(
             FromFace::decode(&a.encode().unwrap()).unwrap(),
-            FromFace::Ui(FromUi::PointerAxis { v120_v: -120, .. })
+            FromFace::Ui(FromUi::PointerAxis { v120_v: -120, finger: true, stop: true, .. })
         ));
         assert!(FromFace::Ui(FromUi::Layout { name: "us" }).encode().is_none());
         let h = FromFace::Hello { section: "firefox".into(), ids: vec!["firefox".into()], token: 42, pid: 9 };

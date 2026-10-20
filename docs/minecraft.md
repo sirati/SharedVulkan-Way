@@ -27,8 +27,10 @@ the engineering record: what broke, why, and what was changed.
 | input | `xdotool` into the Xvfb → Wine → Win32 messages | a person, or TeamViewer |
 
 The workstation's NVIDIA card is never touched: the GPU side is shown only
-`radeon_icd`, the game's loader only our ICD, and the game runs with an empty
-`/dev/dri` (see "Things that bite" below).
+`radeon_icd`, the game's loader only our ICD, and `sv-drm ns` hides NVIDIA
+nodes while exposing the forwarded render node. The stock-Mesa path in
+`waycompose-design.md` §112 supersedes the historical kopper workaround.
+The new native-path runtime and guest deployment gates remain open.
 
 ## Versions
 
@@ -40,7 +42,7 @@ The workstation's NVIDIA card is never touched: the GPU side is shown only
 | Fabric loader | 0.19.5 (intermediary 1.21.11) |
 | VulkanMod | 0.6.8+1.21.11 from Modrinth, sha1 `f273dc13…` — the latest release for 1.21.x; the 26.1 builds need Java 25 |
 | LWJGL / GLFW | LWJGL 3.3.3; GLFW is nixpkgs' `glfw3-minecraft` 3.4, through Prism's "use system GLFW" |
-| GL | `nix/mesa-kopper-wayland.nix` (Mesa 26.2.4 with the kopper-on-Wayland override, §0.28) |
+| GL | Unpatched upstream Mesa main, pinned by `nix/mesa-zink-va.nix`, through the native render-node path, §112 |
 
 ## Demo mode, and how Prism gets there
 
@@ -98,6 +100,9 @@ output and its exit status. Options:
 
 | | |
 |---|---|
+| `SVMC_NODE` | forwarded render node, defaults to the workstation AMD node |
+| `SVMC_PCI` | forwarded PCI identity as `VVVV:DDDD`, auto-detected for a local node |
+| `SVMC_MESA` | unpatched Mesa output, defaults to `nix/mesa-zink-va.nix` |
 | `SVMC_VALIDATE=1` | `VK_LAYER_KHRONOS_validation` on the GPU side, VUIDs counted |
 | `SVMC_APP_VALIDATE=1` | the layer inside the game too (Zink crashes under it on native RADV as well; a diagnostic only) |
 | `SVMC_VSYNC=1` | leave the game's vsync on |
@@ -152,9 +157,9 @@ world loading. The first is Zink's own: it reproduces with Zink on this RADV
   speaks through `pa_simple` and aborts (`Assertion 'p' failed …
   pa_simple_write`) when there is no server. The harness turns it off; a
   session without audio should too.
-* **Mesa's EGL probes every DRM device** before it settles on kopper, and on
-  the workstation the first one is the NVIDIA card. The harness runs the game
-  under `bwrap` with an empty `/dev/dri`, which is also what testhost has.
+* **Mesa's EGL probes DRM devices.** The harness hides NVIDIA nodes and
+  exposes the selected render node with its PCI identity through `sv-drm ns`.
+  Keep that node available for native initialization and dma-buf imports.
 * **OpenAL tries PipeWire first** and, with the session's private
   `XDG_RUNTIME_DIR`, fails (`errno 112`) and falls back to PulseAudio, which
   works with `PULSE_SERVER` set. On the workstation the default sink is

@@ -444,7 +444,7 @@ impl Drop for RingTransport {
 /// The heartbeat has to be independent of what the side is doing, because that
 /// is what it *means*. R4's distinction between "slow" and "gone" is not
 /// answerable by a signal only the not-busy send.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const BEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// What the app side learned when it attached.
@@ -505,7 +505,7 @@ fn lower(e: sv_transport::Error) -> LowerError {
 /// How the doorbell hub at `path` (`SV_BELL`) is reached, every time the
 /// doorman (re)connects: directly, and on Linux, when that fails and
 /// `SV_DRM_NODE` is set, through the render node (§112).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn bell_connector(path: &str) -> impl Fn() -> std::io::Result<sv_transport::vdoorbell::PortHandle> + Send + 'static {
     let path = path.to_string();
     move || match sv_transport::vdoorbell::PortHandle::host_socket(&path) {
@@ -629,6 +629,10 @@ pub(crate) mod relay {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "macos_guest.rs"]
+mod macos_guest;
+
 impl RingTransport {
     /// Connect to whichever side is serving the cold path, attach, claim rings.
     ///
@@ -650,7 +654,6 @@ impl RingTransport {
     #[cfg(target_os = "linux")]
     pub fn connect(socket: &str) -> Result<Attached, String> {
         use std::os::unix::net::UnixStream;
-
         // waycompose-design.md §111.10: the GPU BAR's name may be `broker:ID`
         // and the bell `broker:sv-hub`, both reached through the broker.
         #[cfg(target_os = "linux")]
@@ -795,7 +798,8 @@ impl RingTransport {
         Ok(attached)
     }
 
-    /// Connect to a Windows GPU side over a named pipe and two named sections.
+    /// Attach a Windows client. `ivshmem:SLOT` selects a GPU owner across
+    /// the VM boundary; other names select a local pipe and named sections.
     ///
     /// The counterpart of the Linux `connect`, and shorter, because **nothing is
     /// handed over**. The section names are derived from the session string on
@@ -808,6 +812,9 @@ impl RingTransport {
     /// exists to make: the platform layer differs and the transport does not.
     #[cfg(windows)]
     pub fn connect(session: &str) -> Result<Attached, String> {
+        if let Some(slot) = session.strip_prefix("ivshmem:") {
+            return windows_guest::connect(slot);
+        }
         use sv_transport::cold::ColdMessage;
         use sv_transport::stream::{read_message, write_message};
         use sv_transport::{winpipe, winshm};
@@ -923,7 +930,7 @@ impl RingTransport {
     /// Extracted when the Windows path was written, because it is 60 lines and
     /// duplicating it is how the two platforms come to claim rings in a
     /// different order.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn finish_attach(
         control_region: Arc<SharedRegion>,
         arena: Arc<SharedRegion>,
@@ -1025,15 +1032,21 @@ impl RingTransport {
         // doorbell is the session that shipped, and refusing to run because an
         // optimisation is unavailable would be worse than not having it.
         // Unix only: the host end of the chardev is a Unix socket, which is what
-        // the cross-VM topology has. A Windows *app* side is the same-machine
-        // topology, where the peer is on this kernel and the ordinary futex wake
-        // already reaches it — there is no hypervisor to carry anything across.
-        #[cfg(unix)]
+        // the cross-VM topology has. Named-section Windows sessions use local
+        // wakes. Windows and macOS PCI clients install a per-BAR receiver
+        // before this method; their ControlSets dispatch all process sessions.
+        #[cfg(target_os = "linux")]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             // §99: reconnecting, so a restarted hub costs this session only
-            // the bells in the gap.
-            Ok(path) => match sv_transport::vdoorbell::attach_reconnecting_with(&path, bell_connector(&path), Arc::clone(&control))
+            // the bells in the gap. waycompose-design.md §111.10: a
+            // `broker:NAME` spec is a connection the broker makes for us;
+            // §112: a sandboxed ICD gets it through the render node.
+            Ok(path) => match {
+                #[cfg(target_os = "linux")]
+                wc_broker::client::install_hooks();
+                sv_transport::vdoorbell::attach_reconnecting_with(&path, bell_connector(&path), Arc::clone(&control))
+            }
                 .map_err(|e| e.to_string())
             {
                 Ok((d, true)) => {
@@ -1051,7 +1064,7 @@ impl RingTransport {
             },
         };
 
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
 
         arm_park_report();
@@ -1101,9 +1114,17 @@ impl RingTransport {
         })
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    pub fn connect(socket: &str) -> Result<Attached, String> {
+        if !cfg!(target_arch = "x86_64") { return Err("the PCI guest driver supports Intel macOS only".into()); }
+        let name = socket.strip_prefix("broker-pci:")
+            .ok_or("macOS Vulkan client requires SV_SOCKET=broker-pci:POOL and the Intel PCI guest driver")?;
+        macos_guest::connect(name)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub fn connect(_socket: &str) -> Result<Attached, String> {
-        Err("this build has a cold path for Linux and Windows only".into())
+        Err("this build has a cold path for Linux, macOS and Windows only".into())
     }
 
     fn ring(&self, class: RingClass) -> &Mutex<Ring> {
@@ -2337,7 +2358,7 @@ impl RingTransport {
     /// `svArenaInfo`, on the instance ring. `None` for any failure, which is
     /// a fixed arena: a GPU side too old to know the question is refused at
     /// attach by `WIRE_VERSION` before it gets here.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn arena_info(&self, name: &str) -> Option<sv_proto::sv::ArenaInfoReply> {
         let mut cmd = Vec::new();
         sv_proto::sv::ArenaInfo::named(name).encode(&mut cmd).ok()?;
@@ -2560,3 +2581,7 @@ impl Drop for RamHold {
         }
     }
 }
+
+#[cfg(windows)]
+#[path = "windows_guest.rs"]
+mod windows_guest;

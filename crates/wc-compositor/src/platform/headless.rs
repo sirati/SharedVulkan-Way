@@ -305,6 +305,8 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         // STAGE 38: no monitor here, so no work area. `--output` stays the
         // whole answer, which is what the conformance leg needs.
         None,
+        // §103.18: and no screen to be scaled.
+        1,
     ))
 }
 
@@ -510,6 +512,7 @@ impl PumpInner {
                     image,
                     hotspot_x,
                     hotspot_y,
+                    ..
                 } => {
                     // The hash for the same reason `ToUi::Icon` carries one: it
                     // is how a test asserts that the pixels which arrived are
@@ -580,6 +583,23 @@ impl PumpInner {
             }
             // Never sent off Windows; see its definition.
             ToUi::Direct { .. } => {}
+            #[cfg(target_os = "macos")]
+            ToUi::MetalPresent { id, mailbox } => {
+                let Some(output) = mailbox.take() else { return; };
+                // The explicit headless diagnostics consume completed owned
+                // output for hashes/pixel assertions. Product GUI paths keep
+                // the IOSurface on the GPU and never perform this readback.
+                let Some(window) = windows.get_mut(&id) else { return };
+                let damage = {
+                    let mut shadow = window.shadow.lock().unwrap_or_else(|e| e.into_inner());
+                    unsafe { output.read_snapshot(|bytes, width, height, stride| {
+                        let spec = crate::surface::BufferSpec { width: width as i32, height: height as i32,
+                            stride: stride as i32, format: crate::surface::PixelFormat::Argb8888 };
+                        shadow.blit(bytes, spec, &[crate::surface::Rect::new(0, 0, spec.width, spec.height)])
+                    }) }
+                };
+                if let Some(damage) = damage { self.handle(windows, clipboard, ToUi::Present { id, damage }); }
+            }
             ToUi::Present { id, damage } => {
                 let Some(w) = windows.get_mut(&id) else { return };
                 {
@@ -970,6 +990,8 @@ impl PumpInner {
             vertical: -10.0,
             v120_h: 0,
             v120_v: -120,
+            finger: false,
+            stop: false,
             time: t(),
         });
 

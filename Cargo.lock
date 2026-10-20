@@ -1339,6 +1339,7 @@ dependencies = [
  "serde_json",
  "sv-arena",
  "sv-drm",
+ "sv-proto",
  "sv-transport",
  "sv-wire",
  "wc-broker",
@@ -1357,6 +1358,7 @@ dependencies = [
  "sv-transport",
  "sv-wire",
  "wc-broker",
+ "wc-handle",
 ]
 
 [[package]]
@@ -1755,6 +1757,7 @@ dependencies = [
  "png",
  "smithay",
  "sv-arena",
+ "sv-drm",
  "sv-hostd",
  "sv-proto",
  "sv-transport",
@@ -1832,6 +1835,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-native-shm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sv-transport",
+ "wc-broker",
+]
+
+[[package]]
 name = "wc-probe"
 version = "0.1.0"
 dependencies = [
@@ -1853,6 +1865,7 @@ dependencies = [
  "wc-broker",
  "wc-handle",
  "wc-hostint",
+ "wc-native-shm",
 ]
 
 [[package]]
@@ -1877,7 +1890,10 @@ name = "wc-transport"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sv-transport",
  "uds_windows",
+ "wc-cygwin-link",
+ "wc-handle",
  "windows-sys",
 ]
 

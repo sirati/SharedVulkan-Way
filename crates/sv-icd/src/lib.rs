@@ -54,7 +54,7 @@ pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
 }
 
 /// See `sv_gpu_server::WIRE_VERSION`, which says why this is 5.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = sv_proto::GPU_WIRE_VERSION;
 
 /// The environment variable that points at a GPU side.
 ///
@@ -118,7 +118,7 @@ pub(crate) fn instance() -> Option<&'static state::SharedVulkan> {
         // to use a GPU side and quietly given a driver that answers everything
         // from a table would produce plausible nonsense, which is the one
         // failure mode this project must not have.
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         if let Some(sock) = std::env::var_os(SOCKET_ENV) {
             let sock = sock.to_string_lossy().into_owned();
             return match state::SharedVulkan::connected(&sock) {

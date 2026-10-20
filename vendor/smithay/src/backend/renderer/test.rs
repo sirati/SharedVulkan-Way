@@ -8,15 +8,15 @@
 use crate::backend::renderer::ImportEgl;
 #[cfg(feature = "wayland_frontend")]
 use crate::{
-    backend::renderer::{ImportDmaWl, ImportMemWl},
+    backend::renderer::ImportMemWl,
     reexports::wayland_server::protocol::wl_buffer,
     wayland::{self, compositor::SurfaceData, shm::BufferAccessError},
 };
 use crate::{
     backend::{
-        allocator::{dmabuf::Dmabuf, Fourcc},
+        allocator::Fourcc,
         renderer::{
-            sync::SyncPoint, DebugFlags, Frame, ImportDma, ImportMem, Renderer, RendererSuper, Texture,
+            sync::SyncPoint, DebugFlags, Frame, ImportMem, Renderer, RendererSuper, Texture,
             TextureFilter,
         },
         SwapBuffersError,
@@ -26,6 +26,10 @@ use crate::{
 
 #[cfg(feature = "wayland_frontend")]
 use std::cell::Cell;
+#[cfg(feature = "backend_dmabuf")]
+use crate::backend::{allocator::dmabuf::Dmabuf, renderer::ImportDma};
+#[cfg(all(feature = "wayland_frontend", feature = "backend_dmabuf"))]
+use crate::backend::renderer::ImportDmaWl;
 use std::sync::LazyLock;
 
 use super::{Color32F, ContextId};
@@ -167,6 +171,7 @@ impl ImportMemWl for DummyRenderer {
     }
 }
 
+#[cfg(feature = "backend_dmabuf")]
 impl ImportDma for DummyRenderer {
     fn import_dmabuf(
         &mut self,
@@ -208,7 +213,7 @@ impl ImportEgl for DummyRenderer {
     }
 }
 
-#[cfg(feature = "wayland_frontend")]
+#[cfg(all(feature = "wayland_frontend", feature = "backend_dmabuf"))]
 impl ImportDmaWl for DummyRenderer {}
 
 #[derive(Debug)]

@@ -103,6 +103,10 @@ pub enum Release {
     Probe { after: Option<Duration> },
 }
 
+/// Host-visible guest RAM has no elapsed-time release. Both the broker and
+/// its independent wired holder use this policy with the host release probe.
+pub const HOST_VISIBLE_RELEASE: Release = Release::Probe { after: None };
+
 /// Why a request was refused. Sent as `err <text>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal(pub String);
@@ -163,6 +167,7 @@ struct Conn {
     peer: Peer,
     role: String,
     subscribed: bool,
+    kernel_watched: bool,
 }
 
 /// The broker's whole state.
@@ -180,6 +185,7 @@ pub struct Core {
     budget: Option<u64>,
     /// Processes that end with a pool (`tie`), and that pool: (user, pool).
     ties: BTreeMap<Pid, (User, String)>,
+    owner_observers: BTreeMap<ConnId, BTreeSet<ConnId>>,
 }
 
 impl Core {
@@ -194,6 +200,7 @@ impl Core {
             made_bytes: 0,
             budget: None,
             ties: BTreeMap::new(),
+            owner_observers: BTreeMap::new(),
         }
     }
 
@@ -210,11 +217,38 @@ impl Core {
     // ------------------------------------------------------------ connections
 
     pub fn connect(&mut self, conn: ConnId, peer: Peer) {
-        self.conns.insert(conn, Conn { peer, role: String::from("?"), subscribed: false });
+        self.conns.insert(conn, Conn { peer, role: String::from("?"), subscribed: false, kernel_watched: false });
     }
 
     pub fn peer(&self, conn: ConnId) -> Option<&Peer> {
         self.conns.get(&conn).map(|c| &c.peer)
+    }
+
+    /// Owner tokens are issued only after the existing platform watcher has
+    /// attached to the authenticated process, never from a caller's PID.
+    pub fn owner_watch_ready(&mut self, conn: ConnId, ready: bool) {
+        if let Some(c) = self.conns.get_mut(&conn) { c.kernel_watched = ready; }
+    }
+
+    pub fn owner(&self, conn: ConnId) -> Result<ConnId, Refusal> {
+        match self.conns.get(&conn) {
+            Some(c) if c.kernel_watched => Ok(conn),
+            _ => refuse("owner is not a live kernel-watched connection"),
+        }
+    }
+
+    /// Atomically observe one authenticated connection generation. The expected
+    /// PID is from the compositor's kernel Mach audit trailer; it is compared
+    /// with the broker's own authenticated peer and is never an authorization
+    /// substitute for OS user identity. Roles play no part in this decision.
+    pub fn observe_owner(&mut self, observer: ConnId, owner: ConnId, pid: Pid) -> Result<(), Refusal> {
+        let Some(a) = self.conns.get(&observer) else { return refuse("observer disconnected") };
+        let Some(b) = self.conns.get(&owner) else { return refuse("owner disconnected") };
+        if !b.kernel_watched || b.peer.pid != pid || (a.peer.user != b.peer.user && !a.peer.admin) {
+            return refuse("owner identity differs from the authenticated process");
+        }
+        self.owner_observers.entry(owner).or_default().insert(observer);
+        Ok(())
     }
 
     /// `hello ROLE`: what the process is, for logs and `!exited` lines.
@@ -239,6 +273,15 @@ impl Core {
         if self.conns.remove(&conn).is_none() {
             return;
         }
+        if let Some(observers) = self.owner_observers.remove(&conn) {
+            for observer in observers {
+                if self.conns.contains_key(&observer) {
+                    self.notices.push(Notice::Push(observer, format!("!owner-ended {conn}")));
+                }
+            }
+        }
+        for observers in self.owner_observers.values_mut() { observers.remove(&conn); }
+        self.owner_observers.retain(|_, observers| !observers.is_empty());
         let mut drained = Vec::new();
         for r in self.regions.values_mut() {
             if r.owner == Some(conn) {
@@ -626,6 +669,18 @@ impl Core {
         pids.into_iter().collect()
     }
 
+    /// A second kernel-authenticated local channel may redeem a capability
+    /// only while this exact uid/pid already holds its region lease. This
+    /// neither opens a lease nor permits admin status to replace one.
+    pub fn leased_region(&self, peer: &Peer, id: ObjId, epoch: u64) -> Result<RegionInfo, Refusal> {
+        let Some(r) = self.regions.get(&id) else { return refuse("no region") };
+        if r.info.epoch != epoch { return refuse("region epoch changed") }
+        let holds = r.leases.iter().any(|(id, count)| *count != 0 &&
+            self.conns.get(id).is_some_and(|c| c.peer.pid == peer.pid && c.peer.user == peer.user));
+        if !holds { return refuse("no region lease for this process and user") }
+        Ok(r.info.clone())
+    }
+
     pub fn region(&self, id: ObjId) -> Option<&RegionInfo> {
         self.regions.get(&id).map(|r| &r.info)
     }
@@ -667,6 +722,32 @@ mod tests {
             DeviceSpec { name: "arena".into(), allow: Allow::AnyUser },
             DeviceSpec { name: "wcbell".into(), allow: Allow::Users(vec![User::uid(1000)]) },
         ])
+    }
+
+    #[test]
+    fn a_second_channel_requires_the_existing_kernel_identity_lease_and_epoch() {
+        let mut c = core();
+        let who = peer(100, 1000);
+        c.connect(1, who.clone());
+        let r = c.publish(User::uid(1000), "pci", 4096, 7);
+        assert!(c.leased_region(&who, r.id, 7).is_err());
+        c.open(1, r.id).unwrap();
+        assert!(c.leased_region(&who, r.id, 7).is_ok());
+        assert!(c.leased_region(&peer(101, 1000), r.id, 7).is_err());
+        assert!(c.leased_region(&peer(100, 1001), r.id, 7).is_err());
+        assert!(c.leased_region(&Peer { admin: true, ..peer(1, 0) }, r.id, 7).is_err());
+        assert!(c.leased_region(&who, r.id, 8).is_err());
+        c.retire(r.id);
+        // Retirement prohibits new leases, but does not revoke an existing one.
+        assert!(c.leased_region(&who, r.id, 7).is_ok());
+        c.close(1, r.id).unwrap();
+        assert!(c.leased_region(&who, r.id, 7).is_err());
+        let next = c.publish(User::uid(1000), "pci2", 4096, 9);
+        c.open(1, next.id).unwrap();
+        c.conn_closed(1, Instant::now());
+        assert!(c.leased_region(&who, next.id, 9).is_err());
+        c.connect(2, who.clone());
+        assert!(c.leased_region(&who, next.id, 9).is_err());
     }
 
     /// Rule 2: one holder, one user at a time; free when the holder exits.
@@ -953,5 +1034,38 @@ mod tests {
         let f = c.alloc(1, "gpu", 1 << 20, Release::OwnerFree).unwrap();
         c.alloc_failed(f.id);
         assert_eq!(c.stats().region_bytes, 64 << 20);
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    fn peer(pid: Pid, uid: u32) -> Peer { Peer { pid, user: User::uid(uid), admin: false } }
+    fn core() -> Core {
+        let mut c=Core::new(vec![]);c.connect(1,peer(100,1000));c.owner_watch_ready(1,true);
+        c.connect(2,peer(200,1000));c
+    }
+    #[test] fn observation_revokes_on_disconnect_without_a_timeout() {
+        let mut c=core();assert_eq!(c.owner(1),Ok(1));c.observe_owner(2,1,100).unwrap();
+        c.conn_closed(1,Instant::now());assert!(c.drain().contains(&Notice::Push(2,"!owner-ended 1".into())));
+        assert!(c.observe_owner(2,1,100).is_err());
+    }
+    #[test] fn observation_revokes_on_kernel_exit_and_rejects_reused_pid_token() {
+        let mut c=core();c.observe_owner(2,1,100).unwrap();c.process_exited(100,Instant::now());
+        assert!(c.drain().contains(&Notice::Push(2,"!owner-ended 1".into())));
+        c.connect(3,peer(100,1000));c.owner_watch_ready(3,true);
+        assert!(c.observe_owner(2,1,100).is_err());assert!(c.observe_owner(2,3,100).is_ok());
+        c.conn_closed(1,Instant::now());assert!(!c.drain().contains(&Notice::Push(2,"!owner-ended 3".into())));
+    }
+    #[test] fn identity_and_watch_are_required_but_role_is_not_authority() {
+        let mut c=core();c.connect(3,peer(300,1001));
+        assert!(c.observe_owner(3,1,100).is_err());assert!(c.observe_owner(2,1,999).is_err());
+        c.owner_watch_ready(1,false);assert!(c.owner(1).is_err());assert!(c.observe_owner(2,1,100).is_err());
+        c.hello(1,"root").unwrap();assert!(c.observe_owner(3,1,100).is_err());
+    }
+    #[test] fn disconnect_racing_binding_is_either_refused_or_notified() {
+        let mut before=core();before.conn_closed(1,Instant::now());assert!(before.observe_owner(2,1,100).is_err());
+        let mut after=core();after.observe_owner(2,1,100).unwrap();after.conn_closed(1,Instant::now());
+        assert_eq!(after.drain(),vec![Notice::Push(2,"!owner-ended 1".into())]);
     }
 }

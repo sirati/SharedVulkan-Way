@@ -560,7 +560,8 @@ mod tests {
         //
         // 494 to 534 in §104: `linux-dmabuf-v1`, nine requests and eleven
         // events over three interfaces, twenty messages.
-        assert_eq!(checked, 534, "the vendored protocols changed shape");
+        // §112 adds two allocator requests and two events, walked both ways.
+        assert_eq!(checked, 542, "the vendored protocols changed shape");
     }
 }
 
