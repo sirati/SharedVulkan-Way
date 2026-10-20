@@ -68,7 +68,7 @@ let
   hl = t.stdenv.mkDerivation {
     pname = "hl-waycompose"; version = "0.3.0-rc2";
     src = import ./source.nix;
-    patches = [ ./host-backed-mappings.patch ./seccomp.patch ];
+    patches = [ ./host-backed-mappings.patch ./seccomp.patch ./guest-status.patch ];
     nativeBuildInputs = [ pkgs.gnumake pkgs.python3 pkgs.rcodesign ];
     dontConfigure = true; dontStrip = true; dontPatchELF = true; dontPatchShebangs = true;
     postPatch = ''
@@ -86,6 +86,8 @@ let
       cp ${./hl_atomic.h} src/hl_atomic.h
       cp ${./hl_seccomp.c} src/hl_seccomp.c
       cp ${./hl_seccomp.h} src/hl_seccomp.h
+      cp ${./hl_status.c} src/hl_status.c
+      cp ${./hl_status.h} src/hl_status.h
       cp ${./hl_seccomp_bpf.c} src/hl_seccomp_bpf.c
       cp ${./hl_seccomp_bpf.h} src/hl_seccomp_bpf.h
       cp ${../../include/wc_hyperlinux.h} src/wc_hyperlinux.h
@@ -216,7 +218,7 @@ let
       ${nativeFaultClients}/bin/hl-atomic-fault-check
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
-      for mode in --basic --backend-denial --trap --tsync --stacked --tsync-divergent --kill-thread --arguments; do
+      for mode in --basic --backend-denial --trap --tsync --stacked --tsync-divergent --kill-thread --arguments --wait-status; do
         "$HL_RUNNER" ${seccompClient}/bin/hl-seccomp-client "$mode"
       done
     '';

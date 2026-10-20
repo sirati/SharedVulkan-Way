@@ -1,0 +1,331 @@
+diff --git a/Makefile b/Makefile
+index dea6f78..b124b66 100644
+--- a/Makefile
++++ b/Makefile
+@@ -87,7 +87,7 @@ HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
+            fork_ipc.c syscall_signal.c syscall_net.c stack.c \
+            thread.c futex.c vdso.c crash_report.c rosetta.c \
+            gdb_stub.c trace.c syscall_stats.c fd_object.c vfs.c device.c \
+-           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c hl_socket.c hl_copy.c hl_atomic.c hl_seccomp.c hl_seccomp_bpf.c)
++           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c hl_socket.c hl_copy.c hl_atomic.c hl_seccomp.c hl_seccomp_bpf.c hl_status.c)
+ HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
+            syscall_internal.h syscall_fs.h syscall_io.h \
+            syscall_poll.h syscall_fd.h syscall_inotify.h \
+diff --git a/src/fork_ipc.c b/src/fork_ipc.c
+index e878fa6..fa47197 100644
+--- a/src/fork_ipc.c
++++ b/src/fork_ipc.c
+@@ -17,6 +17,7 @@
+ #include "hv_util.h"         /* HV_CHECK, SCTLR_* constants */
+ #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
+ #include "hl_seccomp.h"
++#include "hl_status.h"
+ #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
+ #include "vdso.h"            /* vdso_build, vdso_publisher_start/stop */
+ #include "hl_shared.h"
+@@ -1007,7 +1008,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+         guest_destroy(&g);
+         return 1;
+     }
+-    close(ipc_fd);
++    /* Keep ipc_fd private until final guest termination is reported. */
+ 
+     /* The [vvar] time page is written only by the vDSO publisher thread,
+      * which does not exist in a fork child (threads are not inherited). The
+@@ -1028,6 +1029,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+     int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec, 1 /* forked main */);
+ 
+     vdso_publisher_stop();
++    hl_status_publish(ipc_fd,hl_status_current(exit_code));
+     guest_destroy(&g);
+     return exit_code;
+ }
+@@ -1550,7 +1552,7 @@ static void *vm_clone_thread_run(void *arg) {
+     int64_t exited_tid=t->guest_tid;
+     t->vm_exited = 1;
+     thread_notify_exit_locked();
+-    t->vm_exit_status = (exit_code & 0xFF) << 8;
++    t->vm_exit_status = hl_status_current(exit_code);
+     pthread_cond_broadcast(&t->ptrace_cond);
+     pthread_mutex_unlock(lock);
+ 
+@@ -2278,14 +2280,20 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+         close(ipc_sock);
+         return -LINUX_ENOMEM;
+     }
+-    close(ipc_sock);
++    /* ipc_sock is now the child's private terminal-status channel. */
+ 
+     /* After COW fork: parent stays on MAP_SHARED (no remap was done).
+      * The shm fd is kept open so subsequent forks can also use COW.
+      * The child has its own MAP_PRIVATE view of the same file. */
+ 
+     /* Step 6: Record child in process table */
+-    proc_register_child(child_host_pid, child_guest_pid);
++    if (proc_register_child_status(child_host_pid,child_guest_pid,ipc_sock)<0) {
++        close(ipc_sock);
++        /* Only this successfully spawned child is ours to retire. */
++        kill(child_host_pid,SIGKILL);
++        while (waitpid(child_host_pid,NULL,0)<0 && errno==EINTR) {}
++        return -LINUX_EAGAIN;
++    }
+ 
+     /* Step 7: For CLONE_VFORK, wait until child exits or execs.
+      * Since we can't detect exec, just wait for child to exit for now.
+diff --git a/src/syscall_proc.c b/src/syscall_proc.c
+index a6583c9..2d9d5cc 100644
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -19,6 +19,7 @@
+ #include "futex.h"
+ #include "gdb_stub.h"
+ #include "syscall_poll.h"
++#include "hl_status.h"
+ 
+ #include <stdatomic.h>
+ #include <stdio.h>
+@@ -390,6 +391,8 @@ static int proc_reap_finished(void) {
+         if (!proc_table[i].active) continue;
+         if (proc_table[i].exited) {
+             /* Already marked exited but never waited — free the slot */
++            if (proc_table[i].status_fd>=0) close(proc_table[i].status_fd);
++            proc_table[i].status_fd=-1;
+             proc_table[i].active = 0;
+             reaped++;
+             continue;
+@@ -397,7 +400,9 @@ static int proc_reap_finished(void) {
+         int status;
+         pid_t ret = waitpid(proc_table[i].host_pid, &status, WNOHANG);
+         if (ret > 0) {
+-            /* Child exited — free the slot */
++            /* Child exited — free the slot and its private channel. */
++            if (proc_table[i].status_fd>=0) close(proc_table[i].status_fd);
++            proc_table[i].status_fd=-1;
+             proc_table[i].active = 0;
+             reaped++;
+         }
+@@ -405,7 +410,10 @@ static int proc_reap_finished(void) {
+     return reaped;
+ }
+ 
+-int proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
++int proc_register_child(pid_t host_pid,int64_t guest_pid_val) {
++    return proc_register_child_status(host_pid,guest_pid_val,-1);
++}
++int proc_register_child_status(pid_t host_pid,int64_t guest_pid_val,int status_fd) {
+     pthread_mutex_lock(&pid_lock);
+     for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+         if (!proc_table[i].active) {
+@@ -414,6 +422,7 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
+             proc_table[i].guest_pid = guest_pid_val;
+             proc_table[i].exited = 0;
+             proc_table[i].exit_status = 0;
++            proc_table[i].status_fd = status_fd;
+             pthread_mutex_unlock(&pid_lock);
+             return 0;
+         }
+@@ -428,6 +437,7 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
+                 proc_table[i].guest_pid = guest_pid_val;
+                 proc_table[i].exited = 0;
+                 proc_table[i].exit_status = 0;
++                proc_table[i].status_fd = status_fd;
+                 pthread_mutex_unlock(&pid_lock);
+                 return 0;
+             }
+@@ -445,7 +455,8 @@ void proc_mark_child_exited(pid_t host_pid, int status) {
+     for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+         if (proc_table[i].active && proc_table[i].host_pid == host_pid) {
+             proc_table[i].exited = 1;
+-            proc_table[i].exit_status = status;
++            proc_table[i].exit_status = hl_status_collect(proc_table[i].status_fd,status);
++            proc_table[i].status_fd=-1;
+             pthread_cond_broadcast(&pid_cond);
+             pthread_mutex_unlock(&pid_lock);
+             return;
+@@ -597,6 +608,28 @@ static int write_rusage_to_guest(guest_t *g, uint64_t gva,
+     return guest_write(g, gva, &lru, sizeof(lru));
+ }
+ 
++/* Host wait completion is the only trigger for reading the private channel.
++ * Reads are nonblocking and bounded; no guest pointer or blocking I/O is used
++ * with pid_lock. The cached Linux status also preserves waitid WNOWAIT. */
++static int proc_cache_child_status(pid_t host_pid,int64_t expected_guest_pid,int status) {
++    if (!WIFEXITED(status) && !WIFSIGNALED(status))
++        return hl_status_collect(-1,status);
++    pthread_mutex_lock(&pid_lock);
++    for (int i=0;i<PROC_TABLE_SIZE;++i) {
++        proc_entry_t *p=&proc_table[i];
++        if (p->active && p->host_pid==host_pid && p->guest_pid==expected_guest_pid) {
++            if (!p->exited) {
++                p->exit_status=hl_status_collect(p->status_fd,status);
++                p->status_fd=-1; p->exited=1;
++            }
++            status=p->exit_status;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&pid_lock);
++    return status;
++}
++
+ /* ---------- sys_wait4 ---------- */
+ 
+ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+@@ -667,12 +700,13 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+                 pid_t ret = wait4(host_pid, &status, mac_options | WNOHANG,
+                                   rusage_gva ? &ru : NULL);
+                 if (ret > 0) {
++                    status=proc_cache_child_status(host_pid,gpid,status);
+                     if (status_gva) {
+                         int32_t linux_status = status;
+                         if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+                             /* Child already reaped — match Linux: return EFAULT */
+                             pthread_mutex_lock(&pid_lock);
+-                            if (proc_table[slot].active &&
++                            if (proc_table[slot].active && proc_table[slot].exited &&
+                                 proc_table[slot].host_pid == host_pid)
+                                 proc_table[slot].active = 0;
+                             pthread_mutex_unlock(&pid_lock);
+@@ -682,14 +716,14 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+                     if (rusage_gva &&
+                         write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+                         pthread_mutex_lock(&pid_lock);
+-                        if (proc_table[slot].active &&
++                        if (proc_table[slot].active && proc_table[slot].exited &&
+                             proc_table[slot].host_pid == host_pid)
+                             proc_table[slot].active = 0;
+                         pthread_mutex_unlock(&pid_lock);
+                         return -LINUX_EFAULT;
+                     }
+                     pthread_mutex_lock(&pid_lock);
+-                    if (proc_table[slot].active &&
++                    if (proc_table[slot].active && proc_table[slot].exited &&
+                         proc_table[slot].host_pid == host_pid)
+                         proc_table[slot].active = 0;
+                     pthread_mutex_unlock(&pid_lock);
+@@ -752,11 +786,12 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+             pid_t ret = wait4(host_pid, &status, mac_options,
+                               rusage_gva ? &ru : NULL);
+             if (ret > 0) {
++                status=proc_cache_child_status(host_pid,gpid,status);
+                 if (status_gva) {
+                     int32_t linux_status = status;
+                     if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+                         pthread_mutex_lock(&pid_lock);
+-                        if (proc_table[slot].active &&
++                        if (proc_table[slot].active && proc_table[slot].exited &&
+                             proc_table[slot].host_pid == host_pid)
+                             proc_table[slot].active = 0;
+                         pthread_mutex_unlock(&pid_lock);
+@@ -766,7 +801,7 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+                 if (rusage_gva &&
+                     write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+                     pthread_mutex_lock(&pid_lock);
+-                    if (proc_table[slot].active &&
++                    if (proc_table[slot].active && proc_table[slot].exited &&
+                         proc_table[slot].host_pid == host_pid)
+                         proc_table[slot].active = 0;
+                     pthread_mutex_unlock(&pid_lock);
+@@ -774,7 +809,7 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+                 }
+                 pthread_mutex_lock(&pid_lock);
+                 /* Re-validate slot: another thread may have reaped it */
+-                if (proc_table[slot].active &&
++                if (proc_table[slot].active && proc_table[slot].exited &&
+                     proc_table[slot].host_pid == host_pid)
+                     proc_table[slot].active = 0;
+                 pthread_mutex_unlock(&pid_lock);
+@@ -872,6 +907,13 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+                     continue; /* Child may have been reaped concurrently */
+                 }
+                 pthread_mutex_lock(&pid_lock);
++                if (!proc_table[i].active || proc_table[i].host_pid!=ret) continue;
++                if (!proc_table[i].exited) {
++                    proc_table[i].exit_status=hl_status_collect(proc_table[i].status_fd,status);
++                    proc_table[i].status_fd=-1;
++                    proc_table[i].exited=1;
++                }
++                status=proc_table[i].exit_status;
+             }
+ 
+             /* Fill siginfo_t in guest memory */
+diff --git a/src/syscall_proc.h b/src/syscall_proc.h
+index f13c935..fb8e970 100644
+--- a/src/syscall_proc.h
++++ b/src/syscall_proc.h
+@@ -90,12 +90,14 @@ typedef struct {
+     pid_t   host_pid;   /* macOS process ID of child hl instance */
+     int64_t guest_pid;  /* Guest-visible PID assigned to child */
+     int     exited;     /* 1 if child has exited */
+-    int     exit_status;/* wait status (as returned by waitpid) */
++    int     exit_status;/* Linux wait status; host kind is converted explicitly */
++    int     status_fd;  /* Private fork terminal channel, -1 when absent/consumed */
+ } proc_entry_t;
+ 
+ /* Register a child process in the process table.
+  * Returns 0 on success, -1 if the table is full. */
+ int proc_register_child(pid_t host_pid, int64_t guest_pid);
++int proc_register_child_status(pid_t host_pid,int64_t guest_pid,int status_fd);
+ 
+ /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
+ void proc_mark_child_exited(pid_t host_pid, int status);
+diff --git a/src/syscall_signal.c b/src/syscall_signal.c
+index 39a08de..99227b9 100644
+--- a/src/syscall_signal.c
++++ b/src/syscall_signal.c
+@@ -13,6 +13,7 @@
+  * Reference: Linux arch/arm64/kernel/signal.c
+  */
+ #include "syscall_signal.h"
++#include "hl_status.h"
+ #include "syscall.h"        /* LINUX_E* errno constants */
+ #include "syscall_fd.h"     /* signalfd_notify */
+ #include "syscall_poll.h"   /* wakeup_pipe_signal */
+@@ -844,6 +845,7 @@ static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
+         case SIG_DISP_CORE:
+             *exit_code = 128 + signum;
+             pthread_mutex_unlock(&sig_lock);
++            hl_status_mark_signal(signum);
+             *exit_code = forced ? thread_seccomp_terminate(1)
+                                 : proc_request_exit_group(*exit_code);
+             return -1;  /* Terminate */
+@@ -964,6 +966,7 @@ static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
+                 signum, sizeof(frame));
+         *exit_code = 128 + signum;
+         pthread_mutex_unlock(&sig_lock);
++        hl_status_mark_signal(signum);
+         if (forced) *exit_code = thread_seccomp_terminate(1);
+         return -1;
+     }
+diff --git a/src/thread.c b/src/thread.c
+index 5182f64..9c581b8 100644
+--- a/src/thread.c
++++ b/src/thread.c
+@@ -107,6 +107,7 @@ thread_entry_t *thread_alloc(int64_t tid, int new_group) {
+             if (current_thread) {
+                 t->no_new_privs = current_thread->no_new_privs;
+                 t->seccomp_killed = !new_group && current_thread->seccomp_killed;
++                t->termination_signal = !new_group ? current_thread->termination_signal : 0;
+                 t->seccomp_filter = current_thread->seccomp_filter;
+                 hl_seccomp_retain(t->seccomp_filter);
+             }
+@@ -568,6 +569,7 @@ int thread_seccomp_terminate(int whole_group) {
+         if (!t->active || !self ||
+             (whole_group ? t->seccomp_tgid!=self->seccomp_tgid : t!=self)) continue;
+         t->seccomp_killed=1;
++        t->termination_signal=31;
+         if (t!=self) {
+             if (t->vcpu_valid) {
+                 hv_vcpus_exit(&t->vcpu,1);
+diff --git a/src/thread.h b/src/thread.h
+index eccae0e..a1f090c 100644
+--- a/src/thread.h
++++ b/src/thread.h
+@@ -36,6 +36,7 @@ typedef struct {
+     uint64_t      sp_el1;          /* Per-thread EL1 stack top (IPA) */
+     struct hl_seccomp_filter *seccomp_filter; /* Protected by thread_lock */
+     int no_new_privs;
++    _Atomic int termination_signal; /* Linux fatal signal, zero for ordinary exit */
+     _Atomic int seccomp_killed; /* Written under thread_lock, wait paths read atomically */
+     int64_t seccomp_tgid; /* Explicit group identity, including CLONE_VM groups */
+     int           active;          /* Non-zero while thread is running */
