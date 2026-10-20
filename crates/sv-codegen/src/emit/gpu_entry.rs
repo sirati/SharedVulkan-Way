@@ -1616,12 +1616,22 @@ fn emit_lower_full_pnext(cx: &Ctx<'_>) -> TokenStream {
 // ---------------------------------------------------------------------------
 
 fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
-    let optional_methods = cx.wire.commands.iter().filter(|c| crate::exceptions::GPU_OPTIONAL_OVERRIDES.contains(&c.name.as_str())).map(|c| {
-        let method = format_ident!("override_{}", naming::command_method(&c.name));
-        let args = format_ident!("{}Args", naming::opcode_variant(&c.name));
-        let ret = if c.generates_reply { let r=format_ident!("{}Reply",naming::opcode_variant(&c.name));quote!(sv_proto::#r) } else {quote!(())};
-        quote! { fn #method(&mut self, _args: &sv_proto::#args) -> Option<sv_wire::Result<#ret>> { None } }
-    });
+    let optional_methods = cx.wire.commands.iter()
+        .filter(|c| crate::exceptions::GPU_OPTIONAL_OVERRIDES.contains(&c.name.as_str()))
+        .map(|c| {
+            let method = format_ident!("override_{}", naming::command_method(&c.name));
+            let args = format_ident!("{}Args", naming::opcode_variant(&c.name));
+            let ret = if c.generates_reply {
+                let reply = format_ident!("{}Reply", naming::opcode_variant(&c.name));
+                quote!(sv_proto::#reply)
+            } else {
+                quote!(())
+            };
+            quote! {
+                fn #method(&mut self, _args: &sv_proto::#args)
+                    -> Option<sv_wire::Result<#ret>> { None }
+            }
+        });
     let methods = hand.iter().filter_map(|c| {
         let wire = cx.wire.commands.iter().find(|w| w.name == c.name)?;
         let m = naming::command_method(&c.name);
