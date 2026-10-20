@@ -9,12 +9,12 @@
  #include "gdkinternals.h"
  #include "gdkdeviceprivate.h"
 @@ -777,6 +778,7 @@
- 
+
    g_ptr_array_free (display_wayland->monitors, TRUE);
- 
+
 +  wc_gtk_native_shm_display_finish (display_wayland);
    wl_display_disconnect(display_wayland->wl_display);
- 
+
    G_OBJECT_CLASS (gdk_wayland_display_parent_class)->finalize (object);
 @@ -1307,6 +1309,8 @@
  typedef struct _GdkWaylandCairoSurfaceData {
@@ -27,7 +27,7 @@
    GdkWaylandDisplay *display;
 @@ -1366,15 +1370,29 @@
  }
- 
+
  static struct wl_shm_pool *
 -create_shm_pool (struct wl_shm  *shm,
 +create_shm_pool (GdkWaylandDisplay *display,
@@ -41,7 +41,7 @@
    struct wl_shm_pool *pool;
    int fd;
    void *data;
- 
+
 +  *native_owner = NULL;
 +  *buffer_offset = 0;
 +  int native = wc_gtk_native_shm_create (display, size, &pool, data_out,
@@ -55,21 +55,21 @@
 +    }
 +
    fd = open_shared_memory ();
- 
+
    if (fd < 0)
 @@ -1396,7 +1414,7 @@
        return NULL;
      }
- 
+
 -  pool = wl_shm_create_pool (shm, fd, size);
 +  pool = wl_shm_create_pool (display->shm, fd, size);
- 
+
    close (fd);
- 
+
 @@ -1417,7 +1435,10 @@
    if (data->pool)
      wl_shm_pool_destroy (data->pool);
- 
+
 -  munmap (data->buf, data->buf_length);
 +  if (data->native_owner)
 +    wc_gtk_native_shm_close (data->native_owner);
@@ -77,11 +77,11 @@
 +    munmap (data->buf, data->buf_length);
    g_free (data);
  }
- 
+
 @@ -1439,10 +1460,12 @@
- 
+
    stride = cairo_format_stride_for_width (CAIRO_FORMAT_ARGB32, width*scale);
- 
+
 -  data->pool = create_shm_pool (display->shm,
 +  data->pool = create_shm_pool (display,
                                  height*scale*stride,
@@ -90,15 +90,15 @@
 +                                &data->buf,
 +                                &data->native_owner,
 +                                &data->buffer_offset);
- 
+
    surface = cairo_image_surface_create_for_data (data->buf,
                                                   CAIRO_FORMAT_ARGB32,
 @@ -1450,7 +1473,7 @@
                                                   height*scale,
                                                   stride);
- 
+
 -  data->buffer = wl_shm_pool_create_buffer (data->pool, 0,
 +  data->buffer = wl_shm_pool_create_buffer (data->pool, data->buffer_offset,
                                              width*scale, height*scale,
                                              stride, WL_SHM_FORMAT_ARGB8888);
- 
+
