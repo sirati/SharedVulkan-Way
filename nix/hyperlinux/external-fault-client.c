@@ -13,6 +13,11 @@
 
 static void *fault_address;
 static volatile sig_atomic_t caught;
+static volatile sig_atomic_t user_signal;
+static void on_user_signal(int signum) {
+    if (signum != SIGUSR1 || user_signal) _exit(92);
+    user_signal = 1;
+}
 static void on_fault(int signum, siginfo_t *info, void *context) {
     if (signum != SIGBUS || info->si_code != BUS_ADRERR ||
         info->si_addr != fault_address || caught) _exit(90);
@@ -24,7 +29,8 @@ static void on_fault(int signum, siginfo_t *info, void *context) {
 }
 int main(int argc, char **argv) {
     assert(argc == 2);
-    int handled = !strcmp(argv[1], "handled");
+    int queued = !strcmp(argv[1], "pending");
+    int handled = queued || !strcmp(argv[1], "handled");
     int blocked = !strcmp(argv[1], "blocked");
     int ignored = !strcmp(argv[1], "ignored");
     assert(handled || blocked || ignored || !strcmp(argv[1], "default"));
@@ -47,11 +53,27 @@ int main(int argc, char **argv) {
         assert(!sigprocmask(SIG_BLOCK, &mask, NULL));
     }
     if (ignored) assert(signal(SIGBUS, SIG_IGN) != SIG_ERR);
+    sigset_t user_mask;
+    if (queued) {
+        struct sigaction action = { .sa_handler = on_user_signal };
+        sigemptyset(&action.sa_mask);
+        assert(!sigaction(SIGUSR1, &action, NULL));
+        sigemptyset(&user_mask);
+        sigaddset(&user_mask, SIGUSR1);
+        assert(!sigprocmask(SIG_BLOCK, &user_mask, NULL));
+        assert(!raise(SIGUSR1));
+    }
     assert(!ftruncate(fd, 0));
     uint32_t value;
     __asm__ volatile("ldr %w0, [%1]" : "=r"(value) : "r"(fault_address) : "memory");
     (void)value;
     if (!handled || !caught) return 91;
+    if (queued) {
+        assert(!user_signal);
+        assert(!sigprocmask(SIG_UNBLOCK, &user_mask, NULL));
+        assert(user_signal == 1);
+        puts("external-fault-client: pending SIGUSR1 preserved across SIGBUS passed");
+    }
     assert(!munmap(fault_address, 16384));
     assert(!close(fd));
     puts("external-fault-client: SIGBUS/BUS_ADRERR address and rt_sigreturn passed");
