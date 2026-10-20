@@ -1132,6 +1132,104 @@ mod tests {
         wait_workers(&port);
     }
 
+    /// Named pipes emulate the raw source. This excludes VM/virtio latency.
+    #[test]
+    #[ignore = "manual native scheduling measurement; requires real Windows"]
+    fn parked_native_fanout_round_trip_latency() {
+        const ROUNDS: usize = 2000;
+        const WARMUP: usize = 100;
+        let (port, host, host_raw) = fixture();
+        let (responder, responder_raw) = peer(port.subscribe(process()).unwrap());
+        let (observer, observer_raw) = peer(port.subscribe(process()).unwrap());
+        let request = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (armed_tx, armed_rx) = std::sync::mpsc::sync_channel(1);
+        let request_peer = request.clone();
+        let completed_peer = completed.clone();
+        let responder_thread = std::thread::spawn(move || {
+            let stop = event().unwrap();
+            let mut seen = 0;
+            while seen < ROUNDS + WARMUP {
+                let wake = read_wake_ops(
+                    responder.clone(),
+                    responder_raw,
+                    stop.0 as usize,
+                    2000,
+                    || {},
+                    |handles, timeout| {
+                        // Only announce an actual pending read entering its wait.
+                        armed_tx.send(()).unwrap();
+                        unsafe {
+                            windows_sys::Win32::System::Threading::WaitForMultipleObjects(
+                                2,
+                                handles.as_ptr(),
+                                0,
+                                timeout,
+                            )
+                        }
+                    },
+                    |handle, ov, done| {
+                        if unsafe {
+                            windows_sys::Win32::System::IO::GetOverlappedResult(handle, ov, done, 1)
+                        } != 0
+                        {
+                            Ok(())
+                        } else {
+                            Err(io::Error::last_os_error())
+                        }
+                    },
+                )
+                .unwrap();
+                assert!(wake);
+                let current = request_peer.load(Ordering::Acquire);
+                if current > seen {
+                    assert_eq!(current, seen + 1);
+                    seen = current;
+                    completed_peer.store(current, Ordering::Release);
+                    (&*responder).write_all(&[RESCAN]).unwrap();
+                }
+            }
+        });
+        let observer_thread = std::thread::spawn(move || {
+            let stop = event().unwrap();
+            while matches!(
+                read_wake(observer.clone(), observer_raw, stop.0 as usize, 2000),
+                Ok(true)
+            ) {}
+        });
+        let mut samples = Vec::with_capacity(ROUNDS);
+        for sequence in 1..=ROUNDS + WARMUP {
+            armed_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            request.store(sequence, Ordering::Release);
+            let start = std::time::Instant::now();
+            (&*host).write_all(&[RESCAN]).unwrap();
+            notification(&host, host_raw);
+            let elapsed = start.elapsed().as_nanos();
+            assert_eq!(completed.load(Ordering::Acquire), sequence);
+            if sequence > WARMUP {
+                samples.push(elapsed);
+            }
+        }
+        responder_thread.join().unwrap();
+        port.fail();
+        observer_thread.join().unwrap();
+        wait_workers(&port);
+        samples.sort_unstable();
+        let mean = samples.iter().sum::<u128>() as f64 / samples.len() as f64 / 1000.0;
+        println!(
+            "NATIVE_PIPE_FANOUT_RTT samples={} warmup={} mean_us={:.3} p50_us={:.3} p95_us={:.3} p99_us={:.3} max_us={:.3} target_mean_us=200 physical_port=false cross_vm=false responder_pending=true",
+            samples.len(),
+            WARMUP,
+            mean,
+            samples[samples.len() / 2] as f64 / 1000.0,
+            samples[samples.len() * 95 / 100] as f64 / 1000.0,
+            samples[samples.len() * 99 / 100] as f64 / 1000.0,
+            samples[samples.len() - 1] as f64 / 1000.0
+        );
+    }
+
     #[test]
     fn raw_and_local_wakes_broadcast_without_consuming_another_subscriber() {
         let (raw_server, raw, raw_client) = pair().unwrap();
