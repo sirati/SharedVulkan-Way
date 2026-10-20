@@ -447,6 +447,20 @@ impl BrokerMappers {
     /// published and the table still holds (same region, same epoch), for
     /// the previous run's holders to find again; it is answered `UNMAPPED`
     /// only once they have all exited.
+    /// A lost directory cannot prove there were no earlier transferred handles.
+    /// Initialize only while the shared table has no live regions at all.
+    fn initialize_empty(&mut self, peer: &Peer) {
+        if (1..=sv_transport::regiontab::ENTRIES).any(|i| peer.table().entry(i).pstate != PState::Empty) {
+            self.recovery_error = Some("new state directory with a nonempty region table".into());
+            say("recovery blocked: new state directory with a nonempty region table");
+            return;
+        }
+        if let Some(path) = self.state_file()
+            && let Err(error) = write_records(&path, std::iter::empty()) {
+                self.recovery_error = Some(error);
+            }
+    }
+
     pub fn inherit(&mut self, peer: &Peer) {
         if self.recovery_error.is_some() {
             return; // Recovery requires a trusted journal and a fresh daemon.
@@ -625,13 +639,13 @@ pub fn spawn(publisher: Arc<dyn Publisher>, cfg: Config) -> Result<std::thread::
 }
 
 pub fn spawn_with(publisher: Arc<dyn Publisher>, cfg: Config, make: Box<MakeParts>) -> Result<std::thread::JoinHandle<()>, String> {
+    let mut fresh_state = false;
     if let Some(d) = &cfg.state {
         if let Some(parent) = d.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
         match std::fs::create_dir(d) {
-            Ok(()) => write_records(&d.join(format!("{}.regions", cfg.pool)), std::iter::empty())
-                .map_err(|e| format!("initializing {}: {e}", d.display()))?,
+            Ok(()) => fresh_state = true,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
             Err(e) => return Err(format!("{}: {e}", d.display())),
         }
@@ -661,6 +675,9 @@ pub fn spawn_with(publisher: Arc<dyn Publisher>, cfg: Config, make: Box<MakePart
             ));
             let (waker, rx) = peerloop::channel();
             let mut m = BrokerMappers::new(publisher, cfg.owner, &cfg.pool, make, cfg.state.clone(), waker.clone());
+            if fresh_state {
+                m.initialize_empty(&a.peer);
+            }
             m.inherit(&a.peer);
             a.peer.set_mappers(Box::new(m));
             let r = peerloop::run(a, &cfg.peer, waker, rx, |_| {}, |_, evs| {
@@ -1028,7 +1045,7 @@ mod tests {
     /// journal. Neither retirement nor a heartbeat may discard that state.
     #[test]
     fn unreadable_or_corrupt_recovery_state_never_releases_an_existing_mapper() {
-        for failure in ["directory", "missing", "malformed", "empty", "truncated", "legacy", "missing-record"] {
+        for failure in ["directory", "lost-directory", "missing", "malformed", "empty", "truncated", "legacy", "missing-record"] {
             let r = rig(16);
             let state = r.dir.join("state");
             std::fs::create_dir(&state).unwrap();
@@ -1055,6 +1072,10 @@ mod tests {
                     std::fs::remove_file(&path).unwrap();
                     std::fs::create_dir(&path).unwrap();
                 }
+                "lost-directory" => {
+                    std::fs::remove_dir_all(&state).unwrap();
+                    std::fs::create_dir(&state).unwrap();
+                }
                 "missing" => std::fs::remove_file(&path).unwrap(),
                 "malformed" => {
                     let payload = "region broken\n";
@@ -1070,6 +1091,10 @@ mod tests {
             let mut restarted_peer = peer(&r);
             let broker = Arc::new(Fake::default());
             let mut m = mappers(&broker, Owner::Uid(1000), Some(state.clone()));
+            if failure == "lost-directory" {
+                restarted_peer.table().answer(entry, restarted_peer.table().entry(entry).epoch, sv_transport::regiontab::QState::None, sv_transport::regiontab::Reason::None, 0);
+                m.initialize_empty(&restarted_peer);
+            }
             m.inherit(&restarted_peer);
             assert!(m.recovery_error.is_some(), "{failure}");
             assert!(!m.let_go(999, 1), "unknown epochs must also remain blocked");

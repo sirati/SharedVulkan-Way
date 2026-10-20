@@ -36363,8 +36363,9 @@ let the provider free memory handed to a mapper before `MAPPED` was written. Hea
 file untouched. Restoring a trusted journal and restarting the daemon is
 required to resume recovery; a timeout never clears the block.
 
-Only a newly created private state directory gets an initial, durably empty
-journal. An existing directory with a missing journal is not treated as a
+Only a newly created private state directory with a demonstrably empty
+shared region table gets an initial, durably empty journal. A nonempty
+table blocks initialization, including ANNOUNCED entries before MAPPED. An existing directory with a missing journal is not treated as a
 first start. Production `GuestRamComponent` construction requires this
 directory; explicitly in-memory simulations retain their test-only mode.
 Unversioned journals are rejected because older heartbeat records cannot
