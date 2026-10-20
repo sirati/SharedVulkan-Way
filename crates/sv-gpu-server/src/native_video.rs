@@ -477,6 +477,9 @@ impl NativeVideo {
         Ok(())
     }
     pub fn end(&mut self, command: u64) -> VideoResult<()> {
+        if self.scopes.get(&command).is_some_and(|scope| scope.reset) {
+            return unsupported();
+        }
         let scope = self
             .scopes
             .remove(&command)
@@ -786,6 +789,8 @@ mod tests_multiple_scopes {
         let old = v.recording(7).unwrap();
         v.begin(7, id, p).unwrap();
         v.reset_scope(7).unwrap();
+        assert!(v.end(7).is_err());
+        v.scopes.get_mut(&7).unwrap().reset = false;
         let mut second = job;
         second.source_buffer = 2;
         second.reset_before = false;
