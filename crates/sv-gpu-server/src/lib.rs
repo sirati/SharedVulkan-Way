@@ -30,6 +30,7 @@ pub mod pool_guest;
 pub mod convert;
 pub mod driver;
 pub mod server;
+pub mod fence;
 pub mod session;
 pub mod shared;
 pub mod set_layout;
@@ -71,7 +72,10 @@ pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 ///
 /// **4** since waycompose-design.md §104: `svAllocShared` and `svImportShared`,
 /// the shared sections behind a dma-buf token.
-pub const WIRE_VERSION: u32 = 4;
+///
+/// **5** since §104.11: `svFenceRecord`, `svFenceMark` and `svFenceWait`, the
+/// sync fd export that does not wait.
+pub const WIRE_VERSION: u32 = 5;
 
 /// The identity the two sides must agree on before a single ring is claimed.
 ///

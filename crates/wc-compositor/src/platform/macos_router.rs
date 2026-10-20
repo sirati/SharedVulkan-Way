@@ -401,6 +401,8 @@ impl R {
                 }
                 self.present_damage(id, (!full).then_some(&damage[..]))
             }
+            // Never sent off Windows; see its definition.
+            ToUi::Direct { .. } => {}
             ToUi::ShiftOrigin { id, dx, dy } => self.forward(id, ToFace::ShiftOrigin { id, dx, dy }),
             ToUi::Map { id, width, height, fold_caption } => {
                 let Some(w) = self.wins.get_mut(&id) else { return true };

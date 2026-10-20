@@ -244,6 +244,16 @@ impl Pool {
     pub fn with_data_mut<T, F: FnOnce(*mut u8, usize) -> T>(&self, f: F) -> Result<T, ()> {
         self.inner.as_ref().unwrap().with_data_mut(f)
     }
+
+    /// The named object this pool was opened from (a refcounted clone), or
+    /// `None` for one that arrived as an open descriptor.
+    pub fn handle(&self) -> Option<crate::utils::os::Handle> {
+        match &self.inner.as_ref()?.fd {
+            WireFd::Named(h) => Some(h.clone()),
+            #[cfg(unix)]
+            WireFd::Open(_) => None,
+        }
+    }
 }
 
 impl Drop for Pool {
