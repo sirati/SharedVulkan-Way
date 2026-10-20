@@ -97,6 +97,9 @@ head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$D/wrong.key"
 
 export WC_LAUNCH_RUN="$D/run" WC_LAUNCH_ARENA="$D/arena" WC_LAUNCH_WCBELL="$D/host.sock"
 export WC_LAUNCH_BELL_HUB="$D/hub" WC_LAUNCH_HUB_UNMANAGED=1 WC_LAUNCH_SESSION_SECS=600
+# §113: the compositor stands for the VM whose process tells a stalled guest
+# from a dead one; start_compositor writes its pid.
+export WC_LAUNCH_VM_PIDFILE="$D/vm.pid"
 # §110: the file leg 7 makes as the GPU device; wc-session passes it to the
 # proxy as region 1 once it exists.
 export WC_LAUNCH_GPU_REGION="$D/gpu"
@@ -132,6 +135,7 @@ start_compositor() {
     --user-control "$D/user.ctl" --singleton "wc-multi-$$" ${region:+--pool-region-file "$region"} \
     ${COMP_EXTRA:-} >"$D/comp-$tag.log" 2>&1 &
   COMP=$!; PIDS+=("$COMP")
+  echo "$COMP" >"$D/vm.pid"
   wait_line "$D/comp-$tag.log" 'user control socket' 20 || bad "compositor $tag: no user control socket"
 }
 wait_line() { # FILE REGEX SECS
@@ -228,6 +232,19 @@ wait_line "$D/comp-1.log" "arena: session ${IDX_B2:-x} granted region" 30
 NEW_B=$(grep -o "arena: session ${IDX_B2:-x} granted region [^:]*: [0-9]* MiB at [0-9]* MiB" "$D/comp-1.log" | head -1 | awk '{print $10}')
 [ -n "$NEW_B" ] && [ "$NEW_B" = "$OLD_B" ] && ok "the new session's first region is at $NEW_B MiB, where the dead one's was" || bad "reuse: old at ${OLD_B:-?} MiB, new at ${NEW_B:-?} MiB"
 keep_log "$D/run/wcmb-$$-b2/proxy.log" "$D/proxy-b2.log"
+
+say "leg 3b (§113): the whole guest stalls for 8 s (SIGSTOP) under three sessions; all of them ride it out"
+ENDED_N=$(grep -c ') ENDED' "$D/comp-1.log")
+sleep 2 # b2 booted just now: its lease starts with its first ping
+kill -STOP "$COMP"; sleep 8; kill -CONT "$COMP"
+sleep 3
+for t in a c b2; do
+  grep -q 'LEASE LOST' "$D/proxy-$t.log" && bad "proxy $t ended over a stall: $(grep -o 'LEASE LOST.*' "$D/proxy-$t.log" | cut -c1-110)"
+  wait_line "$D/proxy-$t.log" 'the guest is back' 5 || bad "proxy $t never said it held a stalled guest"
+  R=$(request "$t" "raw status"); case "$R" in ok-raw*) ;; *) bad "after the stall, status $t: $R" ;; esac
+done
+[ "$(grep -c ') ENDED' "$D/comp-1.log")" = "$ENDED_N" ] && ok "a, c and b2 rode out an 8 s stall: $(grep -m1 -o 'the guest is back after [0-9]* ms' "$D/proxy-a.log"); $(grep -m1 -o 'this process did not run for [0-9]* ms' "$D/comp-1.log" || echo 'no probe crossed it')" \
+  || bad "the compositor ended a session over the stall: $(grep ') ENDED' "$D/comp-1.log" | tail -1 | cut -c1-140)"
 
 say "leg 4: the compositor killed under three sessions, then started again"
 sleep 2
