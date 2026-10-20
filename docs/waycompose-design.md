@@ -37679,6 +37679,24 @@ the same protected candidate. Already protected deployments reuse their
 key. Every script-managed shared-verifier restart first checks that all
 installed directories have protected broker-confirmed provenance and match
 their registry key; a partially migrated directory leaves services stopped. Privileged broker provisioning through the old user layout is refused.
+Generation provenance is written only when the helper actually generates a
+candidate. A preexisting key with root ownership and 0600 mode but no such
+provenance is refused, not relabelled. A lost candidate cannot inherit an old
+broker confirmation. A generated candidate interrupted before broker
+confirmation can be retried unchanged. Generation is serialized.
+
+The focused fixture reproduces a first migration whose candidate `wc-session`
+exits 91, then runs the restored original executable after protected rollback.
+It checks normalized system paths and the current trusted key. This is an
+isolated filesystem fixture, not a live mapped-user application session.
+The private Windows clone additionally passed real broker signing and host
+boot-record verification with the replacement key while rejecting the retired
+key. An already-open handle to the previously readable key retained only the
+retired bytes after replacement. The replacement object allowed only SYSTEM
+and Administrators. Evidence and the recipe are outside git in
+`evidence/session-fixes/broker-rollback/key-rotation-proof.txt` and
+`key-rotation-proof.ps1`; neither records key bytes or fingerprints.
+
 The root helper and privileged deployment channel are trusted administration
 interfaces, not interfaces exposed to desktop clients.
 
