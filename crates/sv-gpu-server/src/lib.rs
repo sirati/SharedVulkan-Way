@@ -91,3 +91,9 @@ pub const WIRE_VERSION: u32 = 5;
 pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
     sv_transport::control::ProtocolIds::new(WIRE_VERSION, sv_proto::PROTOCOL_HASH)
 }
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod native_video;
+
+#[cfg(target_os = "macos")]
+mod video_submit;
