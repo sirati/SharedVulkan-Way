@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 #endif
 
 #define BLOCK (2ULL*1024*1024)
@@ -229,6 +230,10 @@ int hl_wc_protect(guest_t *g, uint64_t lo, uint64_t len, int prot) {
 }
 
 #ifndef HL_WC_SHARED_TEST
+static void map_error(const char *stage, int64_t code) {
+    if (getenv("HL_WC_MAP_TRACE"))
+        fprintf(stderr, "hl: shared mmap stage=%s code=0x%llx\n",stage,(unsigned long long)code);
+}
 static int64_t map_host(guest_t *g, uint64_t addr, uint64_t len, int prot,
     int flags, int hfd, uint64_t offset, int inherited, void *prime) {
     if (g->is_rosetta) { wc_hl_prime_release(prime); return -LINUX_EOPNOTSUPP; }
@@ -259,7 +264,7 @@ static int64_t map_host(guest_t *g, uint64_t addr, uint64_t len, int prot,
     hl_wc_seal_end(&guard);
     if (o->seal_id && o->seal_fd < 0) { hl_wc_seal_untrack(hfd, o->seal_id); wc_hl_prime_release(o->prime); free(o); free(v); return linux_errno(); }
     int rc = wc_hl_backing_map(hfd, offset, len, o->writable, &o->backing, &o->map);
-    if (rc) { hl_wc_seal_untrack(o->seal_fd, o->seal_id); if (o->seal_fd >= 0) close(o->seal_fd);
+    if (rc) { map_error("native-shared-view", rc); hl_wc_seal_untrack(o->seal_fd, o->seal_id); if (o->seal_fd >= 0) close(o->seal_fd);
         wc_hl_prime_release(o->prime); free(o); free(v); errno = -rc; return linux_errno(); }
     if (o->map.mapped_len > UINT64_MAX - BLOCK + 1) goto no_memory;
     o->span = (o->map.mapped_len + BLOCK - 1) & ~(BLOCK - 1);
@@ -273,9 +278,12 @@ static int64_t map_host(guest_t *g, uint64_t addr, uint64_t len, int prot,
         wc_hl_prime_release(o->prime); wc_hl_backing_release(o->backing); free(o); free(v); return -LINUX_EEXIST;
     }
     /* Reserve Stage-2 first. If this fails the old guest mapping is intact. */
-    if (hv_vm_unmap(o->ipa, o->span) != HV_SUCCESS) goto no_memory;
-    if (hv_vm_map(o->map.base, o->ipa, o->map.mapped_len,
-        HV_MEMORY_READ | (o->writable ? HV_MEMORY_WRITE : 0)) != HV_SUCCESS) {
+    hv_return_t result = hv_vm_unmap(o->ipa, o->span);
+    if (result != HV_SUCCESS) { map_error("hv-unmap-primary-reservation", result); goto no_memory; }
+    result = hv_vm_map(o->map.base, o->ipa, o->map.mapped_len,
+        HV_MEMORY_READ | (o->writable ? HV_MEMORY_WRITE : 0));
+    if (result != HV_SUCCESS) {
+        map_error("hv-map-native-shared-view", result);
         hv_vm_map((char *)g->host_base + o->ipa - g->ipa_base,
             o->ipa, o->span, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
         goto no_memory;
