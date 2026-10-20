@@ -88,3 +88,14 @@ eight full64x64 YUV pictures, with maximum error1 against the original input's
 encoded edge-extension rows. This establishes real full macroblock decoding,
 not merely relabeling the cropped50-row image. Native coded-output success is
 not claimed by this software check.
+
+Optional --copy-target adds a real Metal target-copy check. It allocates one
+exact display-size or --coded-output coded-size NV12 target before decoder
+creation and reuses that allocation for every completed frame. Each copy waits
+for tracked input release and synchronous Metal completion before diagnostic
+CPU verification. Target storage is deliberately 420v even for --full-range;
+the copy must preserve the source's raw full-range sample values rather than
+convert according to the target allocation's fourcc. Stream range remains
+separate metadata. The fixture also rechecks every retained decoder picture
+and the final target after compressed-source overwrite. This does not claim
+KK/Vulkan sampling or native target-copy success until the coordinated run.

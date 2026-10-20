@@ -142,8 +142,9 @@ mod fixture {
     fn verify(
         picture: &Picture,
         frame: usize,
-        expected_range: PixelRange,
+        expected_storage_range: PixelRange,
         coded_output: bool,
+        role: &str,
     ) -> Result<(), String> {
         let layout = picture.layout();
         if layout.width != WIDTH || ![HEIGHT, 64].contains(&layout.height) {
@@ -152,9 +153,9 @@ mod fixture {
                 layout.width, layout.height
             ));
         }
-        if picture.range() != expected_range {
+        if picture.range() != expected_storage_range {
             return Err(format!(
-                "fixture requires {expected_range:?} NV12 output, got {:?}",
+                "fixture {role} requires {expected_storage_range:?} NV12 storage, got {:?}",
                 picture.range()
             ));
         }
@@ -198,7 +199,7 @@ mod fixture {
             ));
         }
         println!(
-            "frame={frame} NV12={}x{} visible=64x50 max_yuv_error={max_error:?}",
+            "frame={frame} role={role} NV12={}x{} visible=64x50 storage_range={expected_storage_range:?} max_yuv_error={max_error:?}",
             layout.width, layout.height
         );
         Ok(())
@@ -206,13 +207,15 @@ mod fixture {
     pub fn run() -> Result<(), String> {
         let mut full_range = false;
         let mut coded_output = false;
+        let mut copy_target = false;
         for argument in std::env::args().skip(1) {
             match argument.as_str() {
                 "--full-range" => full_range = true,
                 "--coded-output" => coded_output = true,
+                "--copy-target" => copy_target = true,
                 _ => {
                     return Err(
-                        "usage: macos-videotoolbox-decode [--full-range] [--coded-output]".into(),
+                        "usage: macos-videotoolbox-decode [--full-range] [--coded-output] [--copy-target]".into(),
                     );
                 }
             }
@@ -228,7 +231,7 @@ mod fixture {
             VIDEO_STREAM
         };
         eprintln!(
-            "fixture stage=mode expected_range={expected_range:?} coded_output={coded_output}"
+            "fixture stage=mode expected_range={expected_range:?} coded_output={coded_output} copy_target={copy_target}"
         );
         unsafe {
             libc::alarm(30);
@@ -256,6 +259,23 @@ mod fixture {
         }
         eprintln!("fixture stage=map shared source");
         let source = Arc::new(Mapping::new(stream)?);
+        // Allocate application-like storage before any decoded output exists.
+        // Deliberately use video-range allocation metadata even for full-range
+        // streams: copy_from_gpu must preserve raw samples without interpreting
+        // storage's fourcc as the stream's sampling/conversion metadata.
+        let target = if copy_target {
+            let target_height = if coded_output { 64 } else { HEIGHT };
+            eprintln!(
+                "fixture stage=allocate fixed target extent={WIDTH}x{target_height} storage_range=Video stream_range={expected_range:?}"
+            );
+            Some(Picture::allocate_target(
+                WIDTH,
+                target_height,
+                PixelRange::Video,
+            )?)
+        } else {
+            None
+        };
         eprintln!("fixture stage=create hardware-required decoder");
         let mut decoder = if coded_output {
             Decoder::new_coded(&stream[sps.2.clone()], &stream[pps.2.clone()])?
@@ -310,7 +330,27 @@ mod fixture {
             }
             eprintln!("fixture stage=source released before fence frame={frame}");
             eprintln!("fixture stage=verify frame={frame}");
-            verify(&picture, frame, expected_range, coded_output)?;
+            verify(&picture, frame, expected_range, coded_output, "decoder")?;
+            if let Some(target) = &target {
+                eprintln!(
+                    "fixture stage=copy fixed target frame={frame} source_range={expected_range:?} target_storage_range={:?}",
+                    target.range()
+                );
+                // This fixture has exclusive producer ownership. Each previous
+                // GPU copy has completed and its readback lock has been dropped.
+                // The synchronous helper retains both pictures until Metal
+                // completion; no reader can overlap the next overwrite.
+                unsafe {
+                    target.copy_from_gpu(&picture)?;
+                }
+                verify(
+                    target,
+                    frame,
+                    PixelRange::Video,
+                    coded_output,
+                    "fixed-target",
+                )?;
+            }
             pictures.push(picture);
         }
         eprintln!("fixture stage=final drain");
@@ -330,7 +370,28 @@ mod fixture {
             return Err("source mutation did not reach mapping".into());
         }
         for (frame, picture) in pictures.iter().enumerate() {
-            verify(picture, frame, expected_range, coded_output)?;
+            verify(
+                picture,
+                frame,
+                expected_range,
+                coded_output,
+                "retained-decoder",
+            )?;
+        }
+        if let Some(target) = &target {
+            eprintln!(
+                "fixture stage=verify fixed target after source overwrite stream_range={expected_range:?}"
+            );
+            verify(
+                target,
+                FRAMES - 1,
+                PixelRange::Video,
+                coded_output,
+                "retained-fixed-target",
+            )?;
+            println!(
+                "PASS one preallocated NV12 target reused for all {FRAMES} GPU copies without sample-range conversion; stream_range={expected_range:?} target_storage_range=Video"
+            );
         }
         unsafe {
             libc::alarm(0);
