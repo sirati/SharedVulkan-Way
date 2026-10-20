@@ -326,15 +326,14 @@ impl Directory {
         };
         (self.inner.writable as *mut u8).wrapping_add(offset - start)
     }
-    /// Broker-only producer retirement after authoritative kernel process death.
-    /// No PID lookup, destructor, timeout, or metadata claim is a death proof.
+    /// Cooperative counter simulation for isolated tests only.
+    /// Client-writable counters cannot authorize privileged retirement.
     ///
     /// # Safety
-    /// Caller must retain a kernel-authenticated process HANDLE proven exited,
-    /// plus a trusted registration record binding that process to this exact
-    /// session, key, producer_id, offset and capacity. Client-writable metadata
-    /// alone cannot establish any of those facts.
-    pub unsafe fn retire_producer(
+    /// The test must exclusively control every simulated participant. This
+    /// helper must never be exposed by a production broker or recovery path.
+    #[cfg(test)]
+    unsafe fn simulate_cooperative_producer_close(
         &self,
         key: Key,
         producer_id: u64,
@@ -772,17 +771,17 @@ mod tests {
         unsafe {
             assert!(
                 directory
-                    .retire_producer(key, 43, offset, capacity)
+                    .simulate_cooperative_producer_close(key, 43, offset, capacity)
                     .is_err()
             );
             assert!(
                 directory
-                    .retire_producer(key, 42, offset + 1, capacity)
+                    .simulate_cooperative_producer_close(key, 42, offset + 1, capacity)
                     .is_err()
             );
             assert!(
                 directory
-                    .retire_producer(key, 42, offset, capacity)
+                    .simulate_cooperative_producer_close(key, 42, offset, capacity)
                     .unwrap()
             );
         }
