@@ -108,7 +108,7 @@ phase_kill() {
     # written into the session's arena by the proxy. Throwaway HOME/XDG.
     local th; th=$(mktemp -d "$SCR/foot-XXXX")
     HOME=$th XDG_CONFIG_HOME=$th/c XDG_DATA_HOME=$th/d XDG_STATE_HOME=$th/s XDG_CACHE_HOME=$th/k \
-      WAYLAND_DISPLAY="/tmp/wc-launch/$sid/wl-proxy" timeout 60 "$SCR/foot/bin/foot" -o tweak.max-shm-pool-size-mb=0 \
+      WAYLAND_DISPLAY="/tmp/wc-launch/$sid/wl-proxy" timeout 60 "$SCR/foot/bin/foot" \
       sh -c 'while :; do seq 1 100000; done' >/dev/null 2>&1 &
     local fp=$!
     sleep 6
