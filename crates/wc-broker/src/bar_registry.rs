@@ -38,6 +38,7 @@ pub unsafe trait DurableStore {
 }
 
 pub struct EpochTicket {
+    registry: Arc<()>,
     backing: PhysicalBacking,
     origin: Origin,
     value: u64,
@@ -212,6 +213,7 @@ impl<S: DurableStore> Registry<S> {
             Origin::Linux => self.linux_epoch,
         };
         !self.poisoned
+            && Arc::ptr_eq(&ticket.registry, &self.identity)
             && self.local_issued
             && ticket.backing == self.backing
             && ticket.origin == self.local_origin
@@ -250,6 +252,7 @@ impl<S: DurableStore> Registry<S> {
         self.persist()?;
         self.local_issued = true;
         Ok(EpochTicket {
+            registry: self.identity.clone(),
             backing: self.backing,
             origin,
             value,
@@ -276,6 +279,7 @@ impl<S: DurableStore> Registry<S> {
             Origin::Linux => self.linux_epoch,
         };
         if !self.local_issued
+            || !Arc::ptr_eq(&local.registry, &self.identity)
             || self.pair_ready
             || local.backing != self.backing
             || local.origin != self.local_origin
@@ -320,6 +324,7 @@ impl<S: DurableStore> Registry<S> {
             Origin::Linux => self.linux_epoch,
         };
         if !self.pair_ready
+            || !Arc::ptr_eq(&ticket.registry, &self.identity)
             || !self.local_issued
             || ticket.origin != self.local_origin
             || ticket.backing != self.backing
@@ -629,6 +634,25 @@ mod tests {
         assert_eq!(second.exclusions(), vec![(4096, 4096)]);
         assert!(unsafe { first.release_current(&ticket, second_token) }.is_err());
         assert_eq!(first.exclusions(), vec![(4096, 4096)]);
+    }
+    #[test]
+    fn matching_foreign_ticket_cannot_confirm_reserve_or_release() {
+        let (mut first, first_ticket, first_token) = current(Memory::default());
+        let (_, foreign, _) = current(Memory::default());
+        assert_eq!(first_ticket.value(), foreign.value());
+        assert!(!first.owns_current_ticket(&foreign));
+        assert!(!first.confirmed_pair(&foreign, 101));
+        assert!(unsafe { first.reserve(&foreign, binding(foreign.value(), 101, 8192)) }.is_err());
+        assert!(unsafe { first.release_current(&foreign, first_token) }.is_err());
+        assert_eq!(first.exclusions(), vec![(4096, 4096)]);
+        // Same numerical first-issued epoch is insufficient even before pair confirmation.
+        let mut unconfirmed = fresh(Memory::default());
+        let own = unconfirmed
+            .issue_next_service_epoch(Origin::Windows)
+            .unwrap();
+        assert_eq!(own.value(), foreign.value());
+        assert!(unsafe { unconfirmed.confirm_peer_epoch(&foreign, 101) }.is_err());
+        assert!(!unconfirmed.confirmed_pair(&own, 101));
     }
     #[test]
     fn release_rejects_old_epoch_even_after_new_live_pair_confirmation() {
