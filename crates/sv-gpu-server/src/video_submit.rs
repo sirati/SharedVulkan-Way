@@ -2,8 +2,8 @@
 //! Ordinary submissions keep their generated path. This executor is used only
 //! after the caller has validated a supported video recording and retained its
 //! exact source/target allocations. It never performs decode at record time.
-use ash::vk;
 use crate::{driver::Driver, native_video::Decode};
+use ash::vk;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Semaphore {
@@ -48,53 +48,98 @@ pub(crate) unsafe fn submit(
     signals: &[Semaphore],
     completion: vk::Fence,
     executor: &mut impl DecodeExecutor,
+    retained_fences: &mut Vec<vk::Fence>,
 ) -> Result<(), vk::Result> {
-    let waits: Vec<_> = waits.iter().map(|s| vk::SemaphoreSubmitInfo::default()
-        .semaphore(s.handle).value(s.value)
-        // Conservative ordering also covers the external decoder producer.
-        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();
+    let waits: Vec<_> = waits
+        .iter()
+        .map(|s| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(s.handle)
+                .value(s.value)
+                // Conservative ordering also covers the external decoder producer.
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        })
+        .collect();
     // Waiting on this internal fence observes the real Vulkan waits and all
     // prior queue work before any bytes are exposed to VideoToolbox or Metal.
-    unsafe { native_completed(driver, &waits, &[]) }?;
+    unsafe { native_completed(driver, &waits, &[], retained_fences) }?;
     let mut native = Vec::new();
     for item in work {
         match item {
-            Work::Native(command) => native.push(vk::CommandBufferSubmitInfo::default()
-                .command_buffer(*command)),
+            Work::Native(command) => {
+                native.push(vk::CommandBufferSubmitInfo::default().command_buffer(*command))
+            }
             Work::Decode(job) => {
                 if !native.is_empty() {
-                    unsafe { native_completed(driver, &[], &native) }?;
+                    unsafe { native_completed(driver, &[], &native, retained_fences) }?;
                     native.clear();
                 }
                 executor.decode_completed(job)?;
             }
         }
     }
-    let signals: Vec<_> = signals.iter().map(|s| vk::SemaphoreSubmitInfo::default()
-        .semaphore(s.handle).value(s.value).stage_mask(
-            if s.stage.intersects(vk::PipelineStageFlags2::VIDEO_DECODE_KHR) {
-                vk::PipelineStageFlags2::ALL_COMMANDS
-            } else { s.stage })).collect();
-    let last = vk::SubmitInfo2::default().command_buffer_infos(&native)
+    let signals: Vec<_> = signals
+        .iter()
+        .map(|s| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(s.handle)
+                .value(s.value)
+                .stage_mask(
+                    if s.stage
+                        .intersects(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+                    {
+                        vk::PipelineStageFlags2::ALL_COMMANDS
+                    } else {
+                        s.stage
+                    },
+                )
+        })
+        .collect();
+    let last = vk::SubmitInfo2::default()
+        .command_buffer_infos(&native)
         .signal_semaphore_infos(&signals);
     // Final native segments retain their asynchronous behavior. The Vulkan
     // fence/semaphore signals are downstream of every completed decoder write.
-    unsafe { driver.device.queue_submit2(driver.queue, &[last], completion) }
+    unsafe {
+        driver
+            .device
+            .queue_submit2(driver.queue, &[last], completion)
+    }
 }
 
 unsafe fn native_completed(
     driver: &Driver,
     waits: &[vk::SemaphoreSubmitInfo<'_>],
     commands: &[vk::CommandBufferSubmitInfo<'_>],
+    retained_fences: &mut Vec<vk::Fence>,
 ) -> Result<(), vk::Result> {
-    let fence = unsafe { driver.device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
-    let batch = vk::SubmitInfo2::default().wait_semaphore_infos(waits)
+    let fence = unsafe {
+        driver
+            .device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+    }?;
+    retained_fences.push(fence);
+    let batch = vk::SubmitInfo2::default()
+        .wait_semaphore_infos(waits)
         .command_buffer_infos(commands);
     let submitted = unsafe { driver.device.queue_submit2(driver.queue, &[batch], fence) };
     let result = match submitted {
         Ok(()) => unsafe { driver.device.wait_for_fences(&[fence], true, u64::MAX) },
         Err(error) => Err(error),
     };
-    unsafe { driver.device.destroy_fence(fence, None) };
+    if result.is_ok() {
+        unsafe { driver.device.destroy_fence(fence, None) };
+        retained_fences.retain(|&retained| retained != fence);
+    }
     result
+}
+
+/// # Safety
+/// Called on the device worker under its queue lock; accepted owners remain
+/// alive until this fence observes all preceding native commands and signals.
+pub(crate) unsafe fn complete(
+    driver: &Driver,
+    retained_fences: &mut Vec<vk::Fence>,
+) -> Result<(), vk::Result> {
+    unsafe { native_completed(driver, &[], &[], retained_fences) }
 }

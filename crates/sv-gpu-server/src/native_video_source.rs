@@ -239,7 +239,6 @@ impl Creation {
 
 #[cfg(target_os = "macos")]
 mod hooks {
-    use super::*;
     use crate::server::GpuServer;
     use sv_proto::{self as p, Server};
     impl GpuServer {

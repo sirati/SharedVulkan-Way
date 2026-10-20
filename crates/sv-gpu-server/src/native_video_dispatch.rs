@@ -20,8 +20,9 @@ fn wire_result(r: VideoResult<()>) -> p::VkResult {
 }
 #[derive(Default)]
 pub struct DispatchState {
-    pub plans:crate::video_recording::Plans,
+    pub plans: crate::video_recording::Plans,
     pub video: NativeVideo,
+    pub(crate) runtime: std::sync::Arc<std::sync::Mutex<crate::native_video_decode::Runtime>>,
     failure: Option<vk::Result>,
     sessions: HashMap<u64, u64>,
     parameters: HashMap<u64, u64>,
@@ -347,10 +348,17 @@ impl GpuServer {
         if !state.session_ids.contains(&a.video_session.0) {
             return None;
         }
-        if let Some(id) = state.sessions.remove(&a.video_session.0) {
-            state.video.destroy_session(id)
+        let retired = state.sessions.remove(&a.video_session.0);
+        if let Some(id) = retired {
+            state.video.destroy_session(id);
         }
-        Some(Ok(()))
+        drop(state);
+        // Keep runtime teardown in the same executor as all accepted uses.
+        // No session/DPB owner is reclaimed before its final native fence.
+        Some(match retired {
+            Some(id) => self.native_queue_retire_session(id),
+            None => Ok(()),
+        })
     }
     pub(crate) fn native_destroy_video_session_parameters_khr(
         &mut self,

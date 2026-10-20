@@ -121,3 +121,19 @@ pub(crate) mod native_video_commands;
 
 #[cfg(target_os = "macos")]
 mod native_video_decode;
+
+#[cfg(any(target_os = "macos", test))]
+mod native_video_source;
+
+#[cfg(target_os = "macos")]
+mod native_video_recording;
+
+#[cfg(target_os = "macos")]
+mod native_video_barriers;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod native_video_submits;
+
+#[cfg(target_os = "macos")]
+mod native_video_queue;
+

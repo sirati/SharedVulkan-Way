@@ -3,7 +3,20 @@
 //! every accepted job until its producer/native consumers retire. This module
 //! supplies execution, not a second resource registry or reclamation timer.
 use ash::vk;
-use std::sync::{mpsc, Mutex};
+use std::sync::{Mutex, mpsc};
+
+/// Evidence that pending native objects may be retired. A failed idle caused
+/// by allocation pressure is not evidence that the device stopped reading.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetirementProof(());
+impl RetirementProof {
+    pub(crate) fn from_idle_result(result: Result<(), vk::Result>) -> Result<Self, vk::Result> {
+        match result {
+            Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => Ok(Self(())),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 pub(crate) trait Submission: Send {
     /// All shared allocation/parameter/driver owners belong to `self`, rather
@@ -26,23 +39,34 @@ impl Queue {
     /// must enter the same ordered executor once this runtime is active.
     pub(crate) fn new() -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<Box<dyn Submission>>(16);
-        let worker = std::thread::Builder::new().name("native-video-submit".into())
-            .stack_size(256 * 1024).spawn(move || {
+        let worker = std::thread::Builder::new()
+            .name("native-video-submit".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
                 while let Ok(mut job) = receiver.recv() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.execute()))
-                        .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST));
-                    if result.is_err() { job.retire_failed(); }
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.execute()))
+                            .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST));
+                    if result.is_err() {
+                        job.retire_failed();
+                    }
                     job.finished(result);
                     // Owners drop only after execution/failed-native retirement.
                 }
             })?;
-        Ok(Self { sender: Some(sender), worker: Mutex::new(Some(worker)) })
+        Ok(Self {
+            sender: Some(sender),
+            worker: Mutex::new(Some(worker)),
+        })
     }
     /// The caller must validate all supported-command/handle/synchronization
     /// shapes before enqueue. Full/disconnected queues refuse without accepting
     /// the job. No semaphore/fence wait occurs on the submitting RPC thread.
     pub(crate) fn enqueue(&self, job: Box<dyn Submission>) -> Result<(), vk::Result> {
-        self.sender.as_ref().ok_or(vk::Result::ERROR_DEVICE_LOST)?.try_send(job)
+        self.sender
+            .as_ref()
+            .ok_or(vk::Result::ERROR_DEVICE_LOST)?
+            .try_send(job)
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => vk::Result::ERROR_OUT_OF_HOST_MEMORY,
                 mpsc::TrySendError::Disconnected(_) => vk::Result::ERROR_DEVICE_LOST,
@@ -54,8 +78,15 @@ impl Drop for Queue {
         // Closing sends no cancellation that could discard a live allocation.
         // Every accepted job drains before the execution thread exits.
         self.sender.take();
-        if let Some(worker) = self.worker.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
-            if worker.thread().id() != std::thread::current().id() { let _ = worker.join(); }
+        if let Some(worker) = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            if worker.thread().id() != std::thread::current().id() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -82,7 +113,9 @@ mod tests {
         let queue = Queue::new().unwrap();
         let (signal, gate) = mpsc::channel();
         let (completed, done) = mpsc::channel();
-        queue.enqueue(Box::new(FutureWait { gate, completed })).unwrap();
+        queue
+            .enqueue(Box::new(FutureWait { gate, completed }))
+            .unwrap();
         // This signal is deliberately issued only after enqueue returned. A
         // synchronous fence wait in the RPC would deadlock this valid ordering.
         assert!(done.try_recv().is_err());

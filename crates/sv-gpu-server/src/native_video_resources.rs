@@ -12,6 +12,7 @@ pub(crate) struct View {
 }
 #[derive(Default)]
 pub(crate) struct Resources {
+    pub sources: crate::native_video_source::SourceRegistry,
     pub images: HashMap<u64, Arc<Image>>,
     pub memories: HashMap<u64, Arc<Image>>,
     pub views: HashMap<u64, View>,
@@ -32,6 +33,7 @@ impl Resources {
     /// Called by Objects only after native views are destroyed and the device
     /// is idle. Dropping these references preserves separately retained jobs.
     pub fn clear(&mut self) {
+        self.sources.clear();
         self.views.clear();
         self.images.clear();
         self.memories.clear();

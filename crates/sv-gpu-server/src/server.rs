@@ -487,6 +487,44 @@ fn no_info() -> WireError {
 
 impl GpuHost for GpuServer {
     #[cfg(target_os = "macos")]
+    fn prepare_recorded_command(&mut self,name:&'static str,wire:u64)->WireResult<()> {self.native_prepare_recorded_command(name,wire)}
+
+    #[cfg(target_os = "macos")]
+    fn override_allocate_command_buffers(&mut self,a:&p::VkAllocateCommandBuffersArgs)->Option<WireResult<p::VkAllocateCommandBuffersReply>> {self.native_record_allocate(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_begin_command_buffer(&mut self,a:&p::VkBeginCommandBufferArgs)->Option<WireResult<p::VkBeginCommandBufferReply>> {self.native_record_begin(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_end_command_buffer(&mut self,a:&p::VkEndCommandBufferArgs)->Option<WireResult<p::VkEndCommandBufferReply>> {self.native_record_end(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_reset_command_buffer(&mut self,a:&p::VkResetCommandBufferArgs)->Option<WireResult<p::VkResetCommandBufferReply>> {self.native_record_reset(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_free_command_buffers(&mut self,a:&p::VkFreeCommandBuffersArgs)->Option<WireResult<()>> {self.native_record_free(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_reset_command_pool(&mut self,a:&p::VkResetCommandPoolArgs)->Option<WireResult<p::VkResetCommandPoolReply>> {self.native_record_reset_pool(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_destroy_command_pool(&mut self,a:&p::VkDestroyCommandPoolArgs)->Option<WireResult<()>> {self.native_record_destroy_pool(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_cmd_pipeline_barrier(&mut self,a:&p::VkCmdPipelineBarrierArgs)->Option<WireResult<()>> {self.native_record_barrier_legacy(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_cmd_pipeline_barrier2(&mut self,a:&p::VkCmdPipelineBarrier2Args)->Option<WireResult<()>> {self.native_record_barrier_sync2(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_cmd_execute_commands(&mut self,a:&p::VkCmdExecuteCommandsArgs)->Option<WireResult<()>> {self.native_record_execute(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_bind_buffer_memory(&mut self, a: &p::VkBindBufferMemoryArgs) -> Option<WireResult<p::VkBindBufferMemoryReply>> { self.native_bind_video_source(a) }
+    #[cfg(target_os = "macos")]
+    fn override_bind_buffer_memory2(&mut self, a: &p::VkBindBufferMemory2Args) -> Option<WireResult<p::VkBindBufferMemory2Reply>> { self.native_bind_video_sources(a) }
+
+    #[cfg(target_os = "macos")]
     fn override_cmd_control_video_coding_khr(&mut self,a:&p::VkCmdControlVideoCodingKHRArgs)->Option<WireResult<()>> {
         self.native_cmd_control_video_coding_khr(a)
     }
@@ -577,7 +615,10 @@ impl GpuHost for GpuServer {
 
     fn unbind(&mut self, id: u64) {
         if id != 0 {
-            self.shared.objects().remove(id);
+            let mut objects = self.shared.objects();
+            #[cfg(target_os = "macos")]
+            objects.native_video.sources.destroyed(id);
+            objects.remove(id);
         }
     }
 
@@ -1010,6 +1051,11 @@ impl GpuHost for GpuServer {
     /// dma-buf legitimately would — has ours OR-ed into it instead.
     fn create_buffer(&mut self, a: p::VkCreateBufferArgs) -> WireResult<p::VkCreateBufferReply> {
         let mut a = a;
+        #[cfg(target_os = "macos")]
+        let native_source_creation = crate::native_video_source::Creation::prepare(
+            self.shared.native_video.lock().unwrap_or_else(|e| e.into_inner()).available(),
+            &mut a,
+        );
         a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
         let kind = self.shared.arena.external_handle_type.as_raw();
         let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
@@ -1044,6 +1090,10 @@ impl GpuHost for GpuServer {
         };
         crate::video_log::buffer_created(buffer as usize as u64, ci.usage.0, ci.size, r.0);
         note_driver_error("vkCreateBuffer", r.0);
+        #[cfg(target_os = "macos")]
+        if let Some(creation) = native_source_creation {
+            creation.complete(&mut self.shared.objects().native_video.sources, r.0);
+        }
         if let Some(id) = a.p_buffer {
             self.bind(id.0, HandleType::VkBuffer, buffer as usize as u64);
         }
