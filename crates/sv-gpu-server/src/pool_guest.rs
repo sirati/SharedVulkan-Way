@@ -37,6 +37,7 @@
 
 use crate::pool::{Importer, PoolBinding, PoolServer};
 use crate::idle_owner::IdleOwner;
+use crate::retained_graph::RetainedGraph;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -542,24 +543,26 @@ fn run_prepared(
     // server holds for the life of the process, and the lease is this
     // session's until `close_session`, which runs after `control_region` and
     // everything made from it are gone.
-    let control_region = Arc::new(unsafe { SharedRegion::from_raw(boot.base_ptr().add(offset as usize), control.len as usize) });
+    let control_region = RetainedGraph::new(Arc::new(unsafe { SharedRegion::from_raw(boot.base_ptr().add(offset as usize), control.len as usize) }));
+    let binding_owner = RetainedGraph::new(binding.clone());
 
     let t = Instant::now();
     let setup = (|| -> Result<_, String> {
-        let driver = Driver::open(cfg.device).map_err(|e| format!("Driver::open: {e}"))?;
+        let driver = RetainedGraph::new(Arc::new(Driver::open(cfg.device).map_err(|e| format!("Driver::open: {e}"))?));
         let mut gpu_arena = arena::map_lazy(Arc::clone(&boot));
         gpu_arena.memory_type = crate::pool::host_pointer_memory_type(&driver, &boot, poolhdr::HEADER_LEN)?;
-        let control = Control::create(Arc::clone(&control_region), geometry, crate::protocol_ids(), 1)
-            .map_err(|e| format!("Control::create: {e}"))?;
+        let control = RetainedGraph::new(Arc::new(Control::create(Arc::clone(&control_region), geometry, crate::protocol_ids(), 1)
+            .map_err(|e| format!("Control::create: {e}"))?));
         control.stamp_epoch().map_err(|e| format!("stamp_epoch: {e}"))?;
         Ok((driver, gpu_arena, control))
     })();
     let (driver, gpu_arena, control) = match setup {
         Ok(v) => v,
         Err(e) => {
+            server.quarantine(binding.session);
             published(Err(e.clone()));
-            drop(control_region);
-            server.close_session(binding.session);
+            // The retained setup anchors keep every initialized native field,
+            // original control mapping and pool account even during unwinding.
             return Err(e);
         }
     };
@@ -570,16 +573,14 @@ fn run_prepared(
         gpu_arena.memory_type,
         t.elapsed()
     );
-    let control = Arc::new(control);
     set.add(&control);
-    published(Ok(()));
 
     let fns = driver.load_fns();
     crate::entry::report_missing_pub(&fns);
     let mut objects = Objects::new();
     objects.set_pooled(binding.clone());
     let shared = Arc::new(Shared {
-        driver: Arc::new(driver),
+        driver: Arc::clone(&driver),
         arena: gpu_arena,
         objects: Mutex::new(objects),
         fns: Arc::new(fns),
@@ -588,12 +589,18 @@ fn run_prepared(
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
+    // Keep a complete native graph independently of ordinary worker locals.
+    // These anchors leak on unwind/error, before Shared/Driver destructors can
+    // tear down an unconfirmed native device or its original backing.
+    let shared_owner = RetainedGraph::new(Arc::clone(&shared));
+    published(Ok(()));
     let served = sess::serve(Arc::clone(&control), Arc::clone(&shared), geometry.ring_slot_count, cfg.idle);
 
     // As §87's slot path: destroy what the application left if this side
     // knows how; otherwise keep the device and its leases for ever.
     let leftovers = shared.objects.lock().map(|o| o.leftovers()).unwrap_or_default();
-    let mut clean = Arc::strong_count(&shared) == 1;
+    // One local reference plus the scoped retained-graph anchor.
+    let mut clean = Arc::strong_count(&shared) == 2;
     // A session this side ended with an error may still have its application:
     // its ICD still maps the control region. Giving the region to the next
     // session would re-create a live session's rings under it (§97.10), so it
@@ -624,28 +631,33 @@ fn run_prepared(
         clean = false;
     }
     if clean {
-        drop(control);
+        // GPU completion was checked above. Transfer the Shared anchor while
+        // all original control/driver/pool anchors remain retained.
+        drop(shared_owner.transfer());
         match Arc::try_unwrap(shared) {
             Ok(s) => {
+                let s = RetainedGraph::new(s);
                 let leases = s.objects.lock().map(|mut o| o.take_leases()).unwrap_or_default();
                 let n = unsafe {
                     crate::pool::end_session(&binding, &s.driver.device, leases)
                 };
-                drop(s);
-                eprintln!("[gpu] session {session}: {n} lease(s) and the control region given back");
+                drop(s.transfer());
+                drop(control.transfer());
+                drop(driver.transfer());
+                drop(control_region.transfer());
+                drop(binding_owner.transfer());
+                eprintln!("[gpu] session {session}: {n} lease(s) and the control region given back after checked GPU completion");
             }
             Err(s) => {
+                let _retained = RetainedGraph::new(s);
                 server.quarantine(binding.session);
-                std::mem::forget(s);
                 return Err("the session's state is still shared; its leases are kept".into());
             }
         }
     } else {
         server.quarantine(binding.session);
-        std::mem::forget(shared);
-        std::mem::forget(control);
+        // Every retained anchor deliberately survives normal error return too.
     }
-    drop(control_region);
     served
 }
 
