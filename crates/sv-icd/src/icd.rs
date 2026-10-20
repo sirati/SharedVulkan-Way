@@ -2137,24 +2137,49 @@ impl Icd for SharedVulkan {
         if reply.result.0 != 0 {
             return Ok(reply);
         }
-        if let Some((offset, pitch)) = img.explicit {
-            let mut sub = p::VkImageSubresource::default();
-            sub.aspect_mask = p::VkImageAspectFlags(crate::dmabuf::ASPECT_COLOR);
-            let got = forward::get_image_subresource_layout(
+        let mut img = img;
+        if img.explicit.is_some() {
+            // Each plane where the GPU side's LINEAR image has it, up to one
+            // shift of the whole image, which the bind then adds (§112: an
+            // NV12 frame's chroma plane imported on its own).
+            let n = usize::from(img.nplanes.max(1));
+            let mut have = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut sub = p::VkImageSubresource::default();
+                sub.aspect_mask = p::VkImageAspectFlags(if n > 1 {
+                    crate::dmabuf::ASPECT_PLANE_0 << i
+                } else {
+                    crate::dmabuf::ASPECT_COLOR
+                });
+                let got = forward::get_image_subresource_layout(
+                    t,
+                    p::VkGetImageSubresourceLayoutArgs {
+                        device,
+                        image: p::VkImage(id),
+                        p_subresource: Some(Box::new(sub)),
+                        p_layout: Some(Box::default()),
+                    },
+                )?;
+                have.push(got.p_layout.map(|l| (l.offset, l.row_pitch)).unwrap_or_default());
+            }
+            let base = img.planes[0].0.checked_sub(have[0].0);
+            let align = forward::get_image_memory_requirements(
                 t,
-                p::VkGetImageSubresourceLayoutArgs {
-                    device,
-                    image: p::VkImage(id),
-                    p_subresource: Some(Box::new(sub)),
-                    p_layout: Some(Box::default()),
-                },
-            )?;
-            let have = got.p_layout.map(|l| (l.offset, l.row_pitch)).unwrap_or_default();
-            if have != (offset, pitch) {
+                p::VkGetImageMemoryRequirementsArgs { device, image: p::VkImage(id), p_memory_requirements: None },
+            )?
+            .p_memory_requirements
+            .map_or(1, |r| r.alignment.max(1));
+            let fits = base.is_some_and(|b| {
+                b % align == 0 && (0..n).all(|i| img.planes[i].1 == have[i].1 && img.planes[i].0 == b + have[i].0)
+            });
+            if fits {
+                img.bind_offset = base.unwrap_or(0);
+            } else {
+                let (offset, pitch) = img.planes[0];
                 sv_icd_entry::report_always(&format_args!(
-                    "vkCreateImage: a dma-buf import asks for offset {offset} and row pitch {pitch}, the \
-                     GPU side lays the LINEAR image out at offset {} pitch {}; refused",
-                    have.0, have.1
+                    "vkCreateImage: a dma-buf import asks for planes {:?} (plane 0 at offset {offset}, row pitch \
+                     {pitch}), the GPU side lays the LINEAR image out as {have:?} with alignment {align}; refused",
+                    &img.planes[..n]
                 ));
                 forward::destroy_image(t, p::VkDestroyImageArgs { device, image: p::VkImage(id) })?;
                 return Ok(p::VkCreateImageReply {
@@ -2173,6 +2198,31 @@ impl Icd for SharedVulkan {
         };
         self.state().dmabuf_images.remove(&args.image.0);
         forward::destroy_image(t, args)
+    }
+
+    /// An import whose planes start inside the dma-buf is bound that far in
+    /// (§112).
+    fn bind_image_memory(&self, mut args: p::VkBindImageMemoryArgs) -> IcdResult<p::VkBindImageMemoryReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkBindImageMemory"));
+        };
+        if crate::dmabuf::enabled() {
+            args.memory_offset += self.state().dmabuf_images.get(&args.image.0).map_or(0, |i| i.bind_offset);
+        }
+        forward::bind_image_memory(t, args)
+    }
+
+    fn bind_image_memory2(&self, mut args: p::VkBindImageMemory2Args) -> IcdResult<p::VkBindImageMemory2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkBindImageMemory2"));
+        };
+        if crate::dmabuf::enabled() {
+            let s = self.state();
+            for b in args.p_bind_infos.iter_mut() {
+                b.memory_offset += s.dmabuf_images.get(&b.image.0).map_or(0, |i| i.bind_offset);
+            }
+        }
+        forward::bind_image_memory2(t, args)
     }
 
     /// As `create_image`, for an image that does not exist yet.
@@ -2459,10 +2509,22 @@ impl SharedVulkan {
     /// driver behind the GPU side, which never saw a modifier (§104).
     /// (The aspect is valid only for a modifier image, so the image is not
     /// looked up: whichever image names it was made through this path.)
-    fn plane_to_colour(&self, _image: u64, aspect: &mut p::VkImageAspectFlags) {
-        if aspect.0 == crate::dmabuf::ASPECT_MEMORY_PLANE_0 {
-            aspect.0 = crate::dmabuf::ASPECT_COLOR;
-        }
+    fn plane_to_colour(&self, image: u64, aspect: &mut p::VkImageAspectFlags) {
+        let m0 = crate::dmabuf::ASPECT_MEMORY_PLANE_0;
+        let plane = match aspect.0 {
+            a if a == m0 => 0,
+            a if a == m0 << 1 => 1,
+            a if a == m0 << 2 => 2,
+            _ => return,
+        };
+        // A LINEAR image's memory plane i is its format plane i (§112); a
+        // one-plane format has only the colour aspect.
+        let format = self.state().dmabuf_images.get(&image).map_or(0, |i| i.format);
+        aspect.0 = if crate::dmabuf::plane_count(format) > 1 {
+            crate::dmabuf::ASPECT_PLANE_0 << plane
+        } else {
+            crate::dmabuf::ASPECT_COLOR
+        };
     }
 
     /// `vkAllocateMemory` on the dma-buf path (§104): an import of a token, or

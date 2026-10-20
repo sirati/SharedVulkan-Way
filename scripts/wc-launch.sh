@@ -179,7 +179,13 @@ DEBUG_SSH="${WC_LAUNCH_DEBUG_SSH_TRANSPORT:-0}"
 # allocated dynamically.
 GPU_ARENA_MIB="${WC_LAUNCH_GPU_ARENA_MIB:-64}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
-KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
+# The Mesa the GPU sessions load (a store path on the host): Zink, its EGL
+# and GBM, and since §112 its VA-API driver (nix/mesa-zink-va.nix).
+# WC_LAUNCH_KOPPER_MESA is the older name of the same setting.
+KOPPER_MESA="${WC_LAUNCH_GPU_MESA:-${WC_LAUNCH_KOPPER_MESA:-}}"
+# §112: the guest GPU's PCI ids, VVVV:DDDD, which `sv-drm ns` gives the
+# render node ($HOSTDIR/gpu-pci).
+GPU_PCI="${WC_LAUNCH_GPU_PCI:-}"
 # §104. WC_LAUNCH_DMABUF_NODE=/dev/dri/renderD128: the proxy offers
 # zwp_linux_dmabuf_v1 on that node ($HOSTDIR/dmabuf-node, read by wc-session)
 # — the nested KWin's userspace render node. WC_LAUNCH_ICD_STORE=1: the ICD
@@ -829,6 +835,12 @@ APPS
     "") h "rm -f $HOSTDIR/dmabuf-node" >/dev/null ;;
     *) echo "error: WC_LAUNCH_DMABUF_NODE is a /dev/dri/renderD<N> path"; exit 1 ;;
   esac
+  case "$GPU_PCI" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+      h "printf '%s' $GPU_PCI > $HOSTDIR/gpu-pci" >/dev/null ;;
+    "") h "rm -f $HOSTDIR/gpu-pci" >/dev/null ;;
+    *) echo "error: WC_LAUNCH_GPU_PCI is VVVV:DDDD"; exit 1 ;;
+  esac
   case "${WC_LAUNCH_COPY_SCOPE:-}" in
     buffer) h "printf buffer > $HOSTDIR/copy-scope" >/dev/null ;;
     ""|damage) h "rm -f $HOSTDIR/copy-scope" >/dev/null ;;
@@ -844,8 +856,8 @@ APPS
     *) bad "$HOSTDIR/apps.ini does not check: $apps"; exit 1 ;;
   esac
   if [ "$GPU_SESSIONS" -gt 0 ]; then
-    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so $HOSTDIR/bin/libsv_wlshim.so" >/dev/null 2>&1
-    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$REL_LINUX/libsv_wlshim.so" "$HOST:$HOSTDIR/bin/" >/dev/null \
+    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so $HOSTDIR/bin/libsv_wlshim.so $HOSTDIR/bin/sv-drm" >/dev/null 2>&1
+    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$REL_LINUX/libsv_wlshim.so" "$REL_LINUX/sv-drm" "$HOST:$HOSTDIR/bin/" >/dev/null \
       || { echo "error: scp of the GPU half to the VM host"; exit 1; }
     h "printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"%s\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' $HOSTDIR/bin/libsv_icd.so >$HOSTDIR/bin/sv_icd.json"
     deployed_is "$REL_LINUX/sv-hostd" "$HOSTDIR/bin/sv-hostd" h "re-run $0 deploy" || exit 1
@@ -864,12 +876,14 @@ APPS
 LIBGL_KOPPER_DRI2=1
 __EGL_VENDOR_LIBRARY_FILENAMES=${KOPPER_MESA:-<mesa-kopper-wayland>}/share/glvnd/egl_vendor.d/50_mesa.json
 LIBGL_DRIVERS_PATH=${KOPPER_MESA:-<mesa-kopper-wayland>}/lib/dri
+LIBVA_DRIVER_NAME=zink
+LIBVA_DRIVERS_PATH=${KOPPER_MESA:-<mesa-zink-va>}/lib/dri
 VK_DRIVER_FILES=$icd_json"
     if [ "$GPU_ENV_MODE" = write ] && [ -n "$KOPPER_MESA" ]; then
       printf '%b\n' "$genv" | h "cat >$HOSTDIR/gpu.env"
       echo "  wrote $HOSTDIR/gpu.env: sessions with GPU sides render on the guest's GPU"
     else
-      note "gpu.env NOT written (WC_LAUNCH_GPU_ENV=write and WC_LAUNCH_KOPPER_MESA enable it); it would be:"
+      note "gpu.env NOT written (WC_LAUNCH_GPU_ENV=write and WC_LAUNCH_GPU_MESA enable it); it would be:"
       printf '%b\n' "$genv" | sed 's/^/          /'
     fi
   fi

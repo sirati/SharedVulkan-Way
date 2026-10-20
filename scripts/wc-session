@@ -958,15 +958,36 @@ start_app() {
       GPUENV=()
     fi
   fi
-  # HARDWARE VIDEO DECODE (§86, docs/video-decode.md §7.7): only a Firefox with
-  # the readback patch can decode on a forwarded GPU, and its package says so
-  # with a marker beside the browser. With it and a GPU, the decode prefs go
-  # into user.js and the RDD sandbox is lifted (it brokers connect() to the
-  # display sockets only, so the decoder could not reach the GPU side).
-  DECODE=""
-  if [ -n "$GPU_ON" ] && [ -e "$(dirname "$EXE")/../lib/firefox/.wc-vulkan-readback" ]; then
-    DECODE=1
-    GPUENV+=("MOZ_DISABLE_RDD_SANDBOX=1")
+  # THE RENDER NODE (§112). With a GPU and this installation's dma-buf node
+  # (`$BASE/dmabuf-node`, the userspace render node `sv-drm serve` provides),
+  # the application runs inside `sv-drm ns`, where libdrm sees that node as
+  # the GPU's render node -- a PCI device of the guest GPU's ids from
+  # `$BASE/gpu-pci` -- and the ICD hands out its frames as dma-bufs naming
+  # sections (SV_DRM_NODE). The application is stock and keeps its defaults:
+  # Firefox finds a hardware EGL device and chooses hardware WebRender and
+  # VA-API decode itself, inside its own sandbox, which reaches the GPU
+  # through the node as with any driver. Without a node, nothing changes.
+  NSWRAP=()
+  # Not for the nested desktop (§102): `atp-nested` goes through sudo, which a
+  # user namespace would refuse, and its seat runs KWin in `sv-drm ns` itself.
+  case "$DEF_DESKTOP" in atp-nested*) NESTED=1 ;; *) NESTED="" ;; esac
+  if [ -n "$GPU_ON" ] && [ -z "$NESTED" ] && [ -n "${DMABUF_NODE:-}" ] && [ -c "$DMABUF_NODE" ]; then
+    SVDRM=""
+    for c in "$BASE/bin/sv-drm" "$(command -v sv-drm 2>/dev/null)"; do
+      [ -n "$c" ] && [ -x "$c" ] && { SVDRM=$c; break; }
+    done
+    if [ -n "$SVDRM" ]; then
+      NODE_DEV=$(stat -L -c '%t:%T' "$DMABUF_NODE" 2>/dev/null)
+      NODE_DEV="$((16#${NODE_DEV%%:*})):$((16#${NODE_DEV##*:}))"
+      NSWRAP=("$SVDRM" ns --dev "$NODE_DEV" --minor "${DMABUF_NODE##*renderD}")
+      PCI=$(head -c 16 "$BASE/gpu-pci" 2>/dev/null | tr -d '[:space:]')
+      [[ "$PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] && NSWRAP+=(--pci "$PCI")
+      NSWRAP+=(--)
+      GPUENV+=("SV_DRM_NODE=$DMABUF_NODE")
+      echo "wc-session: $ID renders through the render node $DMABUF_NODE ($NODE_DEV${PCI:+, pci $PCI})" >>"$D/app.log"
+    else
+      echo "wc-session: NO RENDER NODE for $ID -- $DMABUF_NODE is there and sv-drm is not ($BASE/bin/sv-drm); frames are copied" | tee -a "$D/app.log" >&2
+    fi
   fi
   # What `proxy` managed for this session's sound (§86). Read once, here.
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
@@ -992,12 +1013,11 @@ start_app() {
       # deployment ends Firefox, not of any one session.
       printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
         >> "$PROFILE/user.js"
-      if [ ${#GPUENV[@]} -gt 0 ]; then
+      # Only without the render node: a copying GPU path whose EGL device is
+      # the software one, which Firefox would otherwise refuse (§0.28). With
+      # the node Firefox decides for itself (§112).
+      if [ ${#GPUENV[@]} -gt 0 ] && [ ${#NSWRAP[@]} -eq 0 ]; then
         printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
-          >> "$PROFILE/user.js"
-      fi
-      if [ -n "$DECODE" ]; then
-        printf '\n// Added by wc-session: Vulkan video decode, read back to host memory, on the forwarded GPU.\nuser_pref("media.hardware-video-decoding-vulkan.enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.force-enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);\n' \
           >> "$PROFILE/user.js"
       fi
       # AUDIO (§86): no server means Firefox's own null context, never a
@@ -1155,7 +1175,7 @@ start_app() {
     "${GPUENV[@]}" \
     "${DEF_ENV[@]}" \
     "${TESTENV[@]}" \
-    "${CMDV[@]}" >>"$D/app.log" 2>&1 &
+    "${NSWRAP[@]}" "${CMDV[@]}" >>"$D/app.log" 2>&1 &
   echo "run ok $! audio=${AUDIO%%[: ]*} titlebar=$DEF_TITLEBAR"
 }
 

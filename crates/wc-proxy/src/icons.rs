@@ -907,7 +907,7 @@ mod tests {
     fn a_package_without_share_falls_back_to_the_icons_beside_its_binary() {
         let root = std::env::temp_dir().join(format!("wc-bundled-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let lib = root.join("store/firefox-readback/lib/firefox");
+        let lib = root.join("store/firefox/lib/firefox");
         let icons = lib.join("browser/chrome/icons/default");
         std::fs::create_dir_all(&icons).unwrap();
         std::fs::write(lib.join("firefox"), b"").unwrap();

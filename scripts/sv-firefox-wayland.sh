@@ -126,7 +126,6 @@ if [ "${SVWL_VULKAN_DECODE:-0}" = 1 ]; then
   cat >>"$RUN/profile/user.js" <<PREFS
 user_pref("media.hardware-video-decoding-vulkan.enabled", true);
 user_pref("media.hardware-video-decoding-vulkan.force-enabled", true);
-user_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);
 PREFS
 fi
 

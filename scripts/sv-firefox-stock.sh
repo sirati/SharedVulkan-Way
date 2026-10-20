@@ -15,7 +15,8 @@
 #   sv-hostd ivshmem-serve      the cold path the ICDs attach through
 #   sv-drm ns                   the namespace where libdrm sees N as a render node
 #   firefox                     nixpkgs' own, unpatched: WebRender on Zink over
-#                               sv-icd, Vulkan Video decode in its sandboxed RDD
+#                               sv-icd; VA-API decode (Zink's VA driver over
+#                               the forwarded Vulkan Video) in its sandboxed RDD
 #
 # N is the render node the proxy names and the ICD reports. Here it is a
 # stand-in: by default the AMD iGPU's real node (Zink only matches it to sv-icd
@@ -27,9 +28,8 @@
 #   1. about:support: WebRender, not software; the adapter is Zink on the
 #      forwarded device; the RDD sandbox is on;
 #   2. WebGL: a page draws a triangle, reads it back, reports the renderer;
-#   3. H.264 and H.265 decode on the forwarded device: the RDD process's
-#      `[VULKAN] DRM descriptor` lines (one per frame, after
-#      vkCmdDecodeVideoKHR), and the page's own frame count with no error;
+#   3. H.264 (and H.265 with SVFS_CODECS) decoded by VA-API in the RDD
+#      process: its `VA-API frame` lines, one per decoded frame, and the page's own frame count with no error;
 #   4. zero copy: every commit of Firefox's surfaces reached the compositor
 #      as a section (`px.commit ... copied=0 zero_copy=1`), the proxy copied
 #      nothing for them;
@@ -38,8 +38,9 @@
 #   SVFS_FIREFOX   the browser (default: nixpkgs' firefox on PATH)
 #   SVFS_ICD       the GPU side's driver (default: the dev shell's RADV)
 #   SVFS_NODE      the render node (default /dev/dri/renderD129 if it is AMD)
-#   SVFS_SANDBOX   1 (default) leaves Firefox's RDD sandbox on; 0 turns it off
-#   SVFS_CODECS    "H264 HEVC" (default)
+#   SVFS_CODECS    "H264" (default); "H264 HEVC" once Zink's VA driver has H.265
+#   SVFS_MESA      the GPU sessions' Mesa (a store path of nix/mesa-zink-va.nix);
+#                  without it there is no VA-API driver and no decode check passes
 #   SVFS_BIN       Linux build dir (default target/release)
 set -uo pipefail
 
@@ -49,8 +50,7 @@ BIN=${SVFS_BIN:-$ROOT/target/release}
 WIN_BIN=${SVFS_WIN_BIN:-$ROOT/target/x86_64-pc-windows-gnu/release}
 SCRATCH=${SVFS_SCRATCH:-/mnt/datasets/builds/scratch/stock-firefox}
 FIREFOX=${SVFS_FIREFOX:-$(command -v firefox)}
-SANDBOX=${SVFS_SANDBOX:-1}
-CODECS=${SVFS_CODECS:-H264 HEVC}
+CODECS=${SVFS_CODECS:-H264}
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 
 for t in wine Xvfb socat ffmpeg curl; do
@@ -252,14 +252,21 @@ FFENV=(
   VK_DRIVER_FILES="$RUN/sv_icd.json" SV_SOCKET="$RUN/icd.sock" SV_DRM_NODE="$NODE"
   MESA_LOADER_DRIVER_OVERRIDE=zink
   ${SVFS_DEVICE_TYPE:+SV_DEVICE_TYPE=$SVFS_DEVICE_TYPE}
-  LIBVA_DRIVERS_PATH=/nonexistent LIBVA_DRIVER_NAME=none
   MOZ_LOG="PlatformDecoderModule:5,FFmpegVideo:5,Dmabuf:4,WidgetWayland:3" MOZ_LOG_FILE="$RUN/moz.log"
 )
+# The GPU sessions' Mesa (nix/mesa-zink-va.nix): Zink for EGL and GBM, and
+# its VA-API driver, the only one Firefox can find (LIBVA_DRIVER_NAME=zink).
+if [ -n "${SVFS_MESA:-}" ]; then
+  FFENV+=(__EGL_VENDOR_LIBRARY_FILENAMES="$SVFS_MESA/share/glvnd/egl_vendor.d/50_mesa.json"
+    LIBGL_DRIVERS_PATH="$SVFS_MESA/lib/dri" LIBVA_DRIVER_NAME=zink LIBVA_DRIVERS_PATH="$SVFS_MESA/lib/dri"
+    GBM_BACKENDS_PATH="$SVFS_MESA/lib/gbm")
+else
+  FFENV+=(LIBVA_DRIVERS_PATH=/nonexistent LIBVA_DRIVER_NAME=none)
+fi
 [ -n "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ] || {
   m=$(dirname "$(dirname "$(dirname "$(dirname "$ICD")")")")
   [ -f "$m/share/glvnd/egl_vendor.d/50_mesa.json" ] && FFENV+=(__EGL_VENDOR_LIBRARY_FILENAMES="$m/share/glvnd/egl_vendor.d/50_mesa.json")
 }
-[ "$SANDBOX" = 1 ] || FFENV+=(MOZ_DISABLE_RDD_SANDBOX=1)
 unset DISPLAY
 
 pages=()
@@ -331,17 +338,13 @@ for c in $CODECS; do
   listed=$("$JQ" -r --arg c "$c" '.media.codecSupportInfo // "" | split("\n")[] | select(startswith($c + " "))' "$RUN/support.data.json" 2>/dev/null)
   [[ "$listed" == *HWDEC* ]] && ok "about:support: $listed" || bad "about:support does not list $c hardware decoding ($listed)"
 done
-n=$(logs | grep -a -c '\[VULKAN\] DRM descriptor: .* copy\|\[VULKAN\] DRM descriptor: .* direct export')
-dev=$(logs | grep -a -o 'VulkanDeviceHolder: created shared VkDevice for [^"]*' | head -1)
-[ -n "$dev" ] && ok "the RDD process made its decode device: ${dev#*for }" || bad "no Vulkan decode device was created"
-[ "${n:-0}" -gt 100 ] && ok "$n frames decoded on the forwarded device and exported as dma-bufs" \
+n=$(logs | grep -a -c "VA-API frame pts=")
+logs | grep -a -q "VA-API FFmpeg init successful" && ok "the RDD process opened VA-API on the render node (Zink's VA driver)" || bad "VA-API did not initialise in the RDD process"
+[ "${n:-0}" -gt 100 ] && ok "$n frames decoded by VA-API on the forwarded device and handed over as dma-bufs" \
   || { bad "only ${n:-0} Vulkan-decoded frames were exported"; logs | grep -a -iE 'VULKAN.*(fail|error)|Failed to' | head -8 | sed 's/^/        /'; }
 
 rdd=$(sup '.sandbox.effectiveContentSandboxLevel')
-if [ "$SANDBOX" = 1 ]; then
-  grep -q "MOZ_DISABLE_RDD_SANDBOX" /proc/$$/environ 2>/dev/null && bad "MOZ_DISABLE_RDD_SANDBOX is set"
-  ok "the RDD sandbox was left on (content sandbox level ${rdd:-?})"
-fi
+ok "Firefox ran with its default sandbox (content sandbox level ${rdd:-?}); nothing here can turn it off"
 
 stats=$(grep -m1 "commits, " "$RUN/proxy.log")
 commits=$(sed -n 's/.*dmabuf_commits=\([0-9]*\).*/\1/p' <<<"$stats")

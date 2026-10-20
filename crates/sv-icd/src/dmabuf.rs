@@ -42,6 +42,29 @@ pub const QUEUE_FAMILY_FOREIGN: u32 = !2;
 pub const ASPECT_COLOR: u32 = 0x1;
 /// `VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT`.
 pub const ASPECT_MEMORY_PLANE_0: u32 = 0x80;
+/// `VK_IMAGE_ASPECT_PLANE_0_BIT`; planes 1 and 2 are the next two bits, as
+/// the memory planes are after `ASPECT_MEMORY_PLANE_0`.
+pub const ASPECT_PLANE_0: u32 = 0x10;
+
+/// How many planes a format has (§112): 2 for the `_2PLANE_` formats, 3 for
+/// the `_3PLANE_` ones, 1 for everything else. A LINEAR modifier image has as
+/// many memory planes as its format has planes.
+pub fn plane_count(format: i32) -> u32 {
+    match format {
+        // G8/G10X6/G12X4/G16 x {3P420, 2P420, 3P422, 2P422, 3P444}
+        1_000_156_002 | 1_000_156_004 | 1_000_156_006 => 3,
+        1_000_156_003 | 1_000_156_005 => 2,
+        1_000_156_012 | 1_000_156_014 | 1_000_156_016 => 3,
+        1_000_156_013 | 1_000_156_015 => 2,
+        1_000_156_022 | 1_000_156_024 | 1_000_156_026 => 3,
+        1_000_156_023 | 1_000_156_025 => 2,
+        1_000_156_029 | 1_000_156_031 | 1_000_156_033 => 3,
+        1_000_156_030 | 1_000_156_032 => 2,
+        // the four 2PLANE_444 formats
+        1_000_330_000..=1_000_330_003 => 2,
+        _ => 1,
+    }
+}
 /// `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT`.
 pub const STAGE_ALL_COMMANDS: u32 = 0x10000;
 
@@ -321,6 +344,16 @@ pub struct DmabufImage {
     /// `VkImageDrmFormatModifierExplicitCreateInfoEXT`'s plane 0: offset and
     /// row pitch the importer asked for.
     pub explicit: Option<(u64, u64)>,
+    /// Every plane's explicit `(offset, row pitch)`, plane 0 first; `explicit`
+    /// is the first of them (§112: NV12 imported whole, two planes).
+    pub planes: [(u64, u64); 3],
+    pub nplanes: u8,
+    /// Added to every bind of this image: an import whose plane 0 is not at
+    /// the start of the dma-buf (an NV12 frame's chroma plane imported on
+    /// its own as R8G8, §112), checked against the driver's layout.
+    pub bind_offset: u64,
+    /// The image's `VkFormat`, for its plane count.
+    pub format: i32,
     /// Made with `VkExternalMemoryImageCreateInfo{DMA_BUF}`: bound to a
     /// shared section on the GPU side.
     pub external: bool,
@@ -448,6 +481,7 @@ pub fn rewrite_families(src: &mut u32, dst: &mut u32) {
 /// when this path has nothing to do with the image.
 pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option<DmabufImage>, i32> {
     let mut img = DmabufImage::default();
+    img.format = ci.format.0;
     let mut ours = false;
     if ci.tiling.0 == TILING_DRM_FORMAT_MODIFIER {
         ours = true;
@@ -458,11 +492,15 @@ pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option
                     linear |= x.p_drm_format_modifiers.contains(&DRM_FORMAT_MOD_LINEAR);
                 }
                 p::PNextLink::VkImageDrmFormatModifierExplicitCreateInfoEXT(x) => {
-                    if x.drm_format_modifier != DRM_FORMAT_MOD_LINEAR || x.p_plane_layouts.len() != 1 {
+                    let n = x.p_plane_layouts.len();
+                    if x.drm_format_modifier != DRM_FORMAT_MOD_LINEAR || n == 0 || n > 3 || n as u32 != plane_count(ci.format.0) {
                         return Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT);
                     }
-                    let pl = &x.p_plane_layouts[0];
-                    img.explicit = Some((pl.offset, pl.row_pitch));
+                    for (i, pl) in x.p_plane_layouts.iter().enumerate() {
+                        img.planes[i] = (pl.offset, pl.row_pitch);
+                    }
+                    img.nplanes = n as u8;
+                    img.explicit = Some(img.planes[0]);
                     linear = true;
                 }
                 _ => {}
@@ -660,7 +698,7 @@ pub unsafe extern "system" fn get_physical_device_format_properties2(
                         if n == 1 {
                             *(*l).p_drm_format_modifier_properties = sv_icd_entry::VkDrmFormatModifierPropertiesEXT {
                                 drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
-                                drm_format_modifier_plane_count: 1,
+                                drm_format_modifier_plane_count: plane_count(format.0),
                                 drm_format_modifier_tiling_features: sv_icd_entry::VkFormatFeatureFlags(linear),
                             };
                         }
@@ -677,7 +715,7 @@ pub unsafe extern "system" fn get_physical_device_format_properties2(
                         if n == 1 {
                             *(*l).p_drm_format_modifier_properties = sv_icd_entry::VkDrmFormatModifierProperties2EXT {
                                 drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
-                                drm_format_modifier_plane_count: 1,
+                                drm_format_modifier_plane_count: plane_count(format.0),
                                 drm_format_modifier_tiling_features: sv_icd_entry::VkFormatFeatureFlags2(linear2),
                             };
                         }
