@@ -33229,7 +33229,10 @@ three times while Console scrolled panicked the guest kernel three times:
 `[data.kalloc.4096]: element modified after free`, the page full of
 `0xff1c1c1e`, Console's background colour. macOS frees a dead process's wired
 pages at once and reuses them; the proxy wrote pixels into them for the rest of
-its 5 s lease. This was 103.14's design and is fixed here:
+its 5 s lease. The keeper below was the initial fix. Its elapsed-time
+release and bounded shutdown were also unsafe: §111.9.3 replaces them with
+release-word-only retention and an unbounded safe shutdown wait. The bullets
+below describe the historical keeper, not the current broker policy.
 
 * While a keeper is installed (`wc_handle::arena::set_region_keeper`), every
   guest-RAM window the main process makes is a POSIX shared-memory object,
@@ -37053,37 +37056,115 @@ offset 1728 happened to be nonzero. So, additively:
   sends SIGKILL only to a pid the watcher still watches, and a port that is a
   tty is put in raw mode before it is moved.
 
-The release words are unchanged: the host's `mac-sessiond` writes
-`macboot::RELEASED` once the proxy's and GPU units have ended. The fallback
-is the keeper's, 600 s as an orphan (`--release-after`).
+The host's `mac-sessiond` writes `macboot::RELEASED` once the proxy's and
+GPU units have ended. The daemon uses `Release::Probe { after: None }`.
+Elapsed time cannot prove that the host stopped writing, so there is no
+timeout release and `--release-after` is rejected. The original 600-second
+fallback could free wired pages while the host still wrote into them.
 
-**Shutdown** (103.15): on SIGTERM the daemon keeps running the release rules
-for at most 10 s while it holds orphans, then exits; the plist gives it 15 s
-(`ExitTimeOut`) before launchd's SIGKILL. The main process still answers
-SIGTERM with `down`, so the host releases within about 1–2 s.
+**Shutdown**: SIGTERM first quiesces allocation under the broker's state
+lock, then keeps serving and probing until **all** live and orphan regions
+are released. It waits indefinitely if needed. The original ten-second
+orphan-only wait could exit with live or orphan host mappings and was unsafe.
+The plist now sets `ExitTimeOut` to zero, disabling launchd's automatic
+shutdown SIGKILL deadline. The installer refuses to replace a loaded broker
+or an existing broker socket before changing either end's installed files;
+it no longer issues `launchctl bootout`. To upgrade, first end sessions and
+verify their host release, SIGTERM the daemon, wait for its exit, and prevent
+new sessions before unloading its job. Never force bootout of an old broker
+that still holds regions. A crash, explicit SIGKILL, or VM termination still
+removes this process's holds; crash-safe retention needs an independent
+holder and adoption, and is not implemented.
 
 #### 111.9.4 Tests
 
 * `core::tests` (+2): a released boot region frees its whole pool and ends its
   tie, and nothing of another pool, another user's pool of the same name, or a
   live owner's; a pool that times out ends its ties once.
-* `tests/unix.rs` (+2), the keeper on a real socket, as Linux runs the same
+* `tests/unix.rs`, the keeper on a real socket, as Linux runs the same
   code but the watcher: a "main" process allocates the arena and the ring
   window and writes a boot page, a "GPU server" ties itself; the main process
   is killed with SIGKILL; the two regions stay held and readable for 2.5 s
   without the word; the test writes `RELEASED` into the boot page as the host
   does, and within a tick both regions are gone and the GPU process is
-  SIGKILLed. A second test: an arena page with the release value at the
-  offset releases nothing (it is not a boot page), and the pool goes at its
-  time limit with its tie.
-* `daemon::tests` (2): `serve`'s arguments and defaults; the plist keeps the
-  daemon alive and gives it longer than its own shutdown wait.
+  SIGKILLed. This test uses no timeout release, matching the daemon. A
+  separate generic core-policy test uses an explicit optional timeout; it
+  does not select the policy used for host-visible wired RAM.
+* `daemon::tests`: `serve` arguments reject timeout-release overrides; a
+  simulated month without a host release retains both orphan regions; the
+  release word frees the pool; the plist disables forced-kill deadlines.
+* `daemon_shutdown_retains_live_regions_and_orphans_until_explicit_release`:
+  a real daemon receives SIGTERM with a live region, remains alive beyond
+  the old ten-second limit, then retains the orphan, rejects allocation and
+  exits only after explicit adoption/free. Runs on Linux without a VM.
+* `scripts/mac-broker-term-test.sh`: VM stubs cover a root daemon staying
+  alive, actual exit plus a live replacement, probe/transport errors, an
+  unchanged pid, invalid pid output and a dead replacement. Shutdown
+  observation uses a monotonic 12-second deadline, comprising the expected
+  ten-second released-pool case and a two-second scheduling/SSH margin.
+  Every VM call is bounded by the remaining deadline; retained active
+  regions correctly make this timing gate fail rather than force an exit.
 * `wc-arena-host`: `who_asked_is_read_and_with_keys_verified` (the identity
   reported, verified with `--keys`, refused when another user's identity is
   written over it or the record is unsigned). `sessiond_ivshmem` verifies with
   `verifies_identity`, which is §107's check when there is no identity.
 
-VM_RESULTS
+**In the VM** (wayland-host, 4096 MiB, 2026-10-20 11:06–11:20,
+`scripts/mac-broker-test.sh` driven by a waiter; evidence in
+`/mnt/datasets/builds/evidence/session-fixes/broker-mac/`, `broker-*.txt`,
+`keeper-*.txt`, `broker-daemon.log`, `vmrun.log`):
+
+* **The daemon and the ports.** launchd ran it (`keepalive | runatload`).
+  The port nodes became `crw------- root wheel`, the socket
+  `srw-rw-rw-`, the keys directory `drwx------` and the key `-rw-------`, all
+  root's. The VM's user could not read the key. The daemon lent `wcbell` to
+  every main process and `svbell` to the GPU server (`device ... lent to
+  process N`), and logged each exit by kqueue (`process N (main) exited`).
+* **SIGKILL of the main process under load, 5 times** (Console open, foot on
+  this side scrolling `seq` into the session): every time the broker held
+  the session's two windows (64 MiB arena, 6 MiB rings) as orphans after the
+  exit, the host's session service took the session down and wrote the
+  release word, and the broker freed the pool on it (`the release word of
+  pool wcm-N is set; freeing the pool's orphans`). Kernel panic reports
+  before 0, after 0; the guest stayed up.
+* **The GPU server** was tied to its session (`ends with pool`), its exit
+  seen, and its session's pool freed by the release word; 300 frames
+  presented (PASS).
+* **SIGTERM to the daemon** while it held 2 orphans: the daemon logged its
+  shutdown wait, but exit and restart were not proved. The harness queried
+  the root daemon with an unprivileged `kill -0`, which treats permission
+  denial as process exit. It then reported the same pid before and after
+  the signal. The 0.70 s measurement is invalid. The harness now requires a successful root probe and positive PID absence,
+  enforces an elapsed observation deadline, and validates a different live
+  replacement pid; a VM rerun is pending.
+* **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
+  after): its `open` of user 1's regions, `find` of user 1's pool and
+  `device wcbell` (held by user 1's main process) were refused by uid; it
+  could not read the key; its own `alloc` worked; `sign` named it
+  (`os=macos user=wctest2 id=503`). The host logged user 1's sessions as
+  `asked by os=macos user=<user> id=501 (verified, installation wcm)`.
+  `svbell`, free at that moment, was lent to user 2: a free device goes to
+  any user, one at a time, by design.
+
+**Not shown by this run, and why:**
+
+* **Wayland round trip and present time, before and after.** The VM was
+  slow throughout. The host's memory group for the macOS VMs was near its
+  limit while another instance ran, and every number was far from §103.15's
+  in both builds: the GPU present was 8.50 ms/frame with the keeper and
+  23.35 ms/frame with the broker (§103.15: 0.56), and the broker's
+  2000 round trips gave p50 3.52 ms, p99 179 ms (§103.15: 0.248, 0.322). The
+  keeper's round-trip leg produced no number: its main process had already
+  ended when the client connected. Nothing on the data path changed (the
+  doorbell is the same port, now an inherited fd; the windows are the same
+  wired pages), but "the same within noise" is **not measured**; it needs a
+  rerun on a quiet host.
+* **The second user's own session.** Its main process, started with
+  `sudo -u` from ssh, wrote no log, so a second session side by side was not
+  run.
+* The harness's check that a user cannot open a port node itself used
+  `head -c0`, which macOS rejects; the node modes above are the evidence.
+  Fixed for the next run.
 
 #### 111.9.5 Limits
 
@@ -37091,7 +37172,10 @@ VM_RESULTS
   A second macOS user's session gets no doorbell: it polls its rings, and the
   host finds its record only by a periodic sweep (`--sweep-secs`). A port per
   user (`org.sirati.wcbell.N`, a chardev each on the hub) is the fix.
-* **A broker that dies loses its holds.** launchd restarts it, but the new
+* **A broker that dies loses its holds.** Normal SIGTERM retains every
+  live and orphan region until release, and launchd has no automatic
+  SIGKILL deadline, but a crash or explicit forced kill is still unsafe.
+  launchd restarts it, but the new
   process holds none of the old one's regions: a main process that dies after
   that, before its session's release, is the §103.15 case again. The broker
   has no state to lose otherwise. A main process could hand its fds back to a

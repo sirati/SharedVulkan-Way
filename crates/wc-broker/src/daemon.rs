@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--service NAME=PATH]... [--no-default-devices]
-//!                 [--release-after SECS] [--budget-mib N]
+//!                 [--budget-mib N]
 //! wc-broker ctl [--hold] REQUEST...
 //! wc-broker plist BIN                 (the LaunchDaemon's plist, for the installer)
 //! ```
@@ -20,9 +20,9 @@
 //!   whose nodes it makes root's and 0600, so only it can open them;
 //! * the keeper (§103.15): every region it makes is wired by it, and a
 //!   session's orphans go when the host writes the release word in the
-//!   session's boot page, or after `--release-after` (600 s);
-//! * SIGTERM (a shutdown): it waits at most [`TERM_LIMIT`] for the hosts to
-//!   release what it holds, then exits.
+//!   session's boot page, with no elapsed-time release;
+//! * SIGTERM (a shutdown): new allocations stop; it retains all live and
+//!   orphan regions until released, then exits. No shutdown deadline.
 //!
 //! `ctl` sends each REQUEST as one line and prints each reply, with the
 //! number of descriptors that came with it. With `--hold` it then keeps the
@@ -35,12 +35,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// How long a shutdown waits for the hosts' releases (§103.15: the keeper
-/// waited at most 10 s after SIGTERM; launchd's own limit is 20 s).
-pub const TERM_LIMIT: Duration = Duration::from_secs(10);
-
-/// The keeper's fallback: an orphan the host never released goes after this.
-pub const RELEASE_AFTER: Duration = Duration::from_secs(600);
+/// Host-visible wired regions have no elapsed-time release. Only the host's
+/// release word proves it has stopped writing into their guest RAM.
+fn region_release() -> Release {
+    Release::Probe { after: None }
+}
 
 #[cfg(target_os = "macos")]
 pub const DEFAULT_KEYS: &str = "/Library/Application Support/waycompose/keys";
@@ -62,7 +61,6 @@ pub struct ServeArgs {
     pub devices: Vec<(String, PathBuf)>,
     /// `--service NAME=PATH`: a socket `connect NAME` reaches (any user).
     pub services: Vec<(String, PathBuf)>,
-    pub release_after: Duration,
     pub budget: Option<u64>,
 }
 
@@ -72,7 +70,6 @@ pub fn parse_serve(argv: &[String]) -> Result<ServeArgs, String> {
         keys: DEFAULT_KEYS.into(),
         devices: DEFAULT_DEVICES.iter().map(|(n, p)| (n.to_string(), PathBuf::from(p))).collect(),
         services: Vec::new(),
-        release_after: RELEASE_AFTER,
         budget: None,
     };
     let mut it = argv.iter();
@@ -98,9 +95,6 @@ pub fn parse_serve(argv: &[String]) -> Result<ServeArgs, String> {
                     return Err(format!("--service {s}: {n:?} is not a service name"));
                 }
                 a.services.push((n.to_string(), p.into()));
-            }
-            "--release-after" => {
-                a.release_after = Duration::from_secs(v()?.parse().map_err(|e| format!("--release-after: {e}"))?)
             }
             "--budget-mib" => a.budget = Some(v()?.parse::<u64>().map_err(|e| format!("--budget-mib: {e}"))? << 20),
             _ => return Err(format!("unknown argument {k}")),
@@ -166,17 +160,16 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
         devices,
         services: a.services.iter().map(|(n, _)| DeviceSpec { name: n.clone(), allow: Allow::AnyUser }).collect(),
         keys: Some(a.keys.clone()),
-        release: Release::Probe { after: Some(a.release_after) },
+        release: region_release(),
         budget: a.budget,
         run,
     };
     let broker = Broker::new(unix, config);
     log(&format!(
-        "socket {} (0666, decided per uid), keys {}, devices {}, an orphan's limit {:?}",
+        "socket {} (0666, decided per uid), keys {}, devices {}, regions held until host release",
         a.socket,
         a.keys.display(),
-        a.devices.iter().map(|(n, p)| format!("{n}={}", p.display())).collect::<Vec<_>>().join(" "),
-        a.release_after
+        a.devices.iter().map(|(n, p)| format!("{n}={}", p.display())).collect::<Vec<_>>().join(" ")
     ));
     // SAFETY: the handler only stores an atomic. SIGHUP is ignored: nothing
     // of a login session's end may take the keeper's regions with it.
@@ -191,8 +184,7 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
         .name("wc-broker-serve".into())
         .spawn(move || {
             if let Err(e) = b2.serve() {
-                log(&format!("serving ended: {e}"));
-                std::process::exit(1);
+                log(&format!("serving ended: {e}; retaining regions until host release"));
             }
         })
         .map_err(|e| e.to_string())?;
@@ -208,10 +200,16 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
             }
         }
     }
-    let held = broker.stats().orphans;
-    log(&format!("SIGTERM: {held} orphan region(s) held; waiting at most {TERM_LIMIT:?} for their release"));
-    let left = broker.drain_orphans(TERM_LIMIT);
-    log(&if left == 0 { "every orphan released; exiting".to_string() } else { format!("{left} orphan(s) NOT released in {TERM_LIMIT:?}; exiting anyway") });
+    broker.quiesce();
+    log("SIGTERM: new regions refused; retaining all live and orphan regions until host release");
+    loop {
+        broker.tick();
+        if broker.stats().regions == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    log("every region released; exiting");
     let _ = std::fs::remove_file(&a.socket);
     Ok(())
 }
@@ -250,8 +248,8 @@ pub const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/org.waycompose.broker.pl
 
 /// The LaunchDaemon's plist for the program at `bin`: root (a daemon's
 /// default), started at boot, restarted by launchd whenever it ends
-/// (`KeepAlive`), and given 15 s after SIGTERM, more than the
-/// [`TERM_LIMIT`] it waits for the hosts' releases.
+/// (`KeepAlive`). ExitTimeOut zero disables launchd's automatic SIGKILL
+/// deadline: active host mappings can require an unbounded release wait.
 pub fn launchd_plist(bin: &str) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     format!(
@@ -264,7 +262,7 @@ pub fn launchd_plist(bin: &str) -> String {
   <array><string>{}</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ExitTimeOut</key><integer>15</integer>
+  <key>ExitTimeOut</key><integer>0</integer>
   <key>StandardErrorPath</key><string>/Library/Logs/waycompose/broker.log</string>
   <key>StandardOutPath</key><string>/Library/Logs/waycompose/broker.log</string>
 </dict>
@@ -286,8 +284,8 @@ pub fn main(args: Vec<String>) -> std::process::ExitCode {
         },
         Some("serve") => parse_serve(&args[1..]).and_then(serve),
         None => parse_serve(&[]).and_then(serve),
-        Some(_) => Err("usage: wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--no-default-devices] \
-                        [--release-after SECS] [--budget-mib N] | wc-broker ctl [--hold] REQUEST... | wc-broker plist BIN"
+        Some(_) => Err("usage: wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--service NAME=PATH]... [--no-default-devices] \
+                        [--budget-mib N] | wc-broker ctl [--hold] REQUEST... | wc-broker plist BIN"
             .into()),
     };
     match r {
@@ -310,29 +308,48 @@ mod tests {
     #[test]
     fn serve_takes_its_defaults_and_overrides() {
         let a = parse_serve(&[]).unwrap();
-        assert_eq!(a.release_after, RELEASE_AFTER);
+        assert!(matches!(region_release(), Release::Probe { after: None }));
         assert_eq!(a.keys, PathBuf::from(DEFAULT_KEYS));
         assert_eq!(a.devices.len(), DEFAULT_DEVICES.len());
         let a = parse_serve(&s(&[
             "--socket", "/tmp/b.sock", "--no-default-devices", "--device", "wcbell=/dev/x", "--device", "wcbell=/dev/y",
-            "--release-after", "5", "--budget-mib", "64",
+            "--budget-mib", "64",
         ]))
         .unwrap();
         assert_eq!(a.socket, "/tmp/b.sock");
         assert_eq!(a.devices, vec![("wcbell".to_string(), PathBuf::from("/dev/y"))]);
-        assert_eq!((a.release_after, a.budget), (Duration::from_secs(5), Some(64 << 20)));
-        for bad in [&["--device", "nopath"][..], &["--device", "a b=/x"], &["--release-after", "x"], &["--fly"]] {
+        assert_eq!(a.budget, Some(64 << 20));
+        for bad in [&["--device", "nopath"][..], &["--device", "a b=/x"], &["--release-after", "x"], &["--release-after", "600"], &["--fly"]] {
             assert!(parse_serve(&s(bad)).is_err(), "{bad:?}");
         }
     }
 
     #[test]
-    fn the_launch_daemon_is_kept_alive_and_outlasts_its_own_shutdown_wait() {
+    fn host_visible_orphans_survive_elapsed_time_until_release() {
+        use crate::core::{Core, Peer, User};
+        use std::time::Instant;
+        let mut core = Core::new(vec![]);
+        let now = Instant::now();
+        core.connect(1, Peer { user: User::uid(501), pid: 123, admin: false });
+        let ring = core.alloc(1, "session", 8192, region_release()).unwrap();
+        let arena = core.alloc(1, "session", 65536, region_release()).unwrap();
+        core.conn_closed(1, now);
+        // Simulate a host suspended for a month. Time cannot prove release.
+        core.tick(now + Duration::from_secs(30 * 24 * 3600));
+        assert_eq!(core.stats().regions, 2);
+        assert_eq!(core.stats().orphans, 2);
+        assert!(core.region(arena.id).is_some());
+        core.pool_released(ring.id);
+        assert_eq!(core.stats().regions, 0);
+    }
+
+    #[test]
+    fn the_launch_daemon_does_not_force_kill_retained_regions() {
         let p = launchd_plist("/Library/Application Support/waycompose/bin/wc-broker");
         assert!(p.contains("<key>KeepAlive</key><true/>"));
         assert!(p.contains("<string>/Library/Application Support/waycompose/bin/wc-broker</string><string>serve</string>"));
         let t: u64 = p.split("<key>ExitTimeOut</key><integer>").nth(1).unwrap().split('<').next().unwrap().parse().unwrap();
-        assert!(Duration::from_secs(t) > TERM_LIMIT);
+        assert_eq!(t, 0, "launchd must not SIGKILL a broker retaining host-visible RAM");
         assert!(launchd_plist("/a<b").contains("/a&lt;b"));
     }
 }

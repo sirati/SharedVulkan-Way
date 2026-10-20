@@ -1726,6 +1726,14 @@ resources.
   next provider of the pool frees them after the host has let go (the keeper
   rule of R43 and §103.15, now one implementation); its leases end, and a
   retiring region whose last lease ended is drained.
+* **macOS guest-RAM lifetime.** The LaunchDaemon wires every session region
+  and holds orphans until the host's boot-page release word. There is no
+  elapsed-time release. Normal SIGTERM refuses new allocations and waits for
+  all live and orphan regions, with no automatic launchd SIGKILL deadline.
+  The installer refuses a loaded broker instead of booting it out. These
+  rules prevent normal shutdown or upgrade from freeing pages the host may
+  still write. Process crash or explicit SIGKILL still loses the holds; a
+  persistent independent holder with adoption is required for crash safety.
 * **Who asked for a session.** The boot record carries the identity the
   broker read from the caller, under the installation's MAC, and the key is
   readable only by the broker (§111.6). The compositor holds the BAR
