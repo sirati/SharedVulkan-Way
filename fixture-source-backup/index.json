@@ -358,5 +358,25 @@
     "source": "/mnt/datasets/builds/scratch/linux-bar-rdd/webdriver-session-cpu-tests.py",
     "copy": "e6df2a7961ba7e51-webdriver-session-cpu-tests.py",
     "sha256": "e6df2a7961ba7e51691573ab54feaf1796999645c5cab29630b99295bcd249b6"
+  },
+  {
+    "source": "/mnt/datasets/builds/scratch/hyperlinux/run-ro-diagnostic.sh",
+    "copy": "ae19318f3c2c782e-run-ro-diagnostic.sh",
+    "sha256": "ae19318f3c2c782e306b42747d435969e7932a8d47c32f4b9e66aa5f73b12007"
+  },
+  {
+    "source": "/mnt/datasets/builds/scratch/hyperlinux/run-ro-trace.sh",
+    "copy": "43f18c23fbdff5b8-run-ro-trace.sh",
+    "sha256": "43f18c23fbdff5b86dae4f22f28b5aef6be42fa8cd45cdb7ff1457af45c4ea35"
+  },
+  {
+    "source": "/mnt/datasets/builds/scratch/hyperlinux/run-readonly-hvf.sh",
+    "copy": "374fe5887fe48b99-run-readonly-hvf.sh",
+    "sha256": "374fe5887fe48b99804a8e69bc9d4d228730ab769103fdcf19c34ce14220d5d7"
+  },
+  {
+    "source": "/mnt/datasets/builds/scratch/hyperlinux/run-readonly-hvf-rx.sh",
+    "copy": "ebadf00fa4c75822-run-readonly-hvf-rx.sh",
+    "sha256": "ebadf00fa4c758227a7669d920f9b9052a63a2f149d1aed28dc81d1e9f5a3086"
   }
 ]

@@ -1,0 +1,9 @@
+--- a/verify.sh
++++ b/verify.sh
+@@ -58,3 +58,5 @@
+ echo "titles over 72: $n"; [ "$n" = 0 ] || fail=1
+ echo "authors:"; git log --all --format='  %an <%ae>' | sort | uniq -c
+-[ "$fail" = 0 ] && echo "VERIFY: PASS" || echo "VERIFY: FAIL"
++n=$(git log --all --format='%ae%n%ce' | grep -vcx 'git@sirati.me' || true)
++echo "noncanonical author/committer emails: $n"; [ "$n" = 0 ] || fail=1
++if [ "$fail" = 0 ]; then echo "VERIFY: PASS"; else echo "VERIFY: FAIL"; exit 1; fi
