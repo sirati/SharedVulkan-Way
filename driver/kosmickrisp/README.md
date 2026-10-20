@@ -67,3 +67,27 @@ The native fixture also confirms that texture handle properties and image
 requirements exclude every host-visible type and that selecting one for a
 texture import returns `VK_ERROR_INVALID_EXTERNAL_HANDLE`. Ordinary and
 MTLHEAP imports using the original host-visible type still map successfully.
+
+`nv12Sampling` provides a test-only ARM64 Mach-O static archive and the C ABI
+in `nv12-sample.h`, for an example that already owns a bound joined NV12 image.
+It does not import images or modify a protocol. Link `libkk_nv12_fixture.a`
+into the vmhost-built test executable, then sign that executable as usual.
+Supply device/queue handles, device-proc lookup, physical memory properties,
+actual prior image layout and source stage/access, queue family, conversion
+model/range and chroma locations. The producer must have completed first.
+
+Call `kk_nv12_fixture_start`, then `kk_nv12_fixture_read` with a bounded timeout
+and check its 64 floats against the caller's expected frame. The output is a
+row-major 4x4 normalized sample grid at `(column + 0.5, row + 0.5) / 4`, with
+four floats per sample. The helper records the acquire barrier, immutable
+YCbCr sampler, SSBO dispatch and host barrier, then waits a real fence before
+returning diagnostic pixels. The image remains in `SHADER_READ_ONLY_OPTIMAL`.
+Call `kk_nv12_fixture_destroy` after successful completion. Pending jobs refuse
+destruction. Keep the input image, decoder picture and device alive throughout;
+a timeout or failed submission does not authorize their retirement.
+
+`nv12SamplingTest` links that archive into the native fixture and compares its
+results to the independently sampled known image in both range cases. This
+helper is separate from production decode, queue synchronization and lifetime
+management. A VideoToolbox fixture must still check actual decoded/copied
+frames with its own oracle and retain each owner until GPU completion.

@@ -166,6 +166,33 @@ let
     passthru = { inherit kkClc crossFile; };
   };
   # Headless acceptance test: IOSurface -> MTLTexture -> VkImage import.
+  # Test-only static C ABI for sampling a caller-owned joined image.
+  nv12Sampling = pkgs.runCommand "kosmickrisp-nv12-sampling-fixture" {
+    nativeBuildInputs = [ pkgs.glslang ];
+  } ''
+    mkdir -p "$out/lib" "$out/include"
+    glslangValidator -V --target-env vulkan1.1 --vn nv12_spv \
+      -o nv12_spv.h ${./nv12.comp}
+    ${cc} --target=arm64-apple-macosx15.0 -O2 -Wall -Werror \
+      -I${pkgs.vulkan-headers}/include -I. -I${./.} \
+      -c ${./nv12-sample.c} -o nv12-sample.o
+    ${llvm}/bin/llvm-ar rcs "$out/lib/libkk_nv12_fixture.a" nv12-sample.o
+    cp ${./nv12-sample.h} "$out/include/nv12-sample.h"
+  '';
+  nv12SamplingTest = pkgs.runCommand "kosmickrisp-nv12-sampling-test" {
+    nativeBuildInputs = [ pkgs.glslang ];
+  } ''
+    mkdir -p "$out/bin"
+    glslangValidator -V --target-env vulkan1.1 --vn nv12_spv \
+      -o nv12_spv.h ${./nv12.comp}
+    ${cc} --target=arm64-apple-macosx15.0 -O2 -Wall \
+      -DKK_NV12_REUSABLE_HELPER -I${nv12Sampling}/include \
+      -I${pkgs.vulkan-headers}/include -I. \
+      -o "$out/bin/kosmickrisp-nv12-sampling-test" ${./nv12-test.m} \
+      ${nv12Sampling}/lib/libkk_nv12_fixture.a \
+      -framework Foundation -framework CoreFoundation -framework IOSurface -framework Metal
+    ${pkgs.rcodesign}/bin/rcodesign sign "$out/bin/kosmickrisp-nv12-sampling-test"
+  '';
   nv12Test = pkgs.runCommand "kosmickrisp-nv12-test" {
     nativeBuildInputs = [ pkgs.glslang ];
   } ''
@@ -188,5 +215,5 @@ let
   '';
 in
 {
-  inherit kosmickrisp kkClc mtltextureTest nv12Test;
+  inherit kosmickrisp kkClc mtltextureTest nv12Test nv12Sampling nv12SamplingTest;
 }

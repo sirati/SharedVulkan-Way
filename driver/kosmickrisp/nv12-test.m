@@ -40,6 +40,9 @@ static int failures;
    } while (0)
 
 #include "nv12_spv.h"
+#ifdef KK_NV12_REUSABLE_HELPER
+#include "nv12-sample.h"
+#endif
 #include <math.h>
 static int run_memory_contract(void) {
    LOAD_D(vkGetMemoryMetalHandlePropertiesEXT);
@@ -560,6 +563,35 @@ static int run_nv12(bool narrow) {
           "first=%f,%f,%f,%f\n",
           narrow ? "narrow" : "full", pixels[0], pixels[1], pixels[2],
           pixels[3]);
+#ifdef KK_NV12_REUSABLE_HELPER
+   struct kk_nv12_fixture_info helper_info = {
+       .get_device_proc_addr =
+           (PFN_vkGetDeviceProcAddr)gipa(inst, "vkGetDeviceProcAddr"),
+       .device = dev,
+       .queue = queue,
+       .queue_family = 0,
+       .memory_properties = &mp,
+       .image = image,
+       .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+       .src_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+       .src_access = VK_ACCESS_SHADER_READ_BIT,
+       .model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601,
+       .range = narrow ? VK_SAMPLER_YCBCR_RANGE_ITU_NARROW
+                       : VK_SAMPLER_YCBCR_RANGE_ITU_FULL,
+       .x_chroma = VK_CHROMA_LOCATION_MIDPOINT,
+       .y_chroma = VK_CHROMA_LOCATION_MIDPOINT};
+   struct kk_nv12_fixture_job *job = NULL;
+   CHECK(kk_nv12_fixture_start(&helper_info, &job));
+   float helper_pixels[64];
+   CHECK(kk_nv12_fixture_read(job, 10000000000ull, helper_pixels));
+   for (unsigned n = 0; n < 64; n++)
+      if (!isfinite(helper_pixels[n]) ||
+          fabsf(helper_pixels[n] - pixels[n]) > 0.0001f)
+         return 1;
+   CHECK(kk_nv12_fixture_destroy(job));
+   printf("reusable supplied-image helper matches all 16 GPU pixels after its "
+          "own fence\n");
+#endif
    D(vkUnmapMemory);
    D(vkDestroyFence);
    D(vkFreeCommandBuffers);
