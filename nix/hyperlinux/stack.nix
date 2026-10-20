@@ -173,6 +173,9 @@ let
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
+  fatalBusWaitClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-fatal-bus-wait-client"; source = ./fatal-bus-wait-client.c;
+  };
   asyncFaultClient = guest.callPackage ./client-probe.nix {
     programName = "hl-async-fault-client"; source = ./async-fault-client.c;
     linkFlags = [ "-pthread" ];
@@ -260,5 +263,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient asyncFaultClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient asyncFaultClient fatalBusWaitClient probeRunner;
 }
