@@ -124,7 +124,15 @@ unsafe fn native_completed(
         .command_buffer_infos(commands);
     let submitted = unsafe { driver.device.queue_submit2(driver.queue, &[batch], fence) };
     let result = match submitted {
-        Ok(()) => unsafe { driver.device.wait_for_fences(&[fence], true, u64::MAX) },
+        Ok(()) => loop {
+            if driver.native_submission_failure().is_some() {
+                break Err(vk::Result::ERROR_DEVICE_LOST);
+            }
+            match unsafe { driver.device.wait_for_fences(&[fence], true, 50_000_000) } {
+                Err(vk::Result::TIMEOUT) => continue,
+                result => break result,
+            }
+        },
         Err(error) => Err(error),
     };
     if result.is_ok() {

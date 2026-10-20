@@ -1302,6 +1302,16 @@ mod tests {
 
 #[cfg(target_os = "macos")]
 impl Driver {
+    pub(crate) fn native_submission_failure(&self) -> Option<vk::Result> {
+        self.native_submissions.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().and_then(|queue| queue.failure())
+    }
+    pub(crate) fn cancel_native_submissions(&self) -> bool {
+        if let Some(queue) = self.native_submissions.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return queue.cancel_if_pending();
+        }
+        false
+    }
     pub(crate) fn native_submission_queue(&self) -> std::result::Result<std::sync::Arc<crate::video_worker::Queue>, vk::Result> {
         let mut queue = self.native_submissions.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(queue) = &*queue { return Ok(std::sync::Arc::clone(queue)); }

@@ -130,9 +130,22 @@ pub fn serve(
     let heart = {
         let control = Arc::clone(&control);
         let beating = Arc::clone(&beating);
+        #[cfg(target_os = "macos")]
+        let shared = Arc::clone(&shared);
         std::thread::spawn(move || {
+            #[cfg(target_os = "macos")]
+            let mut native_peer = sv_transport::control::LivenessMonitor::new(
+                Instant::now(), APP_GONE_AFTER, Duration::from_millis(50));
             while beating.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = control.beat_now();
+                #[cfg(target_os = "macos")]
+                {
+                    let shutdown = control.flags().is_ok_and(|f| f & Flags::SHUTDOWN != 0);
+                    let gone = matches!(native_peer.poll(&control, Instant::now()),
+                        Ok(sv_transport::control::Liveness::Gone)
+                        | Ok(sv_transport::control::Liveness::Restarted { .. }));
+                    if shutdown || gone { shared.cancel_native_submissions(); }
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         })
@@ -158,6 +171,8 @@ pub fn serve(
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    shared.cancel_native_submissions();
     beating.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = heart.join();
 
@@ -643,6 +658,10 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     let mut ft_window = Instant::now();
 
     loop {
+        #[cfg(target_os = "macos")]
+        if shared.driver.native_submission_failure().is_some() {
+            return Err("native device execution cancelled or failed".into());
+        }
         if control.flags().map_err(err)? & Flags::SHUTDOWN != 0 {
             break;
         }
