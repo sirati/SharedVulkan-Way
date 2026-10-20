@@ -28,3 +28,5 @@ pub mod udma;
 pub mod peerloop;
 #[cfg(target_os = "linux")]
 pub mod brokered;
+#[cfg(target_os = "linux")]
+pub mod hugesub;

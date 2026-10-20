@@ -318,40 +318,12 @@ if [ -n "$INFO" ]; then
     || bad "session ${IDX_L:-x} did not end by its linger ($(sessions))"
   grep -q 'outlived it; closed' "$D/comp-5.log" && ok "a feed the proxy left behind was closed: $(grep -m1 -o 'ring slot [0-9]*: a feed.*' "$D/comp-5.log")"
 fi
-say "leg 9: the one pool grows from guest RAM (§108): a 32 MiB BAR, a 64 MiB GPU pool, regions from a file standing in for the guest's RAM"
-sleep $((LINGER + 1))
-kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
-kill "$PORT" 2>/dev/null; start_port
-rm -f "$D/gpu" "$D"/gpu-*.ram "$D"/gpu-*.lease; truncate -s $((64 << 20)) "$D/gpu"; truncate -s $((1536 << 20)) "$D/ram"
-rm -f "$D/arena" "$D/user.ctl"; truncate -s $((32 << 20)) "$D/arena"
-SV_RAM_IDLE_MS=5000 SV_RAM_DEEP_IDLE_MS=15000 SV_RAM_CALM_MS=2000 \
-XDG_RUNTIME_DIR="$D/crt" WC_IVSHMEM_STANDIN="$D/arena" "$BIN/sv-guest" wayland \
-  --arena-ivshmem 0 --arena-outbound 0:1048576 --wayland-rings "$D/guest.sock" \
-  --socket "wcm$$-5" --in-band --timeout 600 --exit-when-empty $LINGER \
-  --user-control "$D/user.ctl" --singleton "wc-multi-$$" \
-  --with-gpu pool-guest --pool-file "$D/gpu" --grow-ram "$D/ram" --grow-budget 1024 --sessions 4 >"$D/comp-5.log" 2>&1 &
-COMP=$!; PIDS+=("$COMP")
-wait_line "$D/comp-5.log" 'user control socket' 20 || bad "compositor 5: no user control socket"
-wait_line "$D/comp-5.log" 'pool region 1 ' 10 && ok "$(grep -m1 -o 'sessions: pool region 1.*' "$D/comp-5.log" | cut -c1-120)" || bad "no pool region 1"
-"$BIN/wc-arena-host" ram-peer --boot "$D/gpu" --table-off auto --ram "$D/ram" --publish --no-traffic --stats-secs 10 >"$D/peer-8.log" 2>&1 &
-PIDS+=($!)
-BEFORE=$(grep -c ' mapped ' "$D/comp-5.log")
-for t in a b c; do
-  R=$(boot "${t}g" "wcm$t" "$D/guest-wcm$t.key"); case "$R" in ok\ located*) ;; *) bad "growing-pool boot $t: $R" ;; esac
-  request "${t}g" "raw run shm 96 30" >/dev/null
-  keep_log "$D/run/wcm$t-$$-${t}g/proxy.log" "$D/proxy-${t}g.log"
-done
-sleep 8
-GR=$(grep -c 'added to the pool' "$D/comp-5.log"); GK=$(grep -c 'of pool region [2-9]' "$D/comp-5.log")
-MAPPED=$(( $(grep -c ' mapped ' "$D/comp-5.log") - BEFORE ))
-[ "$GR" -ge 1 ] && ok "the GPU pool grew: $GR region(s) added, $(grep -c ' MAPPED ' "$D/peer-8.log") located and mapped by the host's peer" || bad "the GPU pool did not grow"
-[ "$GK" -ge 1 ] && ok "Wayland grants in grown regions: $GK ($(grep -m1 -o 'granted region [^ ]*: [0-9]* MiB at [0-9]* MiB of pool region [2-9]' "$D/comp-5.log"))" || bad "no Wayland grant landed in a grown region"
-[ "$MAPPED" -ge 3 ] && ok "$MAPPED window(s) mapped, three installations on a 32 MiB BAR and a 64 MiB GPU pool" || bad "only $MAPPED window(s) mapped"
-grep -q 'guest-RAM window' "$D"/proxy-*g.log && ok "a proxy mapped a guest-RAM window from the peer's run list" || bad "no proxy mapped a guest-RAM window"
-grep -q 'REFUSED [0-9]* bytes' "$D/comp-5.log" && bad "a refusal: $(grep -m1 -o 'REFUSED [0-9]* bytes.*' "$D/comp-5.log" | cut -c1-150)"
-for t in a b c; do R=$(request "${t}g" "raw status"); case "$R" in ok-raw*) ;; *) bad "growing pool, status $t: $R" ;; esac; done
-for t in a b c; do request "${t}g" "raw down" >/dev/null; done
-wait_line "$D/comp-5.log" "given back to the guest" 45 && ok "after down, the idle regions went back: $(grep -c 'given back to the guest' "$D/comp-5.log") of $GR, after the host's UNMAPPED ($(grep -c ' UNMAPPED ' "$D/peer-8.log"))" || bad "no region went back to the guest within 75 s"
+# Leg 9 (§108: the one pool growing from guest RAM, the proxies mapping
+# windows of grown regions) needs the broker, the one account that may make
+# udmabufs of guest RAM, which the user running this harness never is. It is
+# in the NixOS VM tests: scripts/sv-pool-grow-e2e.sh (the GPU pool) and
+# scripts/wc-guestram-vmtest.sh (the broker, its users and its rules).
+say "leg 9 (guest RAM): in the VM tests, scripts/sv-pool-grow-e2e.sh and scripts/wc-guestram-vmtest.sh"
 
 if [ -n "${WC_MULTI_EVIDENCE:-}" ]; then mkdir -p "$WC_MULTI_EVIDENCE" && cp "$D"/*.log "$WC_MULTI_EVIDENCE"/ 2>/dev/null; fi
 echo "logs: $D"

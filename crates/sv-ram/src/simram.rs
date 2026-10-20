@@ -23,9 +23,16 @@ pub struct SimGuestRam {
 }
 
 impl SimGuestRam {
-    /// `file` must be a multiple of 2 MiB long.
+    /// `file` must be a multiple of 2 MiB long. `memfd:MIB` is a sealed memfd
+    /// of that size instead, named as QEMU names its RAM
+    /// (`memory-backend-sim`), so that the broker finds it through
+    /// `/proc/PID/fd` exactly as it finds a VM's RAM, and can make udmabufs
+    /// of it (§108.18's harnesses).
     pub fn open(path: &str) -> Result<SimGuestRam, String> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| format!("{path}: {e}"))?;
+        let file = match path.strip_prefix("memfd:") {
+            Some(mib) => sealed_memfd(mib.parse::<u64>().map_err(|e| format!("{path}: {e}"))? << 20)?,
+            None => std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| format!("{path}: {e}"))?,
+        };
         let len = file.metadata().map_err(|e| e.to_string())?.len();
         let seed = std::process::id() as u64 ^ 0x9E37_79B9_7F4A_7C15;
         Ok(SimGuestRam { file, used: vec![false; (len / UNIT) as usize], regions: BTreeMap::new(), next: 1, seed })
@@ -41,6 +48,26 @@ impl SimGuestRam {
     pub fn free_bytes(&self) -> u64 {
         self.used.iter().filter(|u| !**u).count() as u64 * UNIT
     }
+}
+
+/// A memfd that cannot shrink or grow, as QEMU's RAM backend is sealed (what
+/// `UDMABUF_CREATE_LIST` requires).
+fn sealed_memfd(len: u64) -> Result<std::fs::File, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new("memory-backend-sim").expect("no NUL");
+    // SAFETY: a valid C string; the result is checked.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("memfd_create: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh fd that nothing else owns.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.set_len(len).map_err(|e| e.to_string())?;
+    // SAFETY: fcntl on our own fd.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL) } != 0 {
+        return Err(format!("sealing the memfd: {}", std::io::Error::last_os_error()));
+    }
+    Ok(f)
 }
 
 impl Substrate for SimGuestRam {

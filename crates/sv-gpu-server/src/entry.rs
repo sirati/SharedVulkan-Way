@@ -2014,7 +2014,8 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let len = f.metadata()?.len();
     let boot = Arc::new(sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)?);
     eprintln!("[gpu] pool file {path}: {} MiB, the pool's region 0", len >> 20);
-    // §108: `--grow-ram FILE` stands a file in for the Windows guest's RAM;
+    // §108: `--grow-ram FILE` (or `memfd:MIB`, which the broker can make
+    // udmabufs of) stands in for the Windows guest's RAM;
     // regions are scattered 2 MiB units of it, located by the host's probe.
     let grow = match arg("--grow-ram") {
         None => None,

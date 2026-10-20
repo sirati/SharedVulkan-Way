@@ -70,9 +70,6 @@ fn run(a: &[String]) -> Result<(), String> {
         (None, Some(pid)) => Ram::QemuPid(pid.parse().map_err(|e| format!("--qemu-pid: {e}"))?),
         _ => return Err("--ram PATH or --qemu-pid PID is required".into()),
     };
-    if a.iter().any(|x| x == "--publish") {
-        return Err("--publish is gone: other host processes get regions from the broker (sv_ram::brokered, §108.15)".into());
-    }
     let cfg = peerloop::Config { boot: boot.clone().into(), table_off, ram, bell: opt("--bell").map(Into::into) };
     let att = peerloop::attach(&cfg)?;
     eprintln!(

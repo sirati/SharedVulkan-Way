@@ -8,6 +8,8 @@ description = "Shared memory that grows and shrinks (waycompose-design.md §108)
 
 [dependencies]
 sv-transport = { workspace = true }
+# `sv-ram-vmtest provider`: the GPU pool's rules (a leased region is never retired).
+sv-arena = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -359,10 +359,24 @@ enum Backing {
     /// The guest's own RAM, found in QEMU's memory backend and stitched into
     /// one view. Not a file, and therefore not subject to a mount's caching.
     GuestRam(crate::guestram::StitchedRegion),
-    /// §108: a window of a guest-RAM region of the GPU pool, and the lease
-    /// file this process holds a shared lock on while it maps it: the
-    /// host's peer answers the guest `UNMAPPED` only once nobody holds it.
-    GuestRamLeased(crate::guestram::StitchedRegion, #[allow(dead_code)] std::fs::File),
+    /// §108: a window of a guest-RAM region of the GPU pool, and the broker
+    /// lease this process holds while it maps it: the host answers the guest
+    /// `UNMAPPED` only once every lease has ended. Fields drop in order, so
+    /// the window is unmapped before the lease ends.
+    GuestRamLeased(crate::guestram::StitchedRegion, #[allow(dead_code)] BrokerLease),
+}
+
+/// A lease on a broker region (§111), ended when dropped.
+pub struct BrokerLease(pub u64);
+
+impl Drop for BrokerLease {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Err(e) = wc_broker::client::close_region(self.0) {
+            // The connection is gone, and the lease with it.
+            println!("[proxy] broker region {}: close: {e}", self.0);
+        }
+    }
 }
 
 impl Backing {
@@ -921,46 +935,30 @@ impl ProvidedRegion {
         Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len, id: Some(id) })
     }
 
-    /// §108: a window `[offset, offset+len)` of a guest-RAM region of the GPU
-    /// pool, from the run list the host's region peer published at `desc`
-    /// (`{gpu device}-{k}.ram`). Holds the region's lease file shared while
-    /// the window is mapped.
+    /// §108: a window `[offset, offset+len)` of guest-RAM region `k` of the
+    /// GPU pool, from the broker (§108.15, §111): `find gpu.<k>` gives this
+    /// process's user the region's udmabufs and a lease, held while the
+    /// window is mapped. Only the parts that cover the window are mapped.
     #[cfg(target_os = "linux")]
-    pub fn ram_window(desc: &Path, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
-        use std::os::fd::AsRawFd;
-        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", desc.display()));
-        let text = std::fs::read_to_string(desc)?;
-        let (mut epoch, mut ram, mut total, mut runs) = (0u64, String::new(), 0u64, Vec::new());
-        for l in text.lines() {
-            let w: Vec<&str> = l.split_whitespace().collect();
-            match w.as_slice() {
-                ["epoch", e] => epoch = e.parse().unwrap_or(0),
-                ["ram", p] => ram = p.to_string(),
-                ["len", n] => total = n.parse().unwrap_or(0),
-                ["run", f, x, n] => runs.push((f.parse::<u64>().unwrap_or(0), x.parse::<u64>().unwrap_or(0), n.parse::<u64>().unwrap_or(0))),
-                _ => {}
-            }
+    pub fn ram_window(k: u32, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
+        use std::os::fd::AsFd;
+        let (r, fds) = wc_broker::client::find_region(&format!("gpu.{k}"))?;
+        let lease = BrokerLease(r.id);
+        if len == 0 || offset.checked_add(len).is_none_or(|e| e > r.len) || !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("no window {offset}+{len} in the {}-byte guest-RAM region {k}", r.len)));
         }
-        if epoch == 0 || ram.is_empty() || len == 0 || offset.checked_add(len).is_none_or(|e| e > total) || !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
-            return Err(bad(format!("no window {offset}+{len} in a {total}-byte region")));
-        }
-        let lease_path = desc.to_string_lossy().trim_end_matches(".ram").to_string() + &format!("-{epoch}.lease");
-        let lock = std::fs::File::open(&lease_path)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-            return Err(bad("the region is being retired".into()));
-        }
-        // The runs that cover the window, cut to it.
+        // The parts that cover the window, cut to it.
         let mut wruns = Vec::new();
-        for (file_off, at, n) in runs {
-            let (s, e) = (at.max(offset), (at + n).min(offset + len));
+        for (p, fd) in r.pieces.iter().zip(&fds) {
+            let (s, e) = (p.offset.max(offset), (p.offset + p.len).min(offset + len));
             if s < e {
-                wruns.push(crate::guestram::Run { arena_offset: s - offset, file_offset: file_off + (s - at), len: e - s });
+                wruns.push((fd.as_fd(), crate::guestram::Run { arena_offset: s - offset, file_offset: s - p.offset, len: e - s }));
             }
         }
-        let plan = crate::guestram::Plan { id, object: PathBuf::from(&ram), len, run_id: 0, outbound: None, runs: wruns };
-        let region = crate::guestram::StitchedRegion::attach(&plan)?;
-        let origin = format!("guest-RAM window {offset}+{len} of {} (§108)", desc.display());
-        Ok(ProvidedRegion { backing: Backing::GuestRamLeased(region, lock), origin, len, id: Some(id) })
+        let parts: Vec<_> = wruns.iter().map(|(fd, run)| (*fd, run)).collect();
+        let origin = format!("guest-RAM window {offset}+{len} of pool region {k}, broker region {} (§108)", r.id);
+        let region = crate::guestram::StitchedRegion::attach_parts(len, &parts, origin.clone())?;
+        Ok(ProvidedRegion { backing: Backing::GuestRamLeased(region, lease), origin, len, id: Some(id) })
     }
 
     /// A region backed by a file on this machine.
