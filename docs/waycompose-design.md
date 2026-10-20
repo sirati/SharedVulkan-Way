@@ -38191,9 +38191,24 @@ The local screenshot's black rectangle outside Firefox belongs to Wine's
 window trees, PID properties and images establish that ownership. Wine retains
 uncovered pixels after child windows resize or leave. Successful `RedrawWindow` and `PaintDesktop` return values did not clear the
 black strip: direct pixel checks still show RGB 0,0,0 outside the application.
-The ineffective repaint helper was removed. A minimal Win32 resize/region
-fixture investigates stale Wine clipping separately; this desktop artifact is
-not evidence of omitted GTK parent frames, and is not waived as clean rendering.
+The ineffective repaint helper was removed. A minimal same-style Win32 fixture
+isolates the cause without Firefox, GTK or Vulkan: showing the initial
+`CW_USEDEFAULT` 1440x900 rectangle before resizing to 1288x1044 leaves pixel
+1300,100 black, while sizing the hidden window first leaves it desktop blue.
+Both final windows have identical geometry and no custom window shape.
+
+Normal mapping now pre-sizes the hidden window with `SWP_NOMOVE`, bounded to
+the work area, before showing it. It keeps the existing post-show origin and
+placement logic for Windows' cascade, and suppresses intermediate size echoes
+with the existing placement guards. The maximized path is unchanged. Actual
+Firefox run `run-orLiEJ` confirms RGB 37,111,149 at both 1300,100 and 1500,100;
+the full screenshot was also inspected. Its Win32 window is 1288x1044 with a
+1280x1040 client, no custom region and the expected DC clip. All 3,997 commits
+remain zero-copy with zero copied commits, including both real GTK parent
+surface 38/buffer 51 commits. WebRender/WebGL and sandbox checks pass; H264
+presents 298 frames with one drop at verdict. The overall lavapipe run still
+fails only its hardware VA checks. This local result does not replace native
+guest placement, hardware decode or performance gates.
 
 GPU Firefox deployment requires `WC_LAUNCH_GPU_GTK`, a shipped GTK store output
 already copied to the host, plus the render node, guest PCI identity and Zink
