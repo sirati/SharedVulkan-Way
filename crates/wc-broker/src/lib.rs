@@ -36,6 +36,7 @@ pub mod server;
 pub mod service_control;
 pub mod service_auth;
 pub mod service_bootstrap;
+pub mod service_lifecycle;
 pub mod sys;
 pub mod usermap;
 

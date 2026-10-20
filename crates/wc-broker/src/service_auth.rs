@@ -7,6 +7,7 @@ use crate::core::User;
 use crate::service_control::{Binding, DOMAIN, MAX_BYTES, Message, Origin, Payload, Phase};
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wc_handle::macboot::{KEY_LEN, hmac_sha256};
 
 fn denied(message: &str) -> io::Error {
@@ -71,8 +72,37 @@ pub struct ServiceEndpoint {
     origin: Origin,
     _user: User,
     process: Arc<dyn ServiceProcess>,
+    revoked: Arc<AtomicBool>,
 }
 impl ServiceEndpoint {
+    pub(crate) fn origin(&self) -> Origin {
+        self.origin
+    }
+    // Restricted sharing preserves irreversible revocation across lifecycle
+    // and every grant stream. It does not permit a new bootstrap ticket.
+    pub(crate) fn share(&self) -> Self {
+        Self {
+            origin: self.origin,
+            _user: self._user.clone(),
+            process: self.process.clone(),
+            revoked: self.revoked.clone(),
+        }
+    }
+    pub(crate) fn ensure_live(&self) -> io::Result<()> {
+        if self.revoked.load(Ordering::SeqCst) {
+            return Err(denied("service endpoint authority was revoked"));
+        }
+        match self.process.exited() {
+            Ok(false) if !self.revoked.load(Ordering::SeqCst) => Ok(()),
+            Ok(false) => Err(denied("service endpoint authority was revoked")),
+            Ok(true) | Err(_) => {
+                self.revoked.store(true, Ordering::SeqCst);
+                Err(denied(
+                    "service process is dead or its kernel identity is unavailable",
+                ))
+            }
+        }
+    }
     /// Capture the native receiver's exact peer and retain its kernel object.
     ///
     /// # Safety
@@ -100,6 +130,7 @@ impl ServiceEndpoint {
             origin: policy.origin,
             _user: actual_user,
             process: retained_process,
+            revoked: Arc::new(AtomicBool::new(false)),
         })
     }
     /// Capture the privileged service's own identity without a PID lookup.
@@ -167,7 +198,6 @@ pub struct Authenticator {
     key: [u8; KEY_LEN],
     binding: Binding,
     _retained_grant: Arc<dyn Send + Sync>,
-    revoked: bool,
     next_send: Option<u64>,
     next_receive: Option<u64>,
 }
@@ -179,6 +209,9 @@ impl Authenticator {
     /// never a key supplied by a client. `binding` and its roles must come from
     /// the authenticated canonical grant owner and protected VM/SID-to-UID
     /// configuration. Both service epochs must be fresh, not caller choices.
+    /// Production callers must use the durable lifecycle and one stream per
+    /// exact binding. Reconstructing this object for a prior binding would
+    /// reset replay protection and violates the freshness contract.
     /// `retained_grant` must keep that exact original BAR/grant alive against
     /// release/reuse. A public boot MAC is not service endpoint authority.
     pub unsafe fn new(
@@ -204,7 +237,6 @@ impl Authenticator {
             key,
             binding,
             _retained_grant: retained_grant,
-            revoked: false,
             next_send: Some(1),
             next_receive: Some(1),
         })
@@ -257,18 +289,7 @@ impl Authenticator {
         Ok(VerifiedMessage { message })
     }
     fn ensure_live(&mut self) -> io::Result<()> {
-        if self.revoked {
-            return Err(denied("service endpoint authority was revoked"));
-        }
-        match self.endpoint.process.exited() {
-            Ok(false) => Ok(()),
-            Ok(true) | Err(_) => {
-                self.revoked = true;
-                Err(denied(
-                    "service process is dead or its kernel identity is unavailable",
-                ))
-            }
-        }
+        self.endpoint.ensure_live()
     }
     fn check_role(&self, origin: Origin, phase: Phase) -> io::Result<()> {
         let roles = self.binding.roles;
