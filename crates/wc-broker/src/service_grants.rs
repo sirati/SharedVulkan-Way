@@ -1655,6 +1655,14 @@ mod tests {
             Some(&producer.process)
         );
         assert_eq!(life.exclusions().unwrap(), exclusions);
+        // Consuming a proof never permits reuse of its native export identity.
+        backend.wrong = 3;
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .is_err()
+        );
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
     }
     #[test]
     fn native_ticket_rejects_wrong_range_rights_target_and_duplicate_export_identity() {
