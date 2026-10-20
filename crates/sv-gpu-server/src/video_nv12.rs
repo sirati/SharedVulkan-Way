@@ -41,6 +41,7 @@ impl Layout {
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
+pub mod h264_parameters;
 
 #[cfg(test)]
 mod tests {

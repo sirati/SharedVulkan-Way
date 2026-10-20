@@ -76,6 +76,15 @@ unsafe extern "C" {
         flags: u32,
         output: *mut Ref,
     ) -> i32;
+    fn CMBlockBufferCreateEmpty(allocator: Ref, capacity: u32, flags: u32, output: *mut Ref)
+    -> i32;
+    fn CMBlockBufferAppendBufferReference(
+        destination: Ref,
+        source: Ref,
+        offset: usize,
+        length: usize,
+        flags: u32,
+    ) -> i32;
     fn CMSampleBufferCreateReady(
         allocator: Ref,
         data: Ref,
@@ -205,6 +214,8 @@ pub struct Decoder {
     callbacks: Box<Callbacks>,
     next: usize,
     pub coded_extent: [u32; 2],
+    pub display_extent: [u32; 2],
+    pub crop_origin: [u32; 2],
 }
 // VideoToolbox sessions may move between threads. All mutating calls require &mut.
 unsafe impl Send for Decoder {}
@@ -275,7 +286,9 @@ impl Decoder {
                 _format: format,
                 callbacks,
                 next: 1,
-                coded_extent: extent,
+                coded_extent: extent.coded_extent,
+                display_extent: extent.display_extent,
+                crop_origin: extent.crop_origin,
             })
         }
     }
@@ -289,41 +302,87 @@ impl Decoder {
     ) -> Result<mpsc::Receiver<Result<Arc<Picture>, String>>, String> {
         let bytes = owner
             .bytes()
-            .get(range)
+            .get(range.clone())
             .ok_or("compressed range outside allocation")?;
         validate_avc(bytes)?;
         let length = bytes.len();
-        let memory = bytes.as_ptr() as Ref;
+        let block = compressed_block(owner, range)?;
+        self.submit_block(block, length)
+    }
+    /// Submit exact Vulkan slice-offset ranges. Offsets are relative to range.start
+    /// and include each Annex B start code. Ambiguous/multiple NAL ranges fail.
+    pub fn submit_annex_b(
+        &mut self,
+        owner: Arc<dyn CompressedBytes>,
+        range: Range<usize>,
+        offsets: &[u32],
+    ) -> Result<mpsc::Receiver<Result<Arc<Picture>, String>>, String> {
+        let data = owner
+            .bytes()
+            .get(range.clone())
+            .ok_or("compressed range outside allocation")?;
+        let ranges = annex_b_ranges(data, offsets)?;
+        let mut block = Owned(ptr::null_mut());
+        unsafe {
+            checked(
+                CMBlockBufferCreateEmpty(
+                    ptr::null_mut(),
+                    (ranges.len() * 2) as u32,
+                    0,
+                    &mut block.0,
+                ),
+                "segmented AVC block",
+            )?;
+        }
+        let mut length = 0usize;
+        for nal in ranges {
+            let size = nal.len();
+            let prefix: Arc<dyn CompressedBytes> = Arc::new(
+                u32::try_from(size)
+                    .map_err(|_| "NAL too large")?
+                    .to_be_bytes()
+                    .to_vec(),
+            );
+            let header = compressed_block(prefix, 0..4)?;
+            let payload = compressed_block(
+                Arc::clone(&owner),
+                range.start + nal.start..range.start + nal.end,
+            )?;
+            unsafe {
+                checked(
+                    CMBlockBufferAppendBufferReference(block.0, header.0, 0, 4, 0),
+                    "append AVC size",
+                )?;
+                checked(
+                    CMBlockBufferAppendBufferReference(block.0, payload.0, 0, size, 0),
+                    "append original NAL",
+                )?;
+            }
+            length = length.checked_add(4 + size).ok_or("AVC size overflow")?;
+        }
+        self.submit_block(block, length)
+    }
+    fn submit_block(
+        &mut self,
+        block: Owned,
+        length: usize,
+    ) -> Result<mpsc::Receiver<Result<Arc<Picture>, String>>, String> {
+        if self
+            .callbacks
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            >= 64
+        {
+            return Err("decoder has 64 pending frames; drain before submitting more".into());
+        }
         let id = self.next;
         self.next = self
             .next
             .checked_add(1)
             .ok_or("decode sequence exhausted")?;
         unsafe {
-            let input = Box::into_raw(Box::new(Input { _owner: owner }));
-            let source = BlockSource {
-                version: 0,
-                allocate: None,
-                free: Some(release_input),
-                context: input.cast(),
-            };
-            let mut block = Owned(ptr::null_mut());
-            let status = CMBlockBufferCreateWithMemoryBlock(
-                ptr::null_mut(),
-                memory,
-                length,
-                ptr::null_mut(),
-                &source,
-                0,
-                length,
-                0,
-                &mut block.0,
-            );
-            if status != 0 {
-                // CoreMedia does not take the memory block on creation failure.
-                drop(Box::from_raw(input));
-                checked(status, "compressed block")?;
-            }
             let mut sample = Owned(ptr::null_mut());
             let timing = Timing {
                 duration: Time {
@@ -411,6 +470,80 @@ impl Drop for Decoder {
         // Invalidate synchronously cancels remaining callbacks. Context outlives it.
     }
 }
+fn compressed_block(owner: Arc<dyn CompressedBytes>, range: Range<usize>) -> Result<Owned, String> {
+    let bytes = owner
+        .bytes()
+        .get(range)
+        .filter(|b| !b.is_empty())
+        .ok_or("invalid compressed block range")?;
+    let memory = bytes.as_ptr() as Ref;
+    let length = bytes.len();
+    let input = Box::into_raw(Box::new(Input { _owner: owner }));
+    let source = BlockSource {
+        version: 0,
+        allocate: None,
+        free: Some(release_input),
+        context: input.cast(),
+    };
+    let mut block = Owned(ptr::null_mut());
+    let status = unsafe {
+        CMBlockBufferCreateWithMemoryBlock(
+            ptr::null_mut(),
+            memory,
+            length,
+            ptr::null_mut(),
+            &source,
+            0,
+            length,
+            0,
+            &mut block.0,
+        )
+    };
+    if status != 0 {
+        // CoreMedia's failure contract leaves memoryBlock with its caller.
+        unsafe {
+            drop(Box::from_raw(input));
+        }
+        checked(status, "compressed block")?;
+    }
+    Ok(block)
+}
+fn annex_b_ranges(data: &[u8], offsets: &[u32]) -> Result<Vec<Range<usize>>, String> {
+    if offsets.is_empty() || offsets.len() > 4096 || offsets[0] != 0 {
+        return Err("Annex B requires 1..4096 exact slice offsets beginning at zero".into());
+    }
+    let mut ranges = Vec::with_capacity(offsets.len());
+    for (i, &offset) in offsets.iter().enumerate() {
+        let start = offset as usize;
+        let end = offsets
+            .get(i + 1)
+            .map(|n| *n as usize)
+            .unwrap_or(data.len());
+        let nal = data
+            .get(start..end)
+            .filter(|b| !b.is_empty())
+            .ok_or("invalid Annex B slice offsets")?;
+        let prefix = if nal.starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if nal.starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            return Err("slice offset does not point to an Annex B start code".into());
+        };
+        let payload = nal
+            .get(prefix..)
+            .filter(|p| !p.is_empty())
+            .ok_or("empty Annex B NAL")?;
+        if payload[0] & 0x80 != 0 || !matches!(payload[0] & 31, 1 | 5) {
+            return Err("Annex B slice range must contain one VCL NAL".into());
+        }
+        if payload.windows(3).any(|b| b == [0, 0, 1]) {
+            return Err("multiple NALs within a slice offset range".into());
+        }
+        ranges.push(start + prefix..end);
+    }
+    Ok(ranges)
+}
 fn validate_avc(mut data: &[u8]) -> Result<(), String> {
     let mut vcl = false;
     while !data.is_empty() {
@@ -432,7 +565,9 @@ fn validate_avc(mut data: &[u8]) -> Result<(), String> {
             1 | 5 => vcl = true,
             6 | 9 | 12 => {}
             _ => {
-                return Err("access unit contains parameter updates or unsupported NAL type".into());
+                return Err(
+                    "access unit contains parameter updates or unsupported NAL type".into(),
+                );
             }
         }
         data = &data[size..];
@@ -483,7 +618,13 @@ impl Bits {
     }
 }
 /// Check the actual SPS rather than trusting the Vulkan profile declaration.
-fn validate_sps(sps: &[u8]) -> Result<[u32; 2], String> {
+#[derive(Debug)]
+struct Geometry {
+    coded_extent: [u32; 2],
+    display_extent: [u32; 2],
+    crop_origin: [u32; 2],
+}
+fn validate_sps(sps: &[u8]) -> Result<Geometry, String> {
     if sps.first().map(|x| x & 0x9f) != Some(7) {
         return Err("expected an SPS NAL".into());
     }
@@ -572,20 +713,28 @@ fn validate_sps(sps: &[u8]) -> Result<[u32; 2], String> {
         return Err("interlaced H.264 is unsupported".into());
     }
     b.read(1)?;
+    let mut crop = [0u32; 4];
     if b.read(1)? != 0 {
-        // Reject cropping until Vulkan coded/display extents are represented separately.
-        let mut crop = 0u64;
-        for _ in 0..4 {
-            crop += u64::from(b.ue()?);
-        }
-        if crop != 0 {
-            return Err("cropped H.264 SPS is unsupported".into());
+        for value in &mut crop {
+            *value = b.ue()?.checked_mul(2).ok_or("SPS crop overflow")?;
         }
     }
+    let display_width = width
+        .checked_sub(crop[0].checked_add(crop[1]).ok_or("SPS crop overflow")?)
+        .filter(|n| *n != 0)
+        .ok_or("invalid SPS horizontal crop")?;
+    let display_height = height
+        .checked_sub(crop[2].checked_add(crop[3]).ok_or("SPS crop overflow")?)
+        .filter(|n| *n != 0)
+        .ok_or("invalid SPS vertical crop")?;
     if width > 8192 || height > 8192 {
         return Err("H.264 coded extent exceeds decoder limit".into());
     }
-    Ok([width, height])
+    Ok(Geometry {
+        coded_extent: [width, height],
+        display_extent: [display_width, display_height],
+        crop_origin: [crop[0], crop[2]],
+    })
 }
 
 #[cfg(test)]
@@ -604,12 +753,28 @@ mod tests {
     }
     #[test]
     fn accepts_progressive_baseline_and_rejects_interlace() {
-        assert_eq!(validate_sps(&baseline(true)).unwrap(), [32, 32]);
+        assert_eq!(
+            validate_sps(&baseline(true)).unwrap().coded_extent,
+            [32, 32]
+        );
         assert!(
             validate_sps(&baseline(false))
                 .unwrap_err()
                 .contains("interlaced")
         );
+    }
+    #[test]
+    fn separates_coded_allocation_from_display_crop() {
+        let bits = "11011010001001011111101001";
+        let mut sps = vec![0x67, 66, 0, 30];
+        let padded = format!("{bits}{}", "0".repeat((8 - bits.len() % 8) % 8));
+        for chunk in padded.as_bytes().chunks(8) {
+            sps.push(chunk.iter().fold(0, |n, b| n * 2 + (b - b'0')));
+        }
+        let geometry = validate_sps(&sps).unwrap();
+        assert_eq!(geometry.coded_extent, [32, 32]);
+        assert_eq!(geometry.display_extent, [32, 30]);
+        assert_eq!(geometry.crop_origin, [0, 0]);
     }
     #[test]
     fn rejects_truncated_sps_and_unsupported_profiles() {
@@ -654,4 +819,18 @@ fn validate_pps(pps: &[u8]) -> Result<(), String> {
         return Err("H.264 flexible macroblock ordering is unsupported".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod annex_tests {
+    use super::*;
+    #[test]
+    fn retains_full_slice_ranges_and_rejects_ambiguous_boundaries() {
+        let stream = [0, 0, 0, 1, 0x65, 0x88, 0, 0, 1, 0x41, 0x99, 0, 0];
+        assert_eq!(annex_b_ranges(&stream, &[0, 6]).unwrap(), [4..6, 9..13]);
+        assert!(annex_b_ranges(&stream, &[0]).is_err());
+        assert!(annex_b_ranges(&stream, &[1, 6]).is_err());
+        assert!(annex_b_ranges(&stream, &[0, 0]).is_err());
+        assert!(annex_b_ranges(&stream, &[0, 7]).is_err());
+    }
 }
