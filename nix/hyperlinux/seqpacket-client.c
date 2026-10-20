@@ -232,6 +232,10 @@ static void readiness(void) {
         CHECK(sent == 1);
     }
     CHECK(count > 0 && count < 65536);
+    if (!linux_reference) {
+        CHECK(count <= 256);
+        printf("SEQPACKET queued records=%u maximum=256 payload_limit=%d\n", count, MAX_RECORD);
+    }
     p = (struct pollfd){ fd[0], POLLOUT, 0 };
     CHECK(poll(&p, 1, 0) == 0);
     for (unsigned i = 0; i < count; i++) CHECK(read(fd[1], bytes, sizeof(bytes)) == 1);
