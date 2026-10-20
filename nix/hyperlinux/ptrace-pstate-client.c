@@ -26,7 +26,7 @@ static void *tracee(void *unused) {
     while(!atomic_load(&go))__asm__ volatile("" ::: "memory");
     for(size_t i=0;i<sizeof(bad)/sizeof(*bad)+3;i++) {
         __asm__ volatile("brk #0\n mrs x9, nzcv\n str x9, [%0]\n brk #0"
-            :: "r"(&live_nzcv) : "x9","memory");
+            :: "r"(&live_nzcv) : "x9","cc","memory");
     }
     return NULL;
 }
@@ -66,6 +66,7 @@ int main(void) {
             assert(!memcmp(&before,&unchanged,sizeof(before)));
         }
         proposed=before;proposed.pc+=4;
+        if(!i)proposed.pc|=UINT64_C(0xab00000000000000);
         uint64_t flags=(i&1) ? UINT64_C(0x90000000) : UINT64_C(0x60000000);
         proposed.pstate=(before.pstate&UINT64_C(0x03001c00))|flags;
         assert(!set(target,&proposed,sizeof(proposed)));

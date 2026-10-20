@@ -10,7 +10,10 @@ static inline uint64_t hl_user_pstate(uint64_t pstate) {
     return pstate & HL_USER_PSTATE_MASK;
 }
 static inline int hl_user_regs_valid(uint64_t pc, uint64_t pstate) {
-    return !(pc & 3) && pc <= UINT64_C(0x0000ffffffffffff) &&
+    /* TCR.TBI0 is enabled. Preserve an ignored top-byte tag, while still
+     * rejecting non-user bits55:48 and misaligned instruction addresses. */
+    return !(pc & 3) &&
+           (pc & UINT64_C(0x00ffffffffffffff)) <= UINT64_C(0x0000ffffffffffff) &&
            pstate == hl_user_pstate(pstate);
 }
 #endif

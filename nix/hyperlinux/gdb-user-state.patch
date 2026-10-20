@@ -1,0 +1,127 @@
+--- a/src/gdb_stub.c
++++ b/src/gdb_stub.c
+@@ -20,6 +20,7 @@
+  * state) is protected by gdb_lock. The vCPU threads call handle_stop
+  * which blocks on gdb_resume_cond under gdb_lock.
+  */
++#include "hl_user_regs.h"
+ #include "gdb_stub.h"
+ #include "thread.h"
+ #include "hv_util.h"
+@@ -357,6 +358,14 @@
+ #define REG_OFF_FPCR    (784)            /* 784 */
+ #define REG_SNAPSHOT_SIZE 788
+ 
++static int user_snapshot_valid(const uint8_t *snapshot) {
++    uint64_t pc;
++    uint32_t pstate;
++    memcpy(&pc, snapshot + REG_OFF_PC, sizeof(pc));
++    memcpy(&pstate, snapshot + REG_OFF_CPSR, sizeof(pstate));
++    return hl_user_regs_valid(pc, pstate);
++}
++
+ /* Snapshot vCPU registers into thread_entry_t.gdb_reg_snapshot.
+  * MUST be called on the vCPU's owning thread. */
+ static void snapshot_vcpu_regs(thread_entry_t *t) {
+@@ -406,6 +415,13 @@
+ static void restore_vcpu_regs(thread_entry_t *t) {
+     hv_vcpu_t vcpu = t->vcpu;
+     const uint8_t *s = t->gdb_reg_snapshot;
++    /* Debug-enabled loopback is reachable by native guest sockets too.
++     * Reject a complete invalid snapshot before changing any live register. */
++    if (!user_snapshot_valid(s)) {
++        t->gdb_regs_dirty = 0;
++        fprintf(stderr, "hl: gdb: refused non-user register snapshot\n");
++        return;
++    }
+ 
+     /* X0-X30 */
+     for (int i = 0; i < 31; i++) {
+@@ -789,18 +805,20 @@
+     }
+ 
+     size_t hex_len = strlen(pkt);
+-    size_t decode_bytes = hex_len / 2;
+-    if (decode_bytes > REG_SNAPSHOT_SIZE) decode_bytes = REG_SNAPSHOT_SIZE;
+-
+-    /* Pad with zeros if GDB sends fewer registers */
+-    if (decode_bytes < REG_SNAPSHOT_SIZE)
+-        memset(t->gdb_reg_snapshot + decode_bytes, 0,
+-               REG_SNAPSHOT_SIZE - decode_bytes);
+-
+-    if (hex_decode(t->gdb_reg_snapshot, pkt, decode_bytes) < 0) {
++    if ((hex_len & 1) || hex_len / 2 > REG_SNAPSHOT_SIZE) {
++        rsp_reply_error(22);
++        return;
++    }
++    uint8_t proposed[REG_SNAPSHOT_SIZE] = {0};
++    if (hex_decode(proposed, pkt, hex_len / 2) < 0) {
+         rsp_reply_error(1);
+         return;
+     }
++    if (!user_snapshot_valid(proposed)) {
++        rsp_reply_error(22);
++        return;
++    }
++    memcpy(t->gdb_reg_snapshot, proposed, sizeof(proposed));
+     t->gdb_regs_dirty = 1;
+     rsp_reply_ok();
+ }
+@@ -848,13 +866,22 @@
+     uint8_t raw[16];
+     size_t hex_len = strlen(p);
+     size_t decode_len = hex_len / 2;
+-    if (decode_len > (size_t)nbytes) decode_len = (size_t)nbytes;
++    if ((hex_len & 1) || decode_len > (size_t)nbytes) {
++        rsp_reply_error(22);
++        return;
++    }
+     if (hex_decode(raw, p, decode_len) < 0) {
+         rsp_reply_error(1);
+         return;
+     }
+-
+-    memcpy(t->gdb_reg_snapshot + off, raw, decode_len);
++    uint8_t proposed[REG_SNAPSHOT_SIZE];
++    memcpy(proposed, t->gdb_reg_snapshot, sizeof(proposed));
++    memcpy(proposed + off, raw, decode_len);
++    if (!user_snapshot_valid(proposed)) {
++        rsp_reply_error(22);
++        return;
++    }
++    memcpy(t->gdb_reg_snapshot, proposed, sizeof(proposed));
+     t->gdb_regs_dirty = 1;
+     rsp_reply_ok();
+ }
+@@ -1216,7 +1243,14 @@
+         uint64_t addr = parse_hex(&p);
+         thread_entry_t *t = find_thread_for_tid(gdb.current_c_tid);
+         if (t) {
+-            memcpy(t->gdb_reg_snapshot + REG_OFF_PC, &addr, 8);
++            uint8_t proposed[REG_SNAPSHOT_SIZE];
++            memcpy(proposed, t->gdb_reg_snapshot, sizeof(proposed));
++            memcpy(proposed + REG_OFF_PC, &addr, 8);
++            if (!user_snapshot_valid(proposed)) {
++                rsp_reply_error(22);
++                return;
++            }
++            memcpy(t->gdb_reg_snapshot, proposed, sizeof(proposed));
+             t->gdb_regs_dirty = 1;
+         }
+     }
+@@ -1237,7 +1271,14 @@
+     if (pkt[0] != '\0' && t) {
+         const char *p = pkt;
+         uint64_t addr = parse_hex(&p);
+-        memcpy(t->gdb_reg_snapshot + REG_OFF_PC, &addr, 8);
++        uint8_t proposed[REG_SNAPSHOT_SIZE];
++        memcpy(proposed, t->gdb_reg_snapshot, sizeof(proposed));
++        memcpy(proposed + REG_OFF_PC, &addr, 8);
++        if (!user_snapshot_valid(proposed)) {
++            rsp_reply_error(22);
++            return;
++        }
++        memcpy(t->gdb_reg_snapshot, proposed, sizeof(proposed));
+         t->gdb_regs_dirty = 1;
+     }
+ 
