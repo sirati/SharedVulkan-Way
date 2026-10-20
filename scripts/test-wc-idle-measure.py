@@ -187,9 +187,45 @@ class Validation(unittest.TestCase):
             scripts.append(script)
             return fresh
         h.guest = guest
-        self.assertEqual(h.verify_signed_boot('compositor.log', 4321), fresh)
+        self.assertEqual(h.verify_signed_boot('compositor.log', {'length': 4321, 'prefix_sha256': 'a' * 64}), fresh)
         self.assertIn('$f.Seek(4321,', scripts[0])
-        self.assertIn('$f.Length -lt 4321', scripts[0])
+        self.assertIn('Prefix-Hash $f 4321', scripts[0])
+        self.assertIn('compositor log prefix changed', scripts[0])
+
+    def test_existing_log_is_always_snapshotted_without_process_inference(self):
+        h = m.Harness(config())
+        scripts = []
+        snapshot = {'length': 8000, 'prefix_sha256': 'a' * 64, 'file_id': '00000001:0000000000000002'}
+        def guest(script):
+            scripts.append(script)
+            return json.dumps(snapshot)
+        h.guest = guest
+        _, actual = h.compositor_log_offset()
+        self.assertEqual(actual, snapshot)
+        self.assertNotIn('Get-CimInstance', scripts[0])
+        self.assertIn('$length = $f.Length', scripts[0])
+        self.assertIn('Prefix-Hash $f $length', scripts[0])
+
+    def test_replaced_log_identity_is_checked_before_reading_suffix(self):
+        h = m.Harness(config())
+        def guest(script):
+            guard = script.index("if ([LogIdentity]::Read($f) -ne '00000001:0000000000000002')")
+            self.assertLess(guard, script.index('$f.Seek(8000,'))
+            raise m.Refused('compositor log file replaced during measurement')
+        h.guest = guest
+        with self.assertRaisesRegex(m.Refused, 'file replaced'):
+            h.verify_signed_boot('compositor.log', {
+                'length': 8000, 'prefix_sha256': 'a' * 64, 'file_id': '00000001:0000000000000002'})
+
+    def test_changed_or_truncated_log_refusal_prevents_stale_signing(self):
+        h = m.Harness(config())
+        def guest(script):
+            self.assertIn('Prefix-Hash $f 8000', script)
+            self.assertIn('$file.Length -lt $length', script)
+            raise m.Refused('compositor log prefix changed during measurement')
+        h.guest = guest
+        with self.assertRaisesRegex(m.Refused, 'prefix changed'):
+            h.verify_signed_boot('compositor.log', {'length': 8000, 'prefix_sha256': 'a' * 64})
 
     def test_key_probe_never_reads_secret_contents(self):
         h = m.Harness(config())

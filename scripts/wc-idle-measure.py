@@ -298,21 +298,85 @@ $dir = Join-Path $env:ProgramData 'waycompose\keys'
         broker_key_metadata(data)
         return data
 
+    @staticmethod
+    def log_prefix_script():
+        # Hash only the captured prefix, even if the compositor appends while
+        # we read. Existing log bytes never need to cross the management link.
+        return r"""
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class LogIdentity {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct Info {
+    public uint attributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME creation, access, write;
+    public uint volume, sizeHigh, sizeLow, links, indexHigh, indexLow;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+  public static string Read(FileStream file) {
+    Info info;
+    if (!GetFileInformationByHandle(file.SafeFileHandle, out info))
+      throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    return info.volume.ToString("x8") + ":" + info.indexHigh.ToString("x8") + info.indexLow.ToString("x8");
+  }
+}
+'@
+function Prefix-Hash($file, [long]$length) {
+  if ($file.Length -lt $length) { throw 'compositor log truncated during measurement' }
+  [void]$file.Seek(0, [IO.SeekOrigin]::Begin)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $buffer = New-Object byte[] 65536
+    $remaining = $length
+    while ($remaining -gt 0) {
+      $n = $file.Read($buffer, 0, [int][Math]::Min($remaining, $buffer.Length))
+      if ($n -le 0) { throw 'compositor log prefix disappeared' }
+      [void]$sha.TransformBlock($buffer, 0, $n, $buffer, 0)
+      $remaining -= $n
+    }
+    [void]$sha.TransformFinalBlock($buffer, 0, 0)
+    return ([BitConverter]::ToString($sha.Hash)).Replace('-', '').ToLowerInvariant()
+  } finally { $sha.Dispose() }
+}
+"""
+
     def compositor_log_offset(self):
         log = self.c['guest_home'].rstrip('\\/') + '\\AppData\\Local\\waycompose\\wc-compositor.log'
-        script = f"""
-$p = @(Get-CimInstance Win32_Process -Filter "Name='sv-guest.exe'" | Where-Object {{ $_.CommandLine -like '*--user-control*' }})
-if ($p.Count -gt 0 -and (Test-Path -LiteralPath {self.ps(log)})) {{
-  Write-Output (Get-Item -LiteralPath {self.ps(log)}).Length
-}} else {{ Write-Output 0 }}
+        # Do not infer freshness from process enumeration. Even an inactive
+        # compositor can leave a log, and a process query may miss an owner.
+        script = self.log_prefix_script() + f"""
+if (Test-Path -LiteralPath {self.ps(log)}) {{
+  $f = [IO.File]::Open({self.ps(log)}, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+  try {{
+    $length = $f.Length
+    @{{length=$length; prefix_sha256=(Prefix-Hash $f $length); file_id=[LogIdentity]::Read($f)}} | ConvertTo-Json -Compress
+  }} finally {{ $f.Dispose() }}
+}} else {{
+  @{{length=0; prefix_sha256='{hashlib.sha256(b'').hexdigest()}'; file_id=$null}} | ConvertTo-Json -Compress
+}}
 """
-        return log, int(self.guest(script).strip())
+        snapshot = json.loads(self.guest(script))
+        require(isinstance(snapshot.get('length'), int) and snapshot['length'] >= 0
+                and re.fullmatch('[0-9a-f]{64}', snapshot.get('prefix_sha256', ''))
+                and ((snapshot.get('file_id') is None and snapshot['length'] == 0)
+                     or re.fullmatch('[0-9a-f]{8}:[0-9a-f]{16}', snapshot.get('file_id') or '')),
+                'invalid compositor log snapshot')
+        return log, snapshot
 
-    def verify_signed_boot(self, log, offset):
-        script = f"""
+    def verify_signed_boot(self, log, snapshot):
+        offset = snapshot['length']
+        prefix = self.ps(snapshot['prefix_sha256'])
+        identity_check = (f"if ([LogIdentity]::Read($f) -ne {self.ps(snapshot['file_id'])}) {{ throw 'compositor log file replaced during measurement' }}"
+                          if snapshot.get('file_id') is not None else '')
+        script = self.log_prefix_script() + f"""
 $f = [IO.File]::Open({self.ps(log)}, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
 try {{
-  if ($f.Length -lt {offset}) {{ throw 'compositor log rotated during measurement' }}
+  {identity_check}
+  if ((Prefix-Hash $f {offset}) -ne {prefix}) {{ throw 'compositor log prefix changed during measurement' }}
   [void]$f.Seek({offset}, [IO.SeekOrigin]::Begin)
   $reader = New-Object IO.StreamReader($f)
   try {{ Write-Output $reader.ReadToEnd() }} finally {{ $reader.Dispose() }}
@@ -412,6 +476,7 @@ try {{
                 _, log = self.paths()
                 self.guest(f"if (Test-Path -LiteralPath {self.ps(log)}) {{ Remove-Item -LiteralPath {self.ps(log)} }}")
                 comp_log, comp_offset = self.compositor_log_offset()
+                (Path(out) / 'broker-log-snapshot.json').write_text(json.dumps(comp_offset, indent=2) + '\n')
                 owned = True
                 if mode == 'batch':
                     self.launch(['--session'])

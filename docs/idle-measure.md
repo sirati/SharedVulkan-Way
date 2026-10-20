@@ -53,8 +53,14 @@ installation. Insufficient metadata access is a refusal, not proof that
 the key is provisioned. Unidentified mapping entries for wcil are refused.
 Each run also requires a fresh compositor-log signing identity matching the
 configured Windows user, alongside the actual mapped wctest proxy. Only
-new log bytes after the run's offset count as signing evidence; a stale
-prior signing line cannot satisfy this check. An already running wctest session or dedicated
+new log bytes after the run's captured length count as signing evidence; a
+stale prior signing line cannot satisfy this check. The initial length is
+captured even when no compositor process is visible. The open handle's
+Windows volume/file identity and a hash of that exact prefix must still
+match when fresh bytes are read. Truncation, replacement
+with a different prefix, or log rotation causes a refusal, including a
+compositor restart that overwrites an old log. The harness does not erase
+or rotate a shared log to recover from that refusal. An already running wctest session or dedicated
 guest launcher causes a refusal, leaving it untouched. The watchdog checks
 host-to-guest ping and guest SSH every 30 seconds. A failed health check
 aborts management commands without retrying or resetting the guest.
