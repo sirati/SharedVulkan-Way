@@ -208,6 +208,8 @@ let
       ${nativeFaultClients}/bin/hl-atomic-fault-check
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
+      "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-write
+      "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-exec
     '';
   };
 in {
