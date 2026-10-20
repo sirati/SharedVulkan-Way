@@ -99,11 +99,15 @@ pub struct Picture {
 }
 #[derive(Clone, Debug)]
 pub struct Reference {
+    pub h264: H264Reference,
     pub slot: u32,
     pub picture: Picture,
 }
 #[derive(Clone)]
 pub struct Decode {
+    pub h264: H264Picture,
+    pub reset_before: bool,
+    pub begin_references: Arc<[Reference]>,
     pub session: Arc<Session>,
     pub configuration: Configuration,
     pub source_buffer: u64,
@@ -115,6 +119,8 @@ pub struct Decode {
     pub references: Arc<[Reference]>,
 }
 struct Scope {
+    reset: bool,
+    begin_references: Arc<[Reference]>,
     session: Arc<Session>,
     sets: Arc<ParameterSets>,
     jobs: Vec<Decode>,
@@ -394,6 +400,8 @@ impl NativeVideo {
         self.scopes.insert(
             command,
             Scope {
+                reset: false,
+                begin_references: Arc::from([]),
                 session: p.session.clone(),
                 sets: p.sets.clone(),
                 jobs: vec![],
@@ -425,6 +433,10 @@ impl NativeVideo {
         })
     }
     pub fn record(&mut self, command: u64, mut job: Decode, sps: u8, pps: u8) -> VideoResult<()> {
+        job.h264.validate()?;
+        if job.h264.sps_id != sps || job.h264.pps_id != pps {
+            return invalid();
+        }
         job.configuration = self.configuration(command, sps, pps)?;
         let scope = self
             .scopes
@@ -458,6 +470,9 @@ impl NativeVideo {
             }
             validate_picture(&r.picture, &scope.session)?;
         }
+        job.reset_before = scope.reset;
+        job.begin_references = scope.begin_references.clone();
+        scope.reset = false;
         scope.jobs.push(job);
         Ok(())
     }
@@ -578,5 +593,132 @@ mod tests {
         assert!(unsafe { v.update_parameters(p, 1, &[], &[]) }.is_ok());
         assert!(unsafe { v.update_parameters(p, 1, &[], &[]) }.is_err());
         assert_eq!(v.parameters[&p].sequence, 1);
+    }
+}
+
+/// Owned picture syntax used to compare explicit Vulkan DPB state with the
+/// decoder's implicit reference state at submission time.
+#[derive(Clone, Debug)]
+pub struct H264Picture {
+    pub idr_pic_flag: bool,
+    pub field_pic_flag: bool,
+    pub bottom_field_flag: bool,
+    pub is_reference: bool,
+    pub is_intra: bool,
+    pub frame_num: u16,
+    pub pic_order_cnt: [i32; 2],
+    pub idr_pic_id: u16,
+    pub sps_id: u8,
+    pub pps_id: u8,
+}
+impl H264Picture {
+    pub fn from_std(p: &vk::native::StdVideoDecodeH264PictureInfo) -> VideoResult<Self> {
+        if p.flags.complementary_field_pair() != 0
+            || p.flags._bitfield_1.get(6, 2) != 0
+            || p.reserved1 != 0
+            || p.reserved2 != 0
+        {
+            return unsupported();
+        }
+        let result = Self {
+            idr_pic_flag: p.flags.IdrPicFlag() != 0,
+            field_pic_flag: p.flags.field_pic_flag() != 0,
+            bottom_field_flag: p.flags.bottom_field_flag() != 0,
+            is_reference: p.flags.is_reference() != 0,
+            is_intra: p.flags.is_intra() != 0,
+            frame_num: p.frame_num,
+            pic_order_cnt: p.PicOrderCnt,
+            idr_pic_id: p.idr_pic_id,
+            sps_id: p.seq_parameter_set_id,
+            pps_id: p.pic_parameter_set_id,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+    fn validate(&self) -> VideoResult<()> {
+        if self.field_pic_flag
+            || self.bottom_field_flag
+            || self.sps_id > 31
+            || (self.idr_pic_flag && (!self.is_intra || !self.is_reference || self.frame_num != 0))
+        {
+            return unsupported();
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug)]
+pub struct H264Reference {
+    pub frame_num: u16,
+    pub pic_order_cnt: [i32; 2],
+    pub long_term: bool,
+}
+impl H264Reference {
+    pub fn from_std(r: &vk::native::StdVideoDecodeH264ReferenceInfo) -> VideoResult<Self> {
+        if r.flags.top_field_flag() != 0
+            || r.flags.bottom_field_flag() != 0
+            || r.flags.is_non_existing() != 0
+            || r.flags._bitfield_1.get(4, 4) != 0
+            || r.reserved != 0
+        {
+            return unsupported();
+        }
+        Ok(Self {
+            frame_num: r.FrameNum,
+            pic_order_cnt: r.PicOrderCnt,
+            long_term: r.flags.used_for_long_term_reference() != 0,
+        })
+    }
+}
+impl NativeVideo {
+    pub fn begin_references(
+        &mut self,
+        command: u64,
+        references: Arc<[Reference]>,
+    ) -> VideoResult<()> {
+        let scope = self
+            .scopes
+            .get_mut(&command)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        if !scope.jobs.is_empty() || references.len() > scope.session.dpb_slots as usize {
+            return invalid();
+        }
+        let mut slots = std::collections::HashSet::new();
+        for r in references.iter() {
+            if r.slot >= scope.session.dpb_slots || !slots.insert(r.slot) {
+                return invalid();
+            }
+            validate_picture(&r.picture, &scope.session)?;
+        }
+        scope.begin_references = references;
+        Ok(())
+    }
+    pub fn reset_scope(&mut self, command: u64) -> VideoResult<()> {
+        let scope = self
+            .scopes
+            .get_mut(&command)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        scope.reset = true;
+        scope.begin_references = Arc::from([]);
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod syntax_tests {
+    use super::*;
+    #[test]
+    fn progressive_picture_metadata_is_owned_and_fields_are_refused() {
+        let mut p: vk::native::StdVideoDecodeH264PictureInfo = unsafe { std::mem::zeroed() };
+        p.flags.set_IdrPicFlag(1);
+        p.flags.set_is_intra(1);
+        p.flags.set_is_reference(1);
+        p.PicOrderCnt = [4, 4];
+        let owned = H264Picture::from_std(&p).unwrap();
+        p.PicOrderCnt = [9, 9];
+        assert_eq!(owned.pic_order_cnt, [4, 4]);
+        p.flags.set_field_pic_flag(1);
+        assert!(H264Picture::from_std(&p).is_err());
+        p.flags.set_field_pic_flag(0);
+        p.flags.set_complementary_field_pair(1);
+        assert!(H264Picture::from_std(&p).is_err());
     }
 }
