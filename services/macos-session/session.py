@@ -13,6 +13,8 @@ from urllib.parse import quote
 from dbus_next import Message, MessageType
 from bus import SessionBus as MessageBus
 
+STARTUP_TIMEOUT = 30
+
 
 def private_directory(path):
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -64,6 +66,20 @@ async def ready(root):
             bus.disconnect()
 
 
+async def wait_for_startup(check, children, deadline):
+    """Wait within one monotonic startup budget, including a blocked probe."""
+    try:
+        async with asyncio.timeout_at(deadline):
+            while True:
+                if any(child.returncode is not None for child in children):
+                    raise RuntimeError('Native service exited before readiness')
+                if await check():
+                    return
+                await asyncio.sleep(0.05)
+    except TimeoutError as error:
+        raise RuntimeError('Native services did not become ready within the startup deadline') from error
+
+
 async def launchctl(*arguments):
     process = await asyncio.create_subprocess_exec('/bin/launchctl', *arguments,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
@@ -79,9 +95,12 @@ async def ensure():
     if sys.platform != 'darwin':
         raise SystemExit('Native macOS services only')
     root = runtime_directory()
-    if await asyncio.wait_for(ready(root), 2):
-        print(root)
-        return
+    try:
+        if await asyncio.wait_for(ready(root), 2):
+            print(root)
+            return
+    except TimeoutError:
+        pass
     domain = f'gui/{os.getuid()}'
     service = domain + '/org.waycompose.session-services'
     if await launchctl('print', service) != 0:
@@ -90,12 +109,9 @@ async def ensure():
             if await launchctl('print', service) != 0:
                 raise SystemExit('Cannot register native user services with launchd')
     await launchctl('kickstart', service)
-    for _ in range(100):
-        if await asyncio.wait_for(ready(root), 2):
-            print(root)
-            return
-        await asyncio.sleep(0.1)
-    raise SystemExit('Native user services did not become ready')
+    deadline = asyncio.get_running_loop().time() + STARTUP_TIMEOUT
+    await wait_for_startup(lambda: ready(root), [], deadline)
+    print(root)
 
 
 async def main():
@@ -139,34 +155,26 @@ load-module module-coreaudio-detect
     children = []
     waiters = []
     bus = None
+    deadline = loop.time() + STARTUP_TIMEOUT
     try:
         for argv in ([os.environ['WC_DBUS_DAEMON'], '--nofork', f'--config-file={config}'],
                      [os.environ['WC_PULSEAUDIO'], '--daemonize=no', '--use-pid-file=no',
                       '--exit-idle-time=-1', '--disallow-exit', '-n', f'--file={pulse_config}']):
             children.append(await asyncio.create_subprocess_exec(*argv, env=env))
-        for _ in range(100):
-            if any(child.returncode is not None for child in children):
-                raise RuntimeError('Native service exited before readiness')
-            if (root / 'bus').exists() and (root / 'pulse/native').exists():
-                break
-            await asyncio.sleep(0.05)
-        else:
-            raise RuntimeError('Native services did not become ready')
+        async def sockets_ready():
+            return (root / 'bus').exists() and (root / 'pulse/native').exists()
+        await wait_for_startup(sockets_ready, children, deadline)
         children.append(await asyncio.create_subprocess_exec(sys.executable, os.environ['WC_PORTAL'], env=env))
-        bus = await MessageBus(bus_address=env['DBUS_SESSION_BUS_ADDRESS']).connect()
-        for _ in range(100):
-            names_ready = True
+        async with asyncio.timeout_at(deadline):
+            bus = await MessageBus(bus_address=env['DBUS_SESSION_BUS_ADDRESS']).connect()
+        async def portal_ready():
             for name in ('org.freedesktop.portal.Desktop', 'org.freedesktop.impl.portal.desktop.waycompose'):
                 reply = await bus.call(Message(destination='org.freedesktop.DBus', path='/org/freedesktop/DBus',
                     interface='org.freedesktop.DBus', member='NameHasOwner', signature='s', body=[name]))
-                names_ready &= reply.message_type != MessageType.ERROR and reply.body == [True]
-            if names_ready:
-                break
-            if children[-1].returncode is not None:
-                raise RuntimeError('Portal exited before readiness')
-            await asyncio.sleep(0.05)
-        else:
-            raise RuntimeError('Portal did not acquire its bus name')
+                if reply.message_type == MessageType.ERROR or reply.body != [True]:
+                    return False
+            return True
+        await wait_for_startup(portal_ready, children, deadline)
         # Publish only after every service is ready. The application factory must
         # still verify socket connectivity, since service death removes this file.
         ready = root / 'ready'

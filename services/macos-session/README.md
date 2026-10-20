@@ -28,6 +28,12 @@ repository asset or a target-machine fetch. The result also exposes
 `hostTools` so its Mach-O executable and package closure can be inspected
 before copying the realized service package to the target.
 
+Startup has one monotonic 30-second budget for native sockets, bus
+connection and portal ownership. `--ensure` uses the same bounded readiness
+window. A child exit fails immediately; a stalled readiness call is cancelled
+at the deadline and the supervisor cleans up its children without publishing
+readiness.
+
 The module installs one Aqua LaunchAgent, `org.waycompose.session-services`.
 The package also contains its plist for deployments without nix-darwin.
 Installation sources do not load or change a live service. Do not install the
