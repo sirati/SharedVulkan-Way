@@ -70,3 +70,15 @@ read-only and PROT_NONE denial on genuine native read-only pages.
 syscalls against O_RDONLY, PROT_READ and PROT_NONE shared views. It must also
 pass under the integrated runtime before native acceptance is claimed. Its
 gettimeofday check explicitly invokes the syscall to avoid a vDSO write.
+
+Guest metadata copies use `mach_vm_read_overwrite` directly into their existing
+caller destination. Strings copy into their existing result buffer before
+scanning it. These kernel operations report an invalid or truncated source or
+destination as a copy failure, which syscall callers translate to EFAULT.
+They add no frame payload staging. Native scalar, vectored and message I/O
+continues to use the pinned mapping directly in the kernel.
+`copy-fault-check.c` is a native Darwin regression for deterministic and
+concurrent truncate during these production copy operations. The Linux ELF
+`shared-access-client.c` also covers truncated output and pathname buffers.
+External futex atomic fault isolation is a separate pending gate; kernel copies
+alone do not make native CPU atomics on a truncated file safe.

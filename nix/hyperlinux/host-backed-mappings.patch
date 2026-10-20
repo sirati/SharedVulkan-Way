@@ -237,18 +237,19 @@ index bbf5a81..ff3d999 100644
 
      switch (cmd) {
 diff --git a/src/guest.c b/src/guest.c
-index 1fa8b35..79aa517 100644
+index 1fa8b35..84d2e69 100644
 --- a/src/guest.c
 +++ b/src/guest.c
-@@ -32,6 +32,7 @@
+@@ -32,6 +32,8 @@
   *                           mixed permissions within a 2MB block (W^X)
   */
  #include "guest.h"
 +#include "hl_shared.h"
++#include "hl_copy.h"
  #include "syscall_internal.h"  /* hl_verbose */
  #include "thread.h"            /* synchronized vCPU ownership */
 
-@@ -612,6 +613,7 @@ void guest_destroy(guest_t *g) {
+@@ -612,6 +614,7 @@ void guest_destroy(guest_t *g) {
          if (main_thread)
              thread_deactivate(main_thread);
      }
@@ -256,7 +257,7 @@ index 1fa8b35..79aa517 100644
      /* Unmap overflow segments before VM teardown (hv_vm_unmap requires
       * the VM to still exist). Host munmap is safe regardless. */
      for (int i = 0; i < g->noverflow; i++) {
-@@ -619,7 +621,7 @@ void guest_destroy(guest_t *g) {
+@@ -619,7 +622,7 @@ void guest_destroy(guest_t *g) {
          munmap(g->overflow[i].host_base, g->overflow[i].size);
      }
      g->noverflow = 0;
@@ -265,7 +266,7 @@ index 1fa8b35..79aa517 100644
      if (g->host_base) {
          munmap(g->host_base, g->guest_size);
          g->host_base = NULL;
-@@ -694,8 +696,11 @@ guest_set_extra_resolve(guest_extra_resolve_fn fn)
+@@ -694,8 +697,11 @@ guest_set_extra_resolve(guest_extra_resolve_fn fn)
      g_extra_resolve = fn;
  }
 
@@ -278,7 +279,7 @@ index 1fa8b35..79aa517 100644
      if (g_extra_resolve) {
          void *ep = g_extra_resolve(gva, avail);
          if (ep)
-@@ -752,14 +757,19 @@ static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
+@@ -752,14 +758,19 @@ static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
  }
 
  void *guest_ptr(const guest_t *g, uint64_t gva) {
@@ -300,7 +301,7 @@ index 1fa8b35..79aa517 100644
      /* Loop across 2MB block boundaries. Each gva_resolve() call returns
       * the host pointer and available bytes to the end of the current
       * 2MB block. Multi-block reads (e.g., large structs spanning a
-@@ -767,7 +777,7 @@ int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
+@@ -767,32 +778,34 @@ int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
      size_t copied = 0;
      while (copied < len) {
          uint64_t avail;
@@ -309,7 +310,11 @@ index 1fa8b35..79aa517 100644
          if (!ptr) return -1;
          size_t chunk = len - copied;
          if (chunk > avail) chunk = avail;
-@@ -778,11 +788,12 @@ int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
+-        memcpy((uint8_t *)dst + copied, ptr, chunk);
++        if (hl_wc_copy((uint8_t *)dst + copied, ptr, chunk) < 0) return -1;
+         copied += chunk;
+     }
+     return 0;
  }
 
  int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len) {
@@ -323,7 +328,11 @@ index 1fa8b35..79aa517 100644
          if (!ptr) return -1;
          size_t chunk = len - copied;
          if (chunk > avail) chunk = avail;
-@@ -793,6 +804,7 @@ int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len) {
+-        memcpy(ptr, (const uint8_t *)src + copied, chunk);
++        if (hl_wc_copy(ptr, (const uint8_t *)src + copied, chunk) < 0) return -1;
+         copied += chunk;
+     }
+     return 0;
  }
 
  int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
@@ -331,7 +340,7 @@ index 1fa8b35..79aa517 100644
      if (max == 0) return -1; /* Prevent underflow in max - 1 */
      size_t copied = 0;
      size_t limit = max - 1;
-@@ -802,7 +814,7 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
+@@ -802,20 +815,19 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
       * region and scans for NUL within the available bytes. */
      while (copied < limit) {
          uint64_t avail;
@@ -340,6 +349,27 @@ index 1fa8b35..79aa517 100644
          if (!ptr) break;
 
          size_t remain = limit - copied;
+         size_t chunk = avail < remain ? avail : remain;
+-        const char *src = (const char *)ptr;
+-
+-        const void *nul = memchr(src, '\0', chunk);
+-        if (nul) {
+-            size_t len = (const char *)nul - src;
+-            memcpy(dst + copied, src, len + 1); /* Include NUL */
+-            return (int)(copied + len);
+-        }
+-        memcpy(dst + copied, src, chunk);
++        /* Do not scan a host pointer backed by a truncatable file. Copy
++         * directly into the existing result buffer, one guest page at a time.
++         * A NUL before an inaccessible following page must still succeed. */
++        size_t page_remain = 4096 - ((gva + copied) & 4095);
++        if (chunk > page_remain) chunk = page_remain;
++        if (hl_wc_copy(dst + copied, ptr, chunk) < 0) break;
++        const char *nul = memchr(dst + copied, '\0', chunk);
++        if (nul) return (int)(nul - dst);
+         copied += chunk;
+     }
+
 @@ -827,6 +839,7 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
  /* ---------- guest_reset ---------- */
 
@@ -521,7 +551,7 @@ index 9d1b246..9e15c29 100644
          if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
          return proc_synthetic_fd(buf, len);
 diff --git a/src/syscall.c b/src/syscall.c
-index a0f5f67..6cf1e25 100644
+index a0f5f67..166936d 100644
 --- a/src/syscall.c
 +++ b/src/syscall.c
 @@ -19,6 +19,8 @@
@@ -558,7 +588,17 @@ index a0f5f67..6cf1e25 100644
 
      /* Linux rejects zero-length mmap */
      if (length == 0) return -LINUX_EINVAL;
-@@ -960,6 +966,8 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
+@@ -941,6 +947,9 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
+             /* sys_mmap_high_va modifies page tables, regions, and
+              * overflow segments — thread-safe because the caller
+              * (syscall_dispatch) holds mmap_lock around sys_mmap. */
++            if (is_noreplace && guest_region_overlaps(g, addr, addr + length))
++                return -LINUX_EEXIST;
++            if (hl_wc_unmap(g, addr, length) < 0) return -LINUX_ENOMEM;
+             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset);
+         }
+         result_off = off;
+@@ -960,6 +969,8 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
              }
          }
 
@@ -567,7 +607,7 @@ index a0f5f67..6cf1e25 100644
          /* Remove any existing region coverage in the fixed range */
          guest_region_remove(g, result_off, result_off + length);
 
-@@ -1155,6 +1163,7 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
+@@ -1155,6 +1166,7 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
  /* ---------- Main dispatch ---------- */
 
  int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
@@ -575,7 +615,7 @@ index a0f5f67..6cf1e25 100644
      uint64_t x0, x1, x2, x3, x4, x5, x8;
 
      hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
-@@ -1289,6 +1298,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1289,6 +1301,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          /* Linux returns EINVAL for non-page-aligned address or zero length */
          if ((unmap_addr & 4095) || x1 == 0) { result = -LINUX_EINVAL; break; }
          uint64_t unmap_len = (x1 + 4095) & ~4095ULL;
@@ -583,7 +623,7 @@ index a0f5f67..6cf1e25 100644
          if (unmap_len == 0) { result = -LINUX_EINVAL; break; }  /* overflow */
          if (unmap_addr > UINT64_MAX - unmap_len) {
              result = -LINUX_EINVAL;
-@@ -1296,6 +1306,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1296,6 +1309,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          }
          pthread_mutex_lock(&mmap_lock);
 
@@ -592,7 +632,7 @@ index a0f5f67..6cf1e25 100644
          if (unmap_addr > GUEST_USER_VA_MAX && g->kbuf_base) {
              /* Kernel VA (TTBR1 kbuf): zero the backing memory and
               * remove region tracking. PTEs remain valid — kbuf L2
-@@ -1421,6 +1433,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1421,6 +1436,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          }
          pthread_mutex_lock(&mmap_lock);
 
@@ -601,7 +641,7 @@ index a0f5f67..6cf1e25 100644
          if (mprot_addr > GUEST_USER_VA_MAX && g->kbuf_base) {
              /* Kbuf (TTBR1 kernel VA): update page permissions via
               * kbuf page table helpers. */
-@@ -1526,12 +1540,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1526,12 +1543,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          break;
 
      /* ---- Identity and info syscalls ---- */
@@ -618,7 +658,7 @@ index a0f5f67..6cf1e25 100644
      case SYS_gettimeofday:
          result = sys_gettimeofday(g, x0, x1);
          break;
-@@ -2000,8 +2012,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2000,8 +2015,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          result = 0;  /* Stub: pretend success */
          break;
      case SYS_getresuid: {
@@ -628,7 +668,7 @@ index a0f5f67..6cf1e25 100644
          if ((x0 && guest_write(g, x0, &uid, 4) < 0) ||
              (x1 && guest_write(g, x1, &uid, 4) < 0) ||
              (x2 && guest_write(g, x2, &uid, 4) < 0)) {
-@@ -2012,7 +2023,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2012,7 +2026,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          break;
      }
      case SYS_getresgid: {
@@ -637,7 +677,7 @@ index a0f5f67..6cf1e25 100644
          if ((x0 && guest_write(g, x0, &gid, 4) < 0) ||
              (x1 && guest_write(g, x1, &gid, 4) < 0) ||
              (x2 && guest_write(g, x2, &gid, 4) < 0)) {
-@@ -2274,13 +2285,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2274,13 +2288,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          char template[] = "/tmp/hl-memfd-XXXXXX";
          int fd = mkstemp(template);
          if (fd < 0) { result = linux_errno(); break; }
@@ -663,7 +703,7 @@ index a0f5f67..6cf1e25 100644
          break;
      }
      case SYS_mlock:
-@@ -2288,9 +2305,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2288,9 +2308,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          result = 0;  /* Stub: pretend success */
          break;
      case SYS_msync: {

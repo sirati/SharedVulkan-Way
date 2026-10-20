@@ -10,6 +10,8 @@ hlCross.overrideAttrs (old: {
   src = import ./source.nix;
   patches = (old.patches or [ ]) ++ [ ./host-backed-mappings.patch ];
   postPatch = (old.postPatch or "") + ''
+    cp ${./hl_copy.c} src/hl_copy.c
+    cp ${./hl_copy.h} src/hl_copy.h
     cp ${./hl_shared.c} src/hl_shared.c
     cp ${./hl_shared.h} src/hl_shared.h
     cp ${./hl_seals.c} src/hl_seals.c

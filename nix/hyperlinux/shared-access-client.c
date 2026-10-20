@@ -41,6 +41,10 @@ int main(void) {
     assert(!syscall(SYS_gettimeofday,map,NULL));
     assert(write(pair[0],"y",1)==1);assert(readv(pair[1],&iov,1)==1);
     assert(*(char *)map=='y');close(pair[0]);close(pair[1]);
+    assert(!munmap(map,16384));
+    map=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,rw,0);assert(map!=MAP_FAILED);
+    assert(!ftruncate(rw,0));output_denied(map);
+    errno=0;assert(syscall(SYS_openat,AT_FDCWD,map,O_RDONLY,0)==-1 && errno==EFAULT);
     assert(!munmap(map,16384));close(rw);
     puts("shared-access-client: O_RDONLY, PROT_READ, PROT_NONE EFAULT and vectored/message direction passed");
 }
