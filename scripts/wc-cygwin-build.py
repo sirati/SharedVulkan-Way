@@ -157,6 +157,15 @@ def build(root, bridge_dir=None):
         if not (bridge / 'wc_cygwin_link.dll').is_file() or not (bridge / 'libwc_cygwin_link.dll.a').is_file():
             raise RuntimeError('build native wc-cygwin-link for x86_64-pc-windows-gnu first')
         native_sources = (REPO / 'crates/wc-cygwin-link/src/lib.rs',
+                          REPO / 'crates/wc-cygwin-link/src/stream_bridge.rs',
+                          REPO / 'crates/wc-handle/src/bar_stream.rs',
+                          REPO / 'crates/wc-handle/src/bar_lease.rs',
+                          REPO / 'crates/wc-handle/src/ivshmem.rs',
+                          REPO / 'crates/wc-handle/src/lib.rs',
+                          REPO / 'crates/sv-transport/src/wlbytes.rs',
+                          REPO / 'crates/sv-transport/src/ring.rs',
+                          REPO / 'crates/sv-transport/src/park.rs',
+                          REPO / 'crates/sv-transport/src/vdoorbell.rs',
                           REPO / 'crates/wc-cygwin-link/Cargo.toml')
         if any(file.stat().st_mtime_ns > (bridge / 'wc_cygwin_link.dll').stat().st_mtime_ns
                for file in native_sources):
@@ -164,8 +173,8 @@ def build(root, bridge_dir=None):
         native_hashes = {str(file.relative_to(REPO)): digest(file) for file in native_sources}
         (output / 'bar-posix.def').write_text(
             'LIBRARY cygwc-posix-0.dll\nEXPORTS\n'
-            'mmap\nmunmap\nclose\ndup\ndup2\nfcntl\nftruncate\nos_create_anonymous_file\n'
-            'wc_cygwin_fd_words\nwc_cygwin_fd_from_words\nwc_cygwin_ring_enabled\n')
+            'mmap\nmunmap\nclose\nfclose\ndup\ndup2\nfcntl\nftruncate\nos_create_anonymous_file\n'
+            'pipe\npipe2\nwc_cygwin_fd_words\nwc_cygwin_fd_from_words\nwc_cygwin_ring_enabled\n')
         compile(INTEGRATION / 'bar-posix.c', output / 'bar-posix.o')
         link([output / 'bar-posix.o', output / 'bar-posix.def', bridge / 'libwc_cygwin_link.dll.a'],
              output / 'cygwc-posix-0.dll', shared=True,
@@ -277,6 +286,41 @@ def build(root, bridge_dir=None):
         for function in ('mmap', 'munmap', 'close', 'ftruncate', 'os_create_anonymous_file'):
             if function not in probe_imports.get('cygwc-posix-0.dll', []):
                 raise RuntimeError(f'lease fixture bypasses POSIX boundary: {function}')
+        # Unchanged upstream clipboard tools. Only generated protocol/config
+        # files live in the build directory; application sources are not edited.
+        run(['tar', '-xf', root / 'wl-clipboard-2.3.0.tar.gz', '-C', root])
+        clipboard_source = root / 'wl-clipboard-2.3.0/src'
+        clipboard_output = output / 'clipboard'
+        clipboard_output.mkdir(exist_ok=True)
+        (clipboard_output / 'config.h').write_text(
+            '#define PROJECT_VERSION "2.3.0"\n#define HAVE_XDG_SHELL 1\n'
+            '#define HAVE_GTK_PRIMARY_SELECTION 1\n#define HAVE_WLR_DATA_CONTROL 1\n#define HAVE_GTK_SHELL 1\n')
+        clipboard_flags = ['-iquote', str(clipboard_output), '-I' + str(clipboard_source)]
+        clipboard_objects = []
+        protocols = {'xdg-shell': root / 'xdg-shell.xml',
+                     'gtk-primary-selection': clipboard_source / 'protocol/gtk-primary-selection.xml',
+                     'wlr-data-control': clipboard_source / 'protocol/wlr-data-control-unstable-v1.xml',
+                     'gtk-shell': clipboard_source / 'protocol/gtk-shell.xml'}
+        for name, xml in protocols.items():
+            header = clipboard_output / (name + '.h')
+            code = clipboard_output / (name + '.c')
+            run(['wayland-scanner', 'client-header', xml, header])
+            run(['wayland-scanner', 'private-code', xml, code])
+            obj = clipboard_output / (name + '.o')
+            compile(code, obj, clipboard_flags)
+            clipboard_objects.append(obj)
+        for file in sorted([*clipboard_source.glob('util/*.c'), *clipboard_source.glob('types/*.c')]):
+            obj = clipboard_output / (file.parent.name + '-' + file.stem + '.o')
+            compile(file, obj, clipboard_flags)
+            clipboard_objects.append(obj)
+        for name in ('wl-copy', 'wl-paste'):
+            obj = clipboard_output / (name + '.o')
+            compile(clipboard_source / (name + '.c'), obj, clipboard_flags)
+            link([obj, *clipboard_objects], output / (name + '.exe'),
+                 libraries=['-lwc-cygwin-posix', '-lwayland-client'])
+            imports = pe_imports(output / (name + '.exe'), symbols=True)
+            if not any(function in imports.get('cygwc-posix-0.dll', []) for function in ('pipe', 'pipe2')):
+                raise RuntimeError(f'{name} bypasses the BAR stream pipe boundary')
         library_imports = pe_imports(dll, symbols=True)
         for function in ('close', 'fcntl', 'wc_cygwin_fd_from_words'):
             if function not in library_imports.get('cygwc-posix-0.dll', []):
@@ -288,7 +332,7 @@ def build(root, bridge_dir=None):
     artifacts = [app, dll, output / 'abi.exe', output / 'fd-probe.exe']
     if bridge is not None:
         artifacts.extend([bridge / 'wc_cygwin_link.dll', output / 'cygwc-posix-0.dll',
-                          output / 'weston-simple-shm.exe', output / 'posix-probe.exe', output / 'lease-probe.exe'])
+                          output / 'weston-simple-shm.exe', output / 'posix-probe.exe', output / 'lease-probe.exe', output / 'wl-copy.exe', output / 'wl-paste.exe', sysroot / 'usr/bin/cat.exe'])
     helper = sysroot / 'usr/bin/cygwin-console-helper.exe'
     if helper.exists():
         artifacts.append(helper)
@@ -304,7 +348,7 @@ def build(root, bridge_dir=None):
     if 'cygwin1.dll' not in {name.lower() for name in pe_imports(app)}:
         raise RuntimeError('application does not import the genuine Cygwin runtime')
     manifest = {'packages': packages, 'sources': sources, 'application_source_unmodified': True,
-                'integration_files': {p.name: digest(p) for p in INTEGRATION.glob('*.c')},
+                'integration_files': {p.name: digest(p) for p in INTEGRATION.iterdir() if p.suffix in ('.c', '.inc')},
                 'tool_versions': {tool: subprocess.check_output([tool, '--version'], stderr=subprocess.STDOUT, text=True).strip() for tool in ('clang', 'ld.lld', 'wayland-scanner')},
                 'transport': ('broker-lent BAR rings and doorbell; BAR pool descriptors in-band; kernel SCM_RIGHTS unsupported'
                               if bridge is not None else 'Cygwin AF_LOCAL, descriptors explicitly unsupported'),

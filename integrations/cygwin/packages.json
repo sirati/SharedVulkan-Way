@@ -30,5 +30,25 @@
   "gcc-core": {
     "path": "x86_64/release/gcc/gcc-core/gcc-core-14.4.0-1-x86_64.tar.zst",
     "sha512": "c463f27075353dbbbb05878a3695c2651a81da0032f75b71f121dece745aa3d646b7f03180618844aa5372be358d5dc2e0efc0fffde80f9216eae3ef5b3d963e"
+  },
+  "coreutils": {
+    "path": "x86_64/release/coreutils/coreutils-9.0-1.tar.xz",
+    "sha512": "530f47640d878f5953580f3556c492a93786191abe573322026b70206a46c7f17d05927784db3e7f2c044d1555f35941880316f7288b887eaec770a9eda4c687"
+  },
+  "libiconv2": {
+    "path": "x86_64/release/libiconv/libiconv2/libiconv2-1.19-2-x86_64.tar.xz",
+    "sha512": "a1b23e24e0a495e7163923bcf40a4b933403e0826cfc0d9bde785bc92c909b8c4fb94b1e6b2c0242f4328a723855e72ff3baab9f557ef855b7fe7a7d901b0943"
+  },
+  "libintl8": {
+    "path": "x86_64/release/gettext/libintl8/libintl8-0.22.5-1.tar.xz",
+    "sha512": "370a19af888bc7c9ed95cf8ade0d36d5e7cdb634abdebcba260cad61fa9a4cc05b5e748e315c9709f66861e8756b227d6757d529846591189e19ee2b2d00002d"
+  },
+  "libgmp10": {
+    "path": "x86_64/release/gmp/libgmp10/libgmp10-6.3.0-1.tar.zst",
+    "sha512": "947cd56e1945ddf180622b453f17e6655b4ee3e79fcc91238370a8826b88cd07c31d939f1ed7b87d91344d46fee90af2560105267a9207dcca800cba72459191"
+  },
+  "libattr1": {
+    "path": "x86_64/release/attr/libattr1/libattr1-2.5.2-2-x86_64.tar.xz",
+    "sha512": "345b8f84b9c4df2eeea5e211dbaff5e0382aaee788435e1f4cc69f546e1603bbb45e9baec02a37d935674fcd55fb782d924c3a1540d2f829bde4969c96945ce4"
   }
 }
