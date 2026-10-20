@@ -4,6 +4,7 @@
 #[cfg(target_os = "linux")]
 mod host {
     use std::io::{self, Write};
+    use std::net::Shutdown;
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
@@ -110,9 +111,156 @@ mod host {
         Ok(n as usize)
     }
 
+    const QUEUE_BYTES: usize = 65536;
+
+    struct Relay {
+        channel: ByteChannel,
+        socket: UnixStream,
+        to_socket: Vec<u8>,
+        to_ring: Vec<u8>,
+        ring_eof: bool,
+        socket_eof: bool,
+        write_shutdown: bool,
+        sent_eof: bool,
+        requests: usize,
+        replies: usize,
+    }
+    impl Relay {
+        fn new(channel: ByteChannel, socket: UnixStream) -> io::Result<Self> {
+            socket.set_nonblocking(true)?;
+            Ok(Self {
+                channel,
+                socket,
+                to_socket: Vec::new(),
+                to_ring: Vec::new(),
+                ring_eof: false,
+                socket_eof: false,
+                write_shutdown: false,
+                sent_eof: false,
+                requests: 0,
+                replies: 0,
+            })
+        }
+        fn service(
+            &mut self,
+            control: &Control,
+            require_dead: bool,
+        ) -> Result<bool, Box<dyn std::error::Error>> {
+            let mut buf = [0u8; QUEUE_BYTES];
+            // Stop reading at the queue bound. Ring credit backpressures this
+            // client while the other connections continue independently.
+            while !self.ring_eof && self.to_socket.len() < QUEUE_BYTES {
+                let remaining = QUEUE_BYTES - self.to_socket.len();
+                match self.channel.read(&mut buf[..remaining])? {
+                    ReadOutcome::Bytes(n) => {
+                        self.to_socket.extend_from_slice(&buf[..n]);
+                        self.requests += n;
+                    }
+                    ReadOutcome::Empty => break,
+                    ReadOutcome::Eof => {
+                        self.ring_eof = true;
+                        break;
+                    }
+                }
+            }
+            while !self.to_socket.is_empty() {
+                match self.socket.write(&self.to_socket) {
+                    Ok(0) => return Err("Linux compositor closed on write".into()),
+                    Ok(n) => {
+                        self.to_socket.drain(..n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if self.ring_eof && self.to_socket.is_empty() && !self.write_shutdown {
+                self.socket.shutdown(Shutdown::Write)?;
+                self.write_shutdown = true;
+            }
+            while !self.to_ring.is_empty() {
+                let n = self.channel.write_available(&self.to_ring)?;
+                if n == 0 {
+                    break;
+                }
+                self.to_ring.drain(..n);
+            }
+            if self.to_ring.is_empty() && !self.socket_eof {
+                match receive(&self.socket, &mut buf) {
+                    Ok(0) => self.socket_eof = true,
+                    Ok(n) => {
+                        self.to_ring.extend_from_slice(&buf[..n]);
+                        self.replies += n;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if self.socket_eof && self.to_ring.is_empty() && !self.sent_eof {
+                self.sent_eof = self.channel.write_eof()?;
+            }
+            Ok(self.ring_eof
+                && self.to_socket.is_empty()
+                && self.sent_eof
+                && (!require_dead
+                    || control.ring_state(self.channel.slot())?
+                        == sv_transport::control::RingState::Dead))
+        }
+        fn needs_credit(&self) -> bool {
+            !self.to_ring.is_empty() || (self.socket_eof && !self.sent_eof)
+        }
+        fn ready(&self) -> Result<bool, Box<dyn std::error::Error>> {
+            Ok((!self.ring_eof
+                    && self.to_socket.len() < QUEUE_BYTES
+                    && self.channel.readable()?)
+                    || (!self.to_ring.is_empty() && self.channel.write_capacity()? > 0)
+                    // An EOF needs only the aligned header. Payload capacity
+                    // can still be zero after enough credit for EOF returns.
+                    || (self.socket_eof && !self.sent_eof && self.to_ring.is_empty()
+                        && self.channel.free_bytes()? >= sv_transport::ring::PACKET_HEADER_SIZE))
+        }
+        fn pollfd(&self) -> libc::pollfd {
+            let events = if !self.socket_eof && self.to_ring.is_empty() {
+                libc::POLLIN
+            } else {
+                0
+            } | if !self.to_socket.is_empty() {
+                libc::POLLOUT
+            } else {
+                0
+            };
+            libc::pollfd {
+                fd: if events == 0 {
+                    -1
+                } else {
+                    self.socket.as_raw_fd()
+                },
+                events,
+                revents: 0,
+            }
+        }
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        let args: Vec<_> = std::env::args().collect();
+        let mut args: Vec<_> = std::env::args().collect();
         let geometry = Geometry::for_wayland();
+        let expected_clients = if let Some(index) = args.iter().position(|arg| arg == "--clients") {
+            let count: usize = args
+                .get(index + 1)
+                .ok_or("--clients needs a count")?
+                .parse()?;
+            if count == 0 || count > geometry.ring_slot_count as usize {
+                return Err("--clients is outside the available ring count".into());
+            }
+            args.drain(index..index + 2);
+            count
+        } else {
+            1
+        };
         let (file, socket_path, bell_path, control_offset, header, _bar_guard) = if args.len() == 9
             && args[1] == "--qemu-bar"
         {
@@ -217,7 +365,7 @@ mod host {
             }
             (file, &args[2], &args[3], 0, None, None)
         } else {
-            return Err("usage: wc-cygwin-host EXISTING_BAR_FILE WAYLAND_SOCKET WCBELL_SOCKET | --qemu-bar QMP DEVICE SLOT ARENA RUN WAYLAND_SOCKET WCBELL_SOCKET".into());
+            return Err("usage: wc-cygwin-host [--clients COUNT] EXISTING_BAR_FILE WAYLAND_SOCKET WCBELL_SOCKET | [--clients COUNT] --qemu-bar QMP DEVICE SLOT ARENA RUN WAYLAND_SOCKET WCBELL_SOCKET".into());
         };
         let region = Arc::new(SharedRegion::map_fd(
             file.as_fd(),
@@ -263,143 +411,98 @@ mod host {
         );
         io::stdout().flush()?;
         let deadline = Instant::now() + Duration::from_secs(120);
-        let mut channel = None;
-        let mut socket = None;
-        let mut to_socket = Vec::new();
-        let mut to_ring = Vec::new();
-        let mut eof = false;
-        let mut buf = [0u8; 65536];
+        let mut relays: Vec<Relay> = Vec::new();
+        let mut completed_slots = std::collections::BTreeSet::new();
+        let mut all_dead = true;
+        let mut accepted = 0usize;
+        let mut completed = 0usize;
         let mut requests = 0usize;
         let mut replies = 0usize;
         loop {
             if Instant::now() >= deadline {
-                return Err("bounded registry proof timed out".into());
+                return Err("bounded Wayland bridge proof timed out".into());
             }
-            if channel.is_none() {
-                let slots = ByteChannel::live_connections(&control)?;
-                if slots.len() > 1 {
-                    return Err("registry fixture supports exactly one connection".into());
+            for slot in ByteChannel::live_connections(&control)? {
+                if completed_slots.contains(&slot)
+                    || relays.iter().any(|relay| relay.channel.slot() == slot)
+                {
+                    continue;
                 }
-                if let Some(slot) = slots.first() {
-                    channel = Some(ByteChannel::open(&control, *slot, Endpoint::Peer)?);
-                    let s = UnixStream::connect(socket_path)?;
-                    s.set_nonblocking(true)?;
-                    socket = Some(s);
+                if accepted == expected_clients {
+                    return Err("more Wayland clients than the configured proof bound".into());
                 }
+                let channel = ByteChannel::open(&control, slot, Endpoint::Peer)?;
+                relays.push(Relay::new(channel, UnixStream::connect(socket_path)?)?);
+                accepted += 1;
             }
-            if let (Some(ch), Some(s)) = (channel.as_mut(), socket.as_mut()) {
-                loop {
-                    match ch.read(&mut buf)? {
-                        ReadOutcome::Bytes(n) => {
-                            if to_socket.len() + n > 65536 {
-                                return Err("bounded bridge request queue overflow".into());
-                            }
-                            to_socket.extend_from_slice(&buf[..n]);
-                            requests += n;
-                        }
-                        ReadOutcome::Empty => break,
-                        ReadOutcome::Eof => {
-                            eof = true;
-                            break;
-                        }
-                    }
-                }
-                while !to_socket.is_empty() {
-                    match s.write(&to_socket) {
-                        Ok(0) => return Err("Linux compositor closed on write".into()),
-                        Ok(n) => {
-                            to_socket.drain(..n);
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                while !to_ring.is_empty() {
-                    let n = ch.write(&to_ring)?;
-                    if n == 0 {
-                        break;
-                    }
-                    to_ring.drain(..n);
-                }
-                if to_ring.is_empty() && !eof {
-                    match receive(s, &mut buf) {
-                        Ok(0) => {
-                            eof = true;
-                        }
-                        Ok(n) => {
-                            to_ring.extend_from_slice(&buf[..n]);
-                            replies += n;
-                            continue;
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                if eof && to_socket.is_empty() && to_ring.is_empty() {
-                    let _ = ch.write_eof();
-                    if header.is_none()
-                        || control.ring_state(ch.slot())? == sv_transport::control::RingState::Dead
-                    {
-                        println!(
-                            "WC_CYGWIN_HOST_DONE request_bytes={requests} reply_bytes={replies} fds_crossed=0 ring_dead={}",
-                            u8::from(
-                                control.ring_state(ch.slot())?
-                                    == sv_transport::control::RingState::Dead
-                            )
-                        );
-                        return Ok(());
-                    }
-                }
-                if to_ring.len() > 65536 || to_socket.len() > 65536 {
-                    return Err("bounded bridge queue overflow".into());
+            let mut index = 0;
+            while index < relays.len() {
+                if relays[index].service(&control, header.is_some())? {
+                    let relay = relays.remove(index);
+                    completed_slots.insert(relay.channel.slot());
+                    all_dead &= control.ring_state(relay.channel.slot())?
+                        == sv_transport::control::RingState::Dead;
+                    requests += relay.requests;
+                    replies += relay.replies;
+                    completed += 1;
+                } else {
+                    index += 1;
                 }
             }
-            // Park the command lane before checking again. The port reader
-            // signals eventfd, so poll never needs a periodic idle slice.
-            let parked = channel.as_ref().and_then(|c| c.rx_bell().ok());
-            if let Some(bell) = &parked {
+            if completed == expected_clients {
+                println!(
+                    "WC_CYGWIN_HOST_DONE request_bytes={requests} reply_bytes={replies} fds_crossed=0 ring_dead={} clients={completed}",
+                    u8::from(all_dead)
+                );
+                return Ok(());
+            }
+            // Park every lane before the final readiness check. Both incoming
+            // bytes and released TX credit wake the shared eventfd. Never let
+            // one blocked socket require periodic polling of another client.
+            let mut parked = Vec::new();
+            for relay in &relays {
+                if !relay.ring_eof && relay.to_socket.len() < QUEUE_BYTES {
+                    parked.push(relay.channel.rx_bell()?);
+                }
+                if relay.needs_credit() {
+                    parked.push(relay.channel.tx_credit_bell()?);
+                }
+            }
+            for bell in &parked {
                 bell.parked
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            if !eof
-                && channel
-                    .as_ref()
-                    .is_some_and(|c| c.readable().unwrap_or(true))
-            {
-                if let Some(bell) = &parked {
+            let ready = relays.iter().try_fold(false, |ready, relay| {
+                relay.ready().map(|next| ready || next)
+            });
+            if matches!(ready, Ok(true)) {
+                for bell in &parked {
                     bell.parked
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 continue;
             }
-            let mut polls = [
-                libc::pollfd {
-                    fd: wake.event.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if eof {
-                        -1
-                    } else {
-                        socket.as_ref().map_or(-1, AsRawFd::as_raw_fd)
-                    },
-                    events: libc::POLLIN
-                        | if to_socket.is_empty() {
-                            0
-                        } else {
-                            libc::POLLOUT
-                        },
-                    revents: 0,
-                },
-            ];
+            if let Err(error) = ready {
+                for bell in &parked {
+                    bell.parked
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+            let mut polls = Vec::with_capacity(relays.len() + 1);
+            polls.push(libc::pollfd {
+                fd: wake.event.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            polls.extend(relays.iter().map(Relay::pollfd));
             let timeout = deadline
                 .saturating_duration_since(Instant::now())
                 .as_millis()
                 .min(i32::MAX as u128) as i32;
-            // SAFETY: a live array of two pollfd entries.
+            // SAFETY: retained pollfd vector, no concurrent mutation.
             let status = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as _, timeout) };
-            if let Some(bell) = &parked {
+            for bell in &parked {
                 bell.parked
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -412,6 +515,119 @@ mod host {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn relay_pair(control: &Control, id: u64) -> (Relay, ByteChannel, UnixStream) {
+            let owner = ByteChannel::claim(control, id).unwrap();
+            let peer = ByteChannel::open(control, owner.slot(), Endpoint::Peer).unwrap();
+            let (bridge, server) = UnixStream::pair().unwrap();
+            server.set_nonblocking(true).unwrap();
+            (Relay::new(peer, bridge).unwrap(), owner, server)
+        }
+
+        fn test_control() -> Control {
+            let geometry = Geometry::for_wayland();
+            let region = Arc::new(SharedRegion::heap(geometry.control_size as usize).unwrap());
+            Control::create(region, geometry, ProtocolIds::new(1, 7), 1).unwrap()
+        }
+
+        #[test]
+        fn concurrent_clients_keep_bytes_and_orderly_teardown_separate() {
+            use std::io::Read;
+            let control = test_control();
+            let (mut first, mut first_owner, mut first_server) = relay_pair(&control, 11);
+            let (mut second, mut second_owner, mut second_server) = relay_pair(&control, 12);
+            first_owner.write(b"first request").unwrap();
+            second_owner.write(b"second request").unwrap();
+            assert!(!first.service(&control, true).unwrap());
+            assert!(!second.service(&control, true).unwrap());
+            let mut bytes = [0u8; 64];
+            let n = first_server.read(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n], b"first request");
+            let n = second_server.read(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n], b"second request");
+            first_server.write_all(b"first reply").unwrap();
+            second_server.write_all(b"second reply").unwrap();
+            for relay in [&mut first, &mut second] {
+                relay.service(&control, true).unwrap();
+                relay.service(&control, true).unwrap();
+            }
+            let ReadOutcome::Bytes(n) = first_owner.read(&mut bytes).unwrap() else {
+                panic!("missing first reply")
+            };
+            assert_eq!(&bytes[..n], b"first reply");
+            let ReadOutcome::Bytes(n) = second_owner.read(&mut bytes).unwrap() else {
+                panic!("missing second reply")
+            };
+            assert_eq!(&bytes[..n], b"second reply");
+            first_owner.write_eof().unwrap();
+            first.service(&control, true).unwrap();
+            assert_eq!(
+                first_server.read(&mut bytes).unwrap(),
+                0,
+                "EOF did not half-close Linux write side"
+            );
+            first_server.shutdown(Shutdown::Write).unwrap();
+            assert!(
+                !first.service(&control, true).unwrap(),
+                "EOF was mistaken for a DEAD acknowledgement"
+            );
+            control.kill_ring(first_owner.slot()).unwrap();
+            assert!(first.service(&control, true).unwrap());
+            second_owner.write(b"still connected").unwrap();
+            assert!(!second.service(&control, true).unwrap());
+            let n = second_server.read(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n], b"still connected");
+        }
+
+        #[test]
+        fn a_full_reply_lane_waits_for_credit_without_polling_the_socket() {
+            let control = test_control();
+            let (mut relay, mut owner, mut server) = relay_pair(&control, 13);
+            let fill = [9u8; 4096];
+            while relay.channel.write(&fill).unwrap() > 0 {}
+            server.write_all(b"reply after pressure").unwrap();
+            relay.service(&control, true).unwrap();
+            assert!(relay.needs_credit());
+            assert_eq!(
+                relay.pollfd().fd,
+                -1,
+                "blocked queue left a readable socket in poll"
+            );
+            assert!(!relay.ready().unwrap());
+            let mut bytes = [0u8; 65536];
+            while matches!(owner.read(&mut bytes).unwrap(), ReadOutcome::Bytes(_)) {}
+            assert!(
+                relay.ready().unwrap(),
+                "released credit did not make the relay runnable"
+            );
+            relay.service(&control, true).unwrap();
+            let ReadOutcome::Bytes(n) = owner.read(&mut bytes).unwrap() else {
+                panic!("missing queued reply")
+            };
+            assert_eq!(&bytes[..n], b"reply after pressure");
+        }
+
+        #[test]
+        fn eof_readiness_accepts_header_only_credit() {
+            let control = test_control();
+            let (mut relay, _owner, _server) = relay_pair(&control, 14);
+            relay.channel.write(&[1u8; 17]).unwrap();
+            while relay.channel.free_bytes().unwrap() > sv_transport::ring::PACKET_HEADER_SIZE {
+                assert_eq!(relay.channel.write(&[2u8; 1]).unwrap(), 1);
+            }
+            assert_eq!(
+                relay.channel.free_bytes().unwrap(),
+                sv_transport::ring::PACKET_HEADER_SIZE
+            );
+            assert_eq!(relay.channel.write_capacity().unwrap(), 0);
+            relay.socket_eof = true;
+            assert!(
+                relay.ready().unwrap(),
+                "EOF credit was mistaken for no writable payload"
+            );
+            relay.service(&control, true).unwrap();
+            assert!(relay.sent_eof);
+        }
 
         #[test]
         fn ordinary_wayland_bytes_survive_the_socket_boundary() {
