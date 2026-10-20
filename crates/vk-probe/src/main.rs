@@ -282,6 +282,9 @@ fn fill_buffer(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Result<()> {
     unsafe {
         device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())?;
         device.cmd_fill_buffer(command, buffer, 0, BYTES, PATTERN);
+        let barrier = [vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ)];
+        device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(), &barrier, &[], &[]);
         device.end_command_buffer(command)?;
     }
     let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;

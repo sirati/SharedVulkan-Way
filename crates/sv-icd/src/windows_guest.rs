@@ -90,7 +90,7 @@ impl Attached {
     fn enter_bar_pool(&mut self) -> Result<(), String> {
         let t = &mut self.transport;
         let info = t.arena_info(&format!("windows pid {}", std::process::id())).ok_or("the GPU owner did not answer arena mode")?;
-        if info.mode != sv_proto::sv::ARENA_MODE_LEASED || info.capacity > t.arena.len() as u64
+        if info.mode != sv_proto::sv::ARENA_MODE_LEASED || info.capacity > t.arena.len() as u64 || info.max_capacity > t.arena.len() as u64
             || info.lease_granule == 0 || !info.lease_granule.is_power_of_two()
             || info.session_cap == 0 || info.session_cap > info.capacity {
             return Err("the GPU pool must be leased and fit entirely in this BAR; grown host regions are unsupported".into());
