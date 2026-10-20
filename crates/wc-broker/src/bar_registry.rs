@@ -409,13 +409,16 @@ fn check_overlap(records: &[Binding], b: &Binding) -> io::Result<()> {
         .grant_offset
         .checked_add(b.grant_length)
         .ok_or_else(|| invalid("grant overflow"))?;
-    if records
-        .iter()
-        .any(|old| b.grant_offset < old.grant_offset + old.grant_length && old.grant_offset < end)
-    {
-        return Err(invalid(
-            "physical BAR extent overlaps retained prior reservation",
-        ));
+    for old in records {
+        let old_end = old
+            .grant_offset
+            .checked_add(old.grant_length)
+            .ok_or_else(|| invalid("retained prior grant overflow"))?;
+        if b.grant_offset < old_end && old.grant_offset < end {
+            return Err(invalid(
+                "physical BAR extent overlaps retained prior reservation",
+            ));
+        }
     }
     Ok(())
 }
@@ -530,6 +533,19 @@ mod tests {
     }
     fn fresh(memory: Memory) -> Registry<Memory> {
         unsafe { Registry::initialize_fresh(memory, backing(), Origin::Windows).unwrap() }
+    }
+    #[test]
+    fn overflowing_prior_extent_refuses_even_an_apparently_disjoint_new_grant() {
+        let candidate = binding(1, 2, 4096);
+        let mut prior = binding(1, 2, u64::MAX - 4095);
+        // Both fields are page aligned, but their mathematical end exceeds
+        // u64. Release-mode wrapping must not make this look disjoint.
+        prior.grant_length = 4096;
+        let error = check_overlap(&[prior], &candidate).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "retained prior grant overflow");
+        assert!(check_overlap(&[binding(1, 2, 8192)], &candidate).is_ok());
+        assert!(check_overlap(&[candidate.clone()], &candidate).is_err());
     }
     #[test]
     fn restart_and_all_generation_changes_keep_original_byte_exclusions() {
