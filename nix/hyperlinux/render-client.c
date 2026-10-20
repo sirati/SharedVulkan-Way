@@ -21,6 +21,11 @@ int main(void) {
     int alias = dup(node); assert(alias >= 0); close(node);
     struct stat st; assert(fstat(alias, &st) == 0 && S_ISCHR(st.st_mode));
     assert(major(st.st_rdev) == 226 && minor(st.st_rdev) == 128);
+    struct statx sx;
+    assert(statx(alias, "", AT_EMPTY_PATH, STATX_TYPE, &sx) == 0);
+    assert(S_ISCHR(sx.stx_mode) && sx.stx_rdev_major == 226 && sx.stx_rdev_minor == 128);
+    assert(statx(AT_FDCWD, "/dev/dri/renderD128", 0, STATX_TYPE, &sx) == 0);
+    assert(S_ISCHR(sx.stx_mode) && sx.stx_rdev_major == 226 && sx.stx_rdev_minor == 128);
     char name[64]={0}, date[64]={0}, desc[128]={0};
     struct version version = { .name_len=63, .name=name, .date_len=63, .date=date, .desc_len=127, .desc=desc };
     assert(ioctl(alias, 0xc0406400u, &version) == 0);

@@ -543,7 +543,7 @@ index a0f5f67..e58dd00 100644
      }
      case SYS_mincore:
 diff --git a/src/syscall_fs.c b/src/syscall_fs.c
-index b7b3337..d7b4224 100644
+index b7b3337..2f5d2b4 100644
 --- a/src/syscall_fs.c
 +++ b/src/syscall_fs.c
 @@ -7,6 +7,8 @@
@@ -583,6 +583,18 @@ index b7b3337..d7b4224 100644
          return guest_fd;
      }
      if (intercepted == -1) {
+@@ -958,9 +967,9 @@ statx_have_stat:
+     sx.stx_btime_sec = mac_st.st_birthtimespec.tv_sec;
+     sx.stx_btime_nsec = (uint32_t)mac_st.st_birthtimespec.tv_nsec;
+     sx.stx_mask |= STATX_BTIME;
+-    sx.stx_rdev_major = (uint32_t)(mac_st.st_rdev >> 24);
++    sx.stx_rdev_major = ((uint32_t)mac_st.st_rdev >> 24);
+     sx.stx_rdev_minor = (uint32_t)(mac_st.st_rdev & 0xFFFFFF);
+-    sx.stx_dev_major = (uint32_t)(mac_st.st_dev >> 24);
++    sx.stx_dev_major = ((uint32_t)mac_st.st_dev >> 24);
+     sx.stx_dev_minor = (uint32_t)(mac_st.st_dev & 0xFFFFFF);
+ 
+     if (guest_write(g, statxbuf_gva, &sx, sizeof(sx)) < 0)
 @@ -1078,6 +1087,15 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
  }
  
