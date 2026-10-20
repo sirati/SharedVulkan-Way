@@ -227,6 +227,25 @@ static int run_nv12(bool narrow) {
                                .memoryTypeIndex = type},
        NULL, &mem));
    CHECK(vkBindImageMemory(dev, image, mem, 0));
+   VkMemoryRequirements after_bind;
+   vkGetImageMemoryRequirements(dev, image, &after_bind);
+   if (after_bind.size != req.size || after_bind.alignment != req.alignment ||
+       after_bind.memoryTypeBits != req.memoryTypeBits)
+      return 1;
+   D(vkGetImageSubresourceLayout);
+   for (unsigned p = 0; p < 2; p++) {
+      VkImageSubresource sub = {.aspectMask = p ? VK_IMAGE_ASPECT_PLANE_1_BIT
+                                                : VK_IMAGE_ASPECT_PLANE_0_BIT};
+      VkSubresourceLayout layout;
+      vkGetImageSubresourceLayout(dev, image, &sub, &layout);
+      size_t offset = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface, p) -
+                      (uintptr_t)IOSurfaceGetBaseAddress(surface);
+      size_t pitch = IOSurfaceGetBytesPerRowOfPlane(surface, p);
+      if (layout.offset != offset || layout.rowPitch != pitch ||
+          layout.size != pitch * IOSurfaceGetHeightOfPlane(surface, p))
+         return 1;
+   }
+
    /* The driver must own both textures and their IOSurface after the caller
     * releases them. */
    [tex release];
