@@ -6,6 +6,7 @@
 #include <linux/seccomp.h>
 #include <linux/audit.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <ucontext.h>
@@ -109,8 +110,9 @@ static int concurrent_wait_tests(void) {
     return 0;
 }
 static int wait_status_tests(const char *self) {
-    for (int mode=0;mode<10;++mode) {
-        pid_t child=fork(); CHECK(child>=0);
+    for (int mode=0;mode<11;++mode) {
+        pid_t child=mode==10 ? (pid_t)syscall(SYS_clone,(unsigned long)CLONE_VFORK|SIGCHLD,0,0,0,0) : fork();
+        CHECK(child>=0);
         if (!child) {
             if (mode==0) _exit(159);
             if (mode==8) _exit(143);
@@ -129,7 +131,7 @@ static int wait_status_tests(const char *self) {
                 sigset_t set; sigemptyset(&set); sigaddset(&set,SIGSYS);
                 CHECK(pthread_sigmask(SIG_BLOCK,&set,NULL)==0);
             }
-            unsigned action=mode==1 || mode==7 ? SECCOMP_RET_KILL_PROCESS :
+            unsigned action=mode==1 || mode==7 || mode==10 ? SECCOMP_RET_KILL_PROCESS :
                             mode==5 ? SECCOMP_RET_KILL_THREAD : SECCOMP_RET_TRAP|73;
             CHECK(filter(SYS_getppid,action,0)==0);
             if (mode==1) {
@@ -162,7 +164,7 @@ static int wait_status_tests(const char *self) {
         errno=0; CHECK(waitpid(child,&status,WNOHANG)==-1 && errno==ECHILD);
     }
     CHECK(concurrent_wait_tests()==0);
-    puts("seccomp fatal waits: KILL_PROCESS group, TRAP default/ignored/blocked, KILL_THREAD, SIGTERM, exec, WNOWAIT, worker-only fatal and normal159/143 passed");
+    puts("seccomp fatal waits: KILL_PROCESS group, TRAP default/ignored/blocked, KILL_THREAD, SIGTERM, exec, VFORK cache, WNOWAIT, worker-only fatal and normal159/143 passed");
     return 0;
 }
 int main(int argc,char **argv) {
