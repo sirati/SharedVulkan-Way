@@ -4,12 +4,13 @@ use super::macos::Picture;
 use std::{
     collections::HashMap,
     ffi::c_void,
+    io::Write,
     ops::Range,
     ptr,
     sync::{Arc, Mutex, mpsc},
 };
 type Ref = *mut c_void;
-#[repr(C)]
+#[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 struct Time {
     value: i64,
@@ -17,20 +18,20 @@ struct Time {
     flags: u32,
     epoch: i64,
 }
-#[repr(C)]
+#[repr(C, packed(4))]
 struct Timing {
     duration: Time,
     pts: Time,
     dts: Time,
 }
-#[repr(C)]
+#[repr(C, packed(4))]
 struct BlockSource {
     version: u32,
     allocate: Option<unsafe extern "C" fn(Ref, usize) -> Ref>,
     free: Option<unsafe extern "C" fn(Ref, Ref, usize)>,
     context: Ref,
 }
-#[repr(C)]
+#[repr(C, packed(4))]
 struct Callback {
     function: unsafe extern "C" fn(Ref, Ref, i32, u32, Ref, Time, Time),
     context: Ref,
@@ -48,6 +49,8 @@ unsafe extern "C" {
     ) -> Ref;
     fn CFNumberCreate(allocator: Ref, kind: isize, value: *const c_void) -> Ref;
     static kCFBooleanTrue: Ref;
+    static kCFTypeDictionaryKeyCallBacks: u8;
+    static kCFTypeDictionaryValueCallBacks: u8;
 }
 #[link(name = "CoreVideo", kind = "framework")]
 unsafe extern "C" {
@@ -127,7 +130,14 @@ impl Drop for Owned {
         }
     }
 }
+fn trace(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("SV_VT_TRACE").is_some() {
+        // Ignore stderr errors, particularly inside a C callback.
+        let _ = writeln!(std::io::stderr().lock(), "sv-vt {message}");
+    }
+}
 fn checked(status: i32, operation: &str) -> Result<(), String> {
+    trace(format_args!("{operation} returned status={status}"));
     if status == 0 {
         Ok(())
     } else {
@@ -135,14 +145,19 @@ fn checked(status: i32, operation: &str) -> Result<(), String> {
     }
 }
 unsafe fn dictionary(keys: &[Ref], values: &[Ref]) -> Result<Owned, String> {
+    trace(format_args!("dictionary create entries={}", keys.len()));
     let value = unsafe {
         CFDictionaryCreate(
             ptr::null_mut(),
             keys.as_ptr(),
             values.as_ptr(),
             keys.len() as isize,
-            ptr::null_mut(),
-            ptr::null_mut(),
+            ptr::addr_of!(kCFTypeDictionaryKeyCallBacks)
+                .cast_mut()
+                .cast(),
+            ptr::addr_of!(kCFTypeDictionaryValueCallBacks)
+                .cast_mut()
+                .cast(),
         )
     };
     if value.is_null() {
@@ -173,7 +188,8 @@ unsafe impl CompressedBytes for Box<[u8]> {
 struct Input {
     _owner: Arc<dyn CompressedBytes>,
 }
-unsafe extern "C" fn release_input(context: Ref, _: Ref, _: usize) {
+unsafe extern "C" fn release_input(context: Ref, _: Ref, size: usize) {
+    trace(format_args!("compressed block release bytes={size}"));
     unsafe { drop(Box::from_raw(context.cast::<Input>())) }
 }
 struct Callbacks {
@@ -188,6 +204,11 @@ unsafe extern "C" fn completed(
     _: Time,
     _: Time,
 ) {
+    trace(format_args!(
+        "callback frame={} status={status} flags={flags:#x} image_present={}",
+        frame as usize,
+        !image.is_null()
+    ));
     // No Rust panic may cross the C ABI, including a poisoned mutex.
     let state = unsafe { &*context.cast::<Callbacks>() };
     let sender = state
@@ -201,7 +222,13 @@ unsafe extern "C" fn completed(
         } else if flags & 2 != 0 || image.is_null() {
             Err("VideoToolbox dropped the frame".into())
         } else {
-            unsafe { Picture::from_completed_buffer(image) }.map_err(str::to_owned)
+            trace(format_args!("retain completed picture begin"));
+            let result = unsafe { Picture::from_completed_buffer(image) }.map_err(str::to_owned);
+            trace(format_args!(
+                "retain completed picture ok={}",
+                result.is_ok()
+            ));
+            result
         };
         let _ = sender.send(result);
     }
@@ -222,12 +249,25 @@ unsafe impl Send for Decoder {}
 impl Decoder {
     /// SPS and PPS include their NAL headers, without Annex B start codes.
     pub fn new(sps: &[u8], pps: &[u8]) -> Result<Self, String> {
+        trace(format_args!(
+            "new begin SPS_bytes={} PPS_bytes={}",
+            sps.len(),
+            pps.len()
+        ));
         let extent = validate_sps(sps)?;
+        trace(format_args!(
+            "SPS validated coded={:?} display={:?}",
+            extent.coded_extent, extent.display_extent
+        ));
         validate_pps(pps)?;
+        trace(format_args!("hardware support query begin"));
         if !super::macos::hardware_h264() {
             return Err("hardware H.264 decode unavailable".into());
         }
         unsafe {
+            trace(format_args!(
+                "hardware support query succeeded; format create begin"
+            ));
             let mut format = Owned(ptr::null_mut());
             checked(
                 CMVideoFormatDescriptionCreateFromH264ParameterSets(
@@ -246,6 +286,7 @@ impl Decoder {
             )?;
             let empty = dictionary(&[], &[])?;
             let nv12 = u32::from_be_bytes(*b"420v");
+            trace(format_args!("NV12 CFNumber create begin"));
             let number = Owned(CFNumberCreate(
                 ptr::null_mut(),
                 3,
@@ -270,6 +311,7 @@ impl Decoder {
                 context: (&mut *callbacks as *mut Callbacks).cast(),
             };
             let mut session = Owned(ptr::null_mut());
+            trace(format_args!("hardware-required session create begin"));
             checked(
                 VTDecompressionSessionCreate(
                     ptr::null_mut(),
@@ -317,12 +359,18 @@ impl Decoder {
         range: Range<usize>,
         offsets: &[u32],
     ) -> Result<mpsc::Receiver<Result<Arc<Picture>, String>>, String> {
+        trace(format_args!(
+            "Annex B submit begin slices={} range_bytes={}",
+            offsets.len(),
+            range.len()
+        ));
         let data = owner
             .bytes()
             .get(range.clone())
             .ok_or("compressed range outside allocation")?;
         let ranges = annex_b_ranges(data, offsets)?;
         let mut block = Owned(ptr::null_mut());
+        trace(format_args!("segmented block create begin"));
         unsafe {
             checked(
                 CMBlockBufferCreateEmpty(
@@ -383,6 +431,9 @@ impl Decoder {
             .checked_add(1)
             .ok_or("decode sequence exhausted")?;
         unsafe {
+            trace(format_args!(
+                "sample create begin frame={id} bytes={length}"
+            ));
             let mut sample = Owned(ptr::null_mut());
             let timing = Timing {
                 duration: Time {
@@ -424,6 +475,7 @@ impl Decoder {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(id, tx);
+            trace(format_args!("decode frame begin frame={id}"));
             let status = VTDecompressionSessionDecodeFrame(
                 self.session.0,
                 sample.0,
@@ -431,6 +483,9 @@ impl Decoder {
                 id as Ref,
                 ptr::null_mut(),
             );
+            trace(format_args!(
+                "decode frame returned frame={id} status={status}"
+            ));
             if status != 0 {
                 self.callbacks
                     .pending
@@ -444,8 +499,13 @@ impl Decoder {
     }
     /// Complete delayed output before resolving a Vulkan submission's fence.
     pub fn drain(&mut self) -> Result<(), String> {
+        trace(format_args!("finish delayed frames begin"));
         let finish = unsafe { VTDecompressionSessionFinishDelayedFrames(self.session.0) };
+        trace(format_args!(
+            "finish delayed frames returned status={finish}; async wait begin"
+        ));
         let wait = unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session.0) };
+        trace(format_args!("async wait returned status={wait}"));
         checked(finish, "finish delayed frames")?;
         checked(wait, "wait for decoder")?;
         let pending = std::mem::take(
@@ -464,9 +524,11 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         let _ = self.drain();
+        trace(format_args!("session invalidate begin"));
         unsafe {
             VTDecompressionSessionInvalidate(self.session.0);
         }
+        trace(format_args!("session invalidate returned"));
         // Invalidate synchronously cancels remaining callbacks. Context outlives it.
     }
 }
@@ -486,6 +548,7 @@ fn compressed_block(owner: Arc<dyn CompressedBytes>, range: Range<usize>) -> Res
         context: input.cast(),
     };
     let mut block = Owned(ptr::null_mut());
+    trace(format_args!("compressed block create begin bytes={length}"));
     let status = unsafe {
         CMBlockBufferCreateWithMemoryBlock(
             ptr::null_mut(),
@@ -499,6 +562,9 @@ fn compressed_block(owner: Arc<dyn CompressedBytes>, range: Range<usize>) -> Res
             &mut block.0,
         )
     };
+    trace(format_args!(
+        "compressed block create returned status={status}"
+    ));
     if status != 0 {
         // CoreMedia's failure contract leaves memoryBlock with its caller.
         unsafe {
@@ -832,5 +898,30 @@ mod annex_tests {
         assert!(annex_b_ranges(&stream, &[1, 6]).is_err());
         assert!(annex_b_ranges(&stream, &[0, 0]).is_err());
         assert!(annex_b_ranges(&stream, &[0, 7]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+    #[test]
+    fn coremedia_and_videotoolbox_match_sdk_pack_four() {
+        // macOS 14.4 SDK headers CMBlockBuffer.h, CMTime.h,
+        // CMSampleBuffer.h and VTDecompressionSession.h use pack(push, 4).
+        assert_eq!(size_of::<Time>(), 24);
+        assert_eq!(align_of::<Time>(), 4);
+        assert_eq!(size_of::<Timing>(), 72);
+        assert_eq!(align_of::<Timing>(), 4);
+        if size_of::<usize>() == 8 {
+            assert_eq!(size_of::<BlockSource>(), 28);
+            assert_eq!(align_of::<BlockSource>(), 4);
+            assert_eq!(offset_of!(BlockSource, allocate), 4);
+            assert_eq!(offset_of!(BlockSource, free), 12);
+            assert_eq!(offset_of!(BlockSource, context), 20);
+            assert_eq!(size_of::<Callback>(), 16);
+            assert_eq!(align_of::<Callback>(), 4);
+            assert_eq!(offset_of!(Callback, context), 8);
+        }
     }
 }

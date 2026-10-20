@@ -194,6 +194,7 @@ mod fixture {
         unsafe {
             libc::alarm(30);
         }
+        eprintln!("fixture stage=parse stream bytes={}", STREAM.len());
         let parsed = nals(STREAM)?;
         let sps = parsed
             .iter()
@@ -214,8 +215,14 @@ mod fixture {
         if slices.len() != FRAMES || slices.iter().filter(|n| n.0 == 5).count() != 2 {
             return Err("fixture must contain two IDR and six P pictures".into());
         }
+        eprintln!("fixture stage=map shared source");
         let source = Arc::new(Mapping::new(STREAM)?);
+        eprintln!("fixture stage=create hardware-required decoder");
         let mut decoder = Decoder::new(&STREAM[sps.2.clone()], &STREAM[pps.2.clone()])?;
+        eprintln!(
+            "fixture stage=decoder created coded={:?} display={:?}",
+            decoder.coded_extent, decoder.display_extent
+        );
         if decoder.coded_extent != [64, 64]
             || decoder.display_extent != [64, 50]
             || decoder.crop_origin != [0, 0]
@@ -227,24 +234,32 @@ mod fixture {
         }
         let mut pictures = Vec::new();
         for (frame, slice) in slices.iter().enumerate() {
+            eprintln!("fixture stage=submit frame={frame} nal_type={}", slice.0);
             let completion = decoder.submit_annex_b(source.clone(), slice.1.clone(), &[0])?;
             // Exercise drain without resetting references, so the following P
             // picture must use the preceding IDR/P reference in this session.
+            eprintln!("fixture stage=drain frame={frame}");
             decoder.drain()?;
+            eprintln!("fixture stage=receive frame={frame}");
             let picture = completion
                 .recv_timeout(Duration::from_secs(2))
                 .map_err(|e| format!("frame {frame}: callback {e}"))??;
+            eprintln!("fixture stage=verify frame={frame}");
             verify(&picture, frame)?;
             pictures.push(picture);
         }
+        eprintln!("fixture stage=final drain");
         decoder.drain()?;
+        eprintln!("fixture stage=drop decoder");
         drop(decoder);
+        eprintln!("fixture stage=decoder dropped");
         let references = Arc::strong_count(&source);
         let mut source = Arc::try_unwrap(source).map_err(|_| {
             format!("decoder retained {references} compressed source references after invalidate")
         })?;
         // Mutation occurs only after all callbacks, drain, session invalidation,
         // and proof that CoreMedia released every compressed-block owner.
+        eprintln!("fixture stage=overwrite released source mmap");
         source.clear_after_release();
         if source.bytes().iter().any(|b| *b != 0) {
             return Err("source mutation did not reach mapping".into());
@@ -263,6 +278,7 @@ mod fixture {
 }
 #[cfg(target_os = "macos")]
 fn main() {
+    eprintln!("fixture stage=main entered pid={}", std::process::id());
     if let Err(error) = fixture::run() {
         eprintln!("FAIL VideoToolbox fixture: {error}");
         std::process::exit(1);
