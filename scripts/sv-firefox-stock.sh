@@ -264,6 +264,7 @@ for _ in $(seq 1 200); do grep -q '^\[proxy\] listening on' "$RUN/proxy.log" && 
 # Attribute every visible test window, including surfaces outside Firefox.
 x11_windows() {
   local stage=$1 id pid
+  (xwd -root -silent -display ":$DISP" | magick xwd:- "$RUN/desktop-$stage.png") 2>/dev/null
   if command -v xwininfo >/dev/null; then
     xwininfo -display ":$DISP" -root -tree >"$RUN/x11-$stage.txt" 2>&1
   fi
@@ -382,6 +383,7 @@ done
 x11_windows screenshot
 (xwd -root -silent -display ":$DISP" | magick xwd:- "$RUN/screen.png") 2>/dev/null
 wait $FF 2>/dev/null
+x11_windows after-firefox
 
 # ------------------------------------------------------------------ verdict ---
 fail=0
