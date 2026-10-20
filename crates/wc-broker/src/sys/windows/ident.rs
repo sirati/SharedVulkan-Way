@@ -12,7 +12,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken, PROCESS_DUP_HANDLE,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION,
 };
 
 use super::pipe::wide;
@@ -118,10 +118,13 @@ pub fn pipe_client(pipe: HANDLE) -> io::Result<(u32, String)> {
 /// Open process `pid` for what the broker does with it (watch it, put
 /// handles into it), and check that its own token's user is `sid`: the
 /// pipe told the pid, and a pid can be reused between that and this open, so
-/// the process must be shown to be the same user's.
+/// the process must be shown to be the same user's. This excludes cross-user
+/// reuse, not same-SID reuse. Retain this exact object for every subsequent
+/// mapping and death watch; do not treat the SID check alone as proof of the
+/// original pipe peer process object.
 pub fn open_process_checked(pid: u32, sid: &str) -> io::Result<Owned> {
     // SAFETY: plain call; checked below.
-    let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_OPERATION, 0, pid) };
     if h.is_null() {
         return Err(os(&format!("OpenProcess({pid})")));
     }

@@ -23,6 +23,7 @@
 //! through the broker, and nothing is copied.
 
 pub mod client;
+pub mod bar_control;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod host;
 pub mod core;

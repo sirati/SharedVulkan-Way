@@ -1,0 +1,87 @@
+--- a/ivshmem/Device.c
++++ b/ivshmem/Device.c
+@@ -30,6 +30,7 @@
+     WDF_FILEOBJECT_CONFIG_INIT(&fileConfig, NULL, NULL, IVSHMEMEvtDeviceFileCleanup);
+     WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileConfig, WDF_NO_OBJECT_ATTRIBUTES);
+ 
++    WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, IVSHMEMRangeCallerContext);
+     status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &device);
+ 
+     if (!NT_SUCCESS(status))
+@@ -40,6 +41,7 @@
+ 
+     deviceContext = DeviceGetContext(device);
+     RtlZeroMemory(deviceContext, sizeof(DEVICE_CONTEXT));
++    IVSHMEMRangeInitialize(device);
+     KeInitializeSpinLock(&deviceContext->eventListLock);
+     InitializeListHead(&deviceContext->eventList);
+ 
+@@ -229,6 +231,7 @@
+             DEBUG_INFO("Interrupts   : %d", deviceContext->interruptsUsed);
+         }
+     }
++    if (NT_SUCCESS(result)) IVSHMEMRangeReady(Device);
+     DEBUG_INFO("%s result 0x%x", __FUNCTION__, result);
+     return result;
+ }
+@@ -240,6 +243,7 @@
+ 
+     PDEVICE_CONTEXT deviceContext;
+     deviceContext = DeviceGetContext(Device);
++    IVSHMEMRangeDrain(Device);
+ 
+     if (deviceContext->devRegisters)
+     {
+--- a/ivshmem/Queue.c
++++ b/ivshmem/Queue.c
+@@ -255,6 +255,8 @@
+     }
+ 
+     MEMORY_CACHING_TYPE cacheType;
++    /* Protected range maps are cached; mixed-cache physical aliases are invalid. */
++    if (in->cacheMode != IVSHMEM_CACHE_CACHED) return STATUS_INVALID_PARAMETER;
+     switch (in->cacheMode)
+     {
+         case IVSHMEM_CACHE_NONCACHED:
+--- a/ivshmem/Driver.h
++++ b/ivshmem/Driver.h
+@@ -1,4 +1,4 @@
+-#include <ntddk.h>
++#include <ntifs.h>
+ #include <wdf.h>
+ #include <initguid.h>
+ 
+--- a/ivshmem/Device.h
++++ b/ivshmem/Device.h
+@@ -1,4 +1,5 @@
+ #include "public.h"
++#include "Range.h"
+ 
+ EXTERN_C_START
+ 
+@@ -26,6 +27,7 @@
+ 
+ typedef struct _DEVICE_CONTEXT
+ {
++    IVSHMEM_RANGE_STATE range;
+     PIVSHMEMDeviceRegisters devRegisters; // the device registers (BAR0)
+ 
+     MM_PHYSICAL_ADDRESS_LIST shmemAddr; // physical address of the shared memory (BAR2)
+--- a/ivshmem/ivshmem.vcxproj
++++ b/ivshmem/ivshmem.vcxproj
+@@ -30,12 +30,15 @@
+     <ClCompile Include="Device.c" />
+     <ClCompile Include="Driver.c" />
+     <ClCompile Include="Queue.c" />
++    <ClCompile Include="Range.c" />
+   </ItemGroup>
+   <ItemGroup>
+     <ClInclude Include="Device.h" />
+     <ClInclude Include="Driver.h" />
+     <ClInclude Include="Public.h" />
+     <ClInclude Include="Queue.h" />
++    <ClInclude Include="Range.h" />
++    <ClInclude Include="RangeBounds.h" />
+   </ItemGroup>
+   <ItemGroup>
+     <Inf Include="ivshmem.inf" />
