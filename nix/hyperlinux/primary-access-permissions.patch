@@ -210,7 +210,7 @@
 +void *guest_ptr_range_access(const guest_t *g, uint64_t va, uint64_t length,
 +                              uint64_t *available, int write) {
 +    if (available) *available = 0;
-+    if (!length || length > UINT64_MAX - va) return NULL;
++    if (!length || length - 1 > UINT64_MAX - va) return NULL;
 +    uint64_t span;
 +    void *first = gva_resolve(g, va, &span, write);
 +    if (!first || !span) return NULL;
