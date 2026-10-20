@@ -37915,8 +37915,14 @@ It passes that same fd through normal `wl_shm.create_pool`. The proxy chooses
 an extent from its existing transport allocator, retains its registered
 backing, and recognizes the SCM_RIGHTS fd with Linux `KCMP_FILE`. Caller
 region names and matching anon-inode stat numbers do not establish identity.
-The translation changes the upstream descriptor and buffer offset, never the
-pixel payload. A separately selected named-file fixture uses live regular
+The broker run and region epoch accompany every allocation. Before sending
+them to GTK, the proxy reopens that generation and compares its fd with the
+exact descriptor retained from its own transport mapping. Registered contiguous
+BAR plans map those retained descriptors directly and check the actual opened
+BAR header. Broker restart, id reuse, a changed offset or an unrelated file
+cannot substitute pages. A bound allocator rejects unknown pool fds without
+entering the copied SHM path. The translation changes the upstream descriptor
+and buffer offset, never the pixel payload. A separately selected named-file fixture uses live regular
 file identity and is not evidence of cross-VM udmabuf mapping.
 
 GTK keeps its mapping and independent broker lease through Cairo destruction.
@@ -37933,16 +37939,18 @@ all region holders before `UNMAPPED` and guest reuse.
 `WC_NATIVE_SHM_STRICT=1`: missing allocation support or refusal fails visibly,
 without a copied allocation fallback. `WC_NATIVE_SHM_FIXTURE=1` explicitly
 permits disposable named-file backing on both fixture participants. Production
-allocations require existing broker-leased guest RAM and the existing mapped
-user policy. No new sandbox exception, broker authorization policy, or raw
+allocations require existing broker-leased guest RAM or registered contiguous
+BAR backing and the existing mapped user policy. No new sandbox exception, broker authorization policy, or raw
 QEMU RAM descriptor is introduced.
 
 Seven targeted Rust fixture tests pass: original-page painting, SCM_RIGHTS
 identity and lifetime, a real broker lease blocking retirement through mapping
 use, foreign anon-inode rejection despite matching fstat metadata, proxy
 registration rejection for a foreign fd, ordinary dual-lifetime reclamation,
-and refusal to guess drain after premature destruction. GTK packaging and
-real Cairo/Firefox runtime validation remain pending. The strict Firefox
+and refusal to guess drain after premature destruction. GTK packaging builds
+successfully. Additional broker generation, original-source and registered BAR
+regressions are added; their final validation and real Cairo/Firefox runtime
+validation remain pending. The strict Firefox
 zero-copy and guest hardware gates remain open.
 
 ## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
