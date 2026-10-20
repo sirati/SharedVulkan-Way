@@ -630,6 +630,18 @@ impl Core {
         pids.into_iter().collect()
     }
 
+    /// A second kernel-authenticated local channel may redeem a capability
+    /// only while this exact uid/pid already holds its region lease. This
+    /// neither opens a lease nor permits admin status to replace one.
+    pub fn leased_region(&self, peer: &Peer, id: ObjId, epoch: u64) -> Result<RegionInfo, Refusal> {
+        let Some(r) = self.regions.get(&id) else { return refuse("no region") };
+        if r.info.epoch != epoch { return refuse("region epoch changed") }
+        let holds = r.leases.iter().any(|(id, count)| *count != 0 &&
+            self.conns.get(id).is_some_and(|c| c.peer.pid == peer.pid && c.peer.user == peer.user));
+        if !holds { return refuse("no region lease for this process and user") }
+        Ok(r.info.clone())
+    }
+
     pub fn region(&self, id: ObjId) -> Option<&RegionInfo> {
         self.regions.get(&id).map(|r| &r.info)
     }
@@ -671,6 +683,32 @@ mod tests {
             DeviceSpec { name: "arena".into(), allow: Allow::AnyUser },
             DeviceSpec { name: "wcbell".into(), allow: Allow::Users(vec![User::uid(1000)]) },
         ])
+    }
+
+    #[test]
+    fn a_second_channel_requires_the_existing_kernel_identity_lease_and_epoch() {
+        let mut c = core();
+        let who = peer(100, 1000);
+        c.connect(1, who.clone());
+        let r = c.publish(User::uid(1000), "pci", 4096, 7);
+        assert!(c.leased_region(&who, r.id, 7).is_err());
+        c.open(1, r.id).unwrap();
+        assert!(c.leased_region(&who, r.id, 7).is_ok());
+        assert!(c.leased_region(&peer(101, 1000), r.id, 7).is_err());
+        assert!(c.leased_region(&peer(100, 1001), r.id, 7).is_err());
+        assert!(c.leased_region(&Peer { admin: true, ..peer(1, 0) }, r.id, 7).is_err());
+        assert!(c.leased_region(&who, r.id, 8).is_err());
+        c.retire(r.id);
+        // Retirement prohibits new leases, but does not revoke an existing one.
+        assert!(c.leased_region(&who, r.id, 7).is_ok());
+        c.close(1, r.id).unwrap();
+        assert!(c.leased_region(&who, r.id, 7).is_err());
+        let next = c.publish(User::uid(1000), "pci2", 4096, 9);
+        c.open(1, next.id).unwrap();
+        c.conn_closed(1, Instant::now());
+        assert!(c.leased_region(&who, next.id, 9).is_err());
+        c.connect(2, who.clone());
+        assert!(c.leased_region(&who, next.id, 9).is_err());
     }
 
     /// Rule 2: one holder, one user at a time; free when the holder exits.

@@ -8,5 +8,6 @@ mkdir -p "$WC_PCI_CHECK_DIR"
 "$WC_PCI_CHECK_DIR/ranges"
 # An ordinary macOS SDK is sufficient for the ABI cross-link, not the DEXT.
 if [[ -n ${DARWIN_CXX:-} ]]; then
+    "$DARWIN_CXX" -std=c++17 -fsyntax-only "$root/tests/mach-abi.cpp"
     "$DARWIN_CXX" -std=c++17 -Wall -Wextra -Werror "$root/tests/ranges.cpp" -o "$WC_PCI_CHECK_DIR/ranges-darwin"
 fi
