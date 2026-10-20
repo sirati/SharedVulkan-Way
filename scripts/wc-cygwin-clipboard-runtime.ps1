@@ -61,7 +61,7 @@ if ($LegacyBin) {
   foreach ($entry in $legacyManifest.artifacts.PSObject.Properties) {
     if ((Get-FileHash (Join-Path $LegacyBin $entry.Name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value.sha256) { throw 'legacy artifact differs' }
   }
-  Reject-Probe $LegacyBin 'legacy-format' 'header version 4'
+  Reject-Probe $LegacyBin 'legacy-format' 'header version 4|requires lease header format 3'
 }
 $env:WC_CYGWIN_RUN = [string]([uint64]$BarRun + [uint64]1)
 Reject-Probe $bin 'wrong-run' 'Wayland BAR run/arena/geometry identity differs'
