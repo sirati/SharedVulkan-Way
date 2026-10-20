@@ -19,6 +19,9 @@ sv-wire = { workspace = true }
 # programs on different operating systems, so a second copy of these offsets is
 # the one thing that must not exist.
 arena-record = { path = "../arena-record" }
+# The render node's relay (waycompose-design.md §112): registering the ICD
+# socket's and the doorbell hub's services, and taking the forwarded clients.
+sv-drm = { workspace = true }
 # Stitching a scattered extent into one contiguous view is `mmap(MAP_FIXED)` per
 # run, which has no safe spelling.
 libc = { workspace = true }

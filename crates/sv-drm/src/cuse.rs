@@ -490,11 +490,11 @@ pub struct Server<D: Device> {
     stop: Option<Stop>,
 }
 
-fn errno_reply(unique: u64, errno: i32) -> Vec<u8> {
+pub(crate) fn errno_reply(unique: u64, errno: i32) -> Vec<u8> {
     OutHeader { len: OutHeader::SIZE as u32, error: -errno, unique }.to_bytes()
 }
 
-fn ok_reply(unique: u64, body: &[u8]) -> Vec<u8> {
+pub(crate) fn ok_reply(unique: u64, body: &[u8]) -> Vec<u8> {
     let mut w = Wr::default();
     OutHeader { len: (OutHeader::SIZE + body.len()) as u32, error: 0, unique }.write(&mut w);
     w.bytes(body);
@@ -658,17 +658,34 @@ pub fn devname_ok(name: &str) -> bool {
         && name.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
+/// Request bytes in, reply bytes out: [`Server`], or a filesystem around one
+/// ([`crate::fusenode`]).
+pub trait Handler {
+    fn handle(&mut self, msg: &[u8]) -> Option<Vec<u8>>;
+    /// Set once the loop must end.
+    fn take_stop(&mut self) -> Option<Stop>;
+}
+
+impl<D: Device> Handler for Server<D> {
+    fn handle(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        Server::handle(self, msg)
+    }
+    fn take_stop(&mut self) -> Option<Stop> {
+        self.stop()
+    }
+}
+
 /// Run `server` over `fd` until the channel closes, the kernel destroys the
 /// connection, or `wait` says to stop. `wait` blocks until `fd` is readable
 /// (`Ok(true)`) or the server should stop (`Ok(false)`, e.g. on SIGTERM).
 /// `after` runs after each answered request (the CUSE_INIT reply is what makes
 /// the kernel create the node, so node setup goes there); its error ends the
 /// loop.
-pub fn serve<D: Device>(
+pub fn serve<H: Handler>(
     fd: BorrowedFd<'_>,
-    server: &mut Server<D>,
+    server: &mut H,
     mut wait: impl FnMut() -> io::Result<bool>,
-    mut after: impl FnMut(&mut Server<D>) -> io::Result<()>,
+    mut after: impl FnMut(&mut H) -> io::Result<()>,
 ) -> io::Result<Stop> {
     let mut buf = vec![0u8; READ_BUFFER];
     loop {
@@ -703,7 +720,7 @@ pub fn serve<D: Device>(
                 }
             }
         }
-        if let Some(s) = server.stop() {
+        if let Some(s) = server.take_stop() {
             return Ok(s);
         }
         after(server)?;
@@ -716,12 +733,17 @@ pub(crate) mod tests {
 
     /// A request as the kernel lays it out.
     pub fn req(opcode: u32, unique: u64, pid: u32, body: &[u8]) -> Vec<u8> {
+        req_as(opcode, unique, pid, 1000, body)
+    }
+
+    /// [`req`] from a caller of uid `uid`.
+    pub fn req_as(opcode: u32, unique: u64, pid: u32, uid: u32, body: &[u8]) -> Vec<u8> {
         let h = InHeader {
             len: (InHeader::SIZE + body.len()) as u32,
             opcode,
             unique,
             nodeid: 0,
-            uid: 1000,
+            uid,
             gid: 100,
             pid,
             total_extlen: 0,

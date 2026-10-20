@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
+use std::sync::Arc;
+
 use crate::cuse::{Device, InHeader, IoVec, IoctlIn, IoctlReply, OpenIn};
+use crate::relay::{self, Relay};
 use crate::token::{self, Token};
 
 /// `DRM_IOCTL_BASE`.
@@ -279,11 +282,20 @@ pub struct DrmNode<R: FdResolver> {
     next_fh: u64,
     resolver: R,
     logged: HashSet<u32>,
+    /// The services the node introduces clients to (§112); `None`: the
+    /// connect ioctl answers `EOPNOTSUPP`.
+    relay: Option<Arc<dyn Relay>>,
+    relay_said: HashSet<(u32, i32, String)>,
 }
 
 impl<R: FdResolver> DrmNode<R> {
     pub fn new(resolver: R) -> Self {
-        DrmNode { files: HashMap::new(), next_fh: 0, resolver, logged: HashSet::new() }
+        DrmNode { files: HashMap::new(), next_fh: 0, resolver, logged: HashSet::new(), relay: None, relay_said: HashSet::new() }
+    }
+
+    /// A node that also answers [`relay::DRM_IOCTL_SVDRM_CONNECT`].
+    pub fn with_relay(resolver: R, relay: Arc<dyn Relay>) -> Self {
+        DrmNode { relay: Some(relay), ..DrmNode::new(resolver) }
     }
 
     fn log_once(&mut self, nr: u32, cmd: u32, pid: u32, what: &str) {
@@ -322,6 +334,7 @@ impl<R: FdResolver> Device for DrmNode<R> {
             DRM_GET_CAP => Some(16),
             DRM_GEM_CLOSE => Some(8),
             DRM_PRIME_FD_TO_HANDLE => Some(12),
+            relay::DRM_SVDRM_CONNECT => Some(relay::CONNECT_SIZE),
             _ => None,
         };
         if let Some(s) = expect
@@ -370,6 +383,35 @@ impl<R: FdResolver> Device for DrmNode<R> {
                     Ok(d)
                 })
             }
+            relay::DRM_SVDRM_CONNECT => {
+                let Some(r) = self.relay.clone() else {
+                    self.log_once(nr, cmd, pid, "SVDRM_CONNECT on a node without --services: EOPNOTSUPP");
+                    return IoctlReply::Error(libc::EOPNOTSUPP);
+                };
+                let uid = hdr.uid;
+                let mut asked = None;
+                let reply = fixed(a, data, relay::CONNECT_SIZE, false, |d| {
+                    let (fd, name) = relay::decode_connect(d)?;
+                    let r = r.connect(uid, pid, fd, &name).map(|()| vec![]);
+                    asked = Some(name);
+                    r
+                });
+                // A client retries while its service is not up yet: each
+                // (pid, outcome, service) is said once.
+                if let Some(name) = asked {
+                    let e = match &reply {
+                        IoctlReply::Error(e) => *e,
+                        _ => 0,
+                    };
+                    if self.relay_said.insert((pid, e, name.clone())) {
+                        match e {
+                            0 => eprintln!("sv-drm: pid {pid} (uid {uid}) passed to {name}"),
+                            e => eprintln!("sv-drm: pid {pid} (uid {uid}) to {name}: errno {e}"),
+                        }
+                    }
+                }
+                reply
+            }
             DRM_PRIME_HANDLE_TO_FD => {
                 // The kernel turns ENOSYS from a FUSE server into ENOTTY.
                 self.log_once(nr, cmd, pid, "PRIME_HANDLE_TO_FD: a CUSE server cannot hand out fds (ENOSYS)");
@@ -390,7 +432,7 @@ impl<R: FdResolver> Device for DrmNode<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuse::tests::{Got, decode_ioctl_reply, init_req, req};
+    use crate::cuse::tests::{Got, decode_ioctl_reply, init_req, req, req_as};
     use crate::cuse::{
         DevInfo, FUSE_IOCTL_32BIT, FUSE_IOCTL_UNRESTRICTED, FUSE_OPEN, FUSE_RELEASE, OutHeader, ReleaseIn, Server,
         Wire,
@@ -458,6 +500,19 @@ mod tests {
     /// memory, as fs/fuse/ioctl.c does: returns the result (or -errno), the
     /// number of rounds, and the memory after.
     fn drive<D: Device>(s: &mut Server<D>, pid: u32, fh: u64, cmd: u32, flags: u32, mem: &mut UserMem) -> (i32, usize) {
+        drive_as(s, pid, 1000, fh, cmd, flags, mem)
+    }
+
+    /// [`drive`] for a caller of uid `uid`.
+    fn drive_as<D: Device>(
+        s: &mut Server<D>,
+        pid: u32,
+        uid: u32,
+        fh: u64,
+        cmd: u32,
+        flags: u32,
+        mem: &mut UserMem,
+    ) -> (i32, usize) {
         let (mut ins, mut outs): (Vec<IoVec>, Vec<IoVec>) = (vec![], vec![]);
         for round in 1..10 {
             let data: Vec<u8> = ins.iter().flat_map(|v| mem.read(v.base, v.len)).collect();
@@ -473,7 +528,7 @@ mod tests {
             let mut body = a.to_bytes();
             body.extend_from_slice(&data);
             let unique = 100 + round as u64;
-            let r = s.handle(&req(crate::cuse::FUSE_IOCTL, unique, pid, &body)).unwrap();
+            let r = s.handle(&req_as(crate::cuse::FUSE_IOCTL, unique, pid, uid, &body)).unwrap();
             match decode_ioctl_reply(&r, unique) {
                 Got::Err(e) => return (-e, round),
                 Got::Retry(i, o) => (ins, outs) = (i, o),
@@ -753,5 +808,156 @@ mod tests {
         unsafe { libc::pwrite(raw, h.as_ptr().cast(), h.len(), 0) };
         assert_eq!(ProcResolver.token(pid, raw), Err(libc::EINVAL));
         unsafe { libc::close(raw) };
+    }
+
+    // ---- §112: the connect ioctl, through the kernel's retry loop ----
+
+    use crate::relay::{
+        CONNECT_SIZE, DRM_IOCTL_SVDRM_CONNECT, Registration, Scope, Services, bind_services, encode_connect, peer_cred,
+    };
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    fn connect_arg(fd: i32, name: &str) -> UserMem {
+        UserMem::new(0x8000, encode_connect(fd, name).unwrap().to_vec())
+    }
+
+    #[test]
+    fn connect_without_services_is_not_supported() {
+        let (mut s, fh) = opened(Table(HashMap::new()), 42);
+        let mut m = connect_arg(3, "sv-gpu:/x");
+        assert_eq!(drive(&mut s, 42, fh, DRM_IOCTL_SVDRM_CONNECT, 0, &mut m), (-libc::EOPNOTSUPP, 1));
+        // The wrong size for the number is refused before anything else.
+        let mut m = UserMem::new(0x8000, vec![0; 72]);
+        assert_eq!(drive(&mut s, 42, fh, drm_ioc(1, 0x40, 72), 0, &mut m).0, -libc::EINVAL);
+    }
+
+    /// The whole rule through the node, with real descriptors of this process:
+    /// a name nobody registered is ENOENT, a name registered by another uid
+    /// is EACCES (the caller's uid is the FUSE header's), and a granted one
+    /// reaches the service with the client's own `SO_PEERCRED`.
+    #[test]
+    fn connect_is_forwarded_only_to_the_callers_own_service() {
+        let svc = Services::new();
+        // SAFETY: getter.
+        let me_uid = unsafe { libc::geteuid() };
+        let me = std::process::id();
+        let (reg_ours, reg_theirs) = UnixStream::pair().unwrap();
+        svc.add("sv-gpu:/run/icd.sock", Scope::Uid(me_uid), reg_theirs).unwrap();
+        let (other_ours, other_theirs) = UnixStream::pair().unwrap();
+        svc.add("sv-gpu:/run/other.sock", Scope::Uid(me_uid + 1), other_theirs).unwrap();
+        let mut reg = Registration::from_stream(reg_ours);
+        let node = DrmNode::with_relay(Table(HashMap::new()), svc.clone());
+        let mut s = Server::new(node, DevInfo { devname: "dri/renderD128".into(), dev_major: 0, dev_minor: 128 });
+        s.handle(&init_req(1, 45)).unwrap();
+        let r = s.handle(&req(FUSE_OPEN, 2, me, &OpenIn { flags: 2, open_flags: 0 }.to_bytes())).unwrap();
+        let fh = u64::from_ne_bytes(r[16..24].try_into().unwrap());
+
+        let (mut client, far) = UnixStream::pair().unwrap();
+        let fd = far.as_raw_fd();
+        let mut m = connect_arg(fd, "sv-gpu:/run/nobody.sock");
+        assert_eq!(drive_as(&mut s, me, me_uid, fh, DRM_IOCTL_SVDRM_CONNECT, 0, &mut m), (-libc::ENOENT, 2), "unregistered");
+        let mut m = connect_arg(fd, "sv-gpu:/run/other.sock");
+        assert_eq!(drive_as(&mut s, me, me_uid, fh, DRM_IOCTL_SVDRM_CONNECT, 0, &mut m).0, -libc::EACCES, "another uid's");
+        let mut m = connect_arg(fd, "sv-gpu:/run/icd.sock");
+        assert_eq!(
+            drive_as(&mut s, me, me_uid + 7, fh, DRM_IOCTL_SVDRM_CONNECT, 0, &mut m).0,
+            -libc::EACCES,
+            "a caller of another uid asking for this uid's service"
+        );
+        let mut m = connect_arg(fd, "sv-gpu:/run/icd.sock");
+        assert_eq!(drive_as(&mut s, me, me_uid, fh, DRM_IOCTL_SVDRM_CONNECT, 0, &mut m), (0, 2), "granted, one retry");
+        drop(far);
+
+        let mut got = reg.accept().unwrap();
+        assert_eq!((got.uid, got.pid), (me_uid, me));
+        let c = peer_cred(&got.stream).unwrap();
+        assert_eq!((c.uid, c.pid as u32), (me_uid, me), "the service sees the client's SO_PEERCRED");
+        client.write_all(b"hello").unwrap();
+        let mut b = [0u8; 5];
+        got.stream.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"hello");
+        // Nothing reached the other uid's service.
+        other_ours.set_nonblocking(true).unwrap();
+        let mut z = [0u8; 1];
+        assert_eq!((&other_ours).read(&mut z).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(CONNECT_SIZE, 68);
+    }
+
+    /// The same through [`crate::cuse::serve`] over a seqpacket socketpair, as
+    /// `/dev/cuse` carries it, with the registration made on a real control
+    /// socket.
+    #[test]
+    fn connect_through_the_serve_loop_and_a_control_socket() {
+        use crate::cuse::{IoctlOut, serve};
+        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+        let dir = std::env::temp_dir().join(format!("sv-drm-node-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("services.sock");
+        let svc = Services::new();
+        svc.listen(bind_services(&path).unwrap()).unwrap();
+        let mut reg = Registration::register(&path, "sv-bell:/run/hub.sock", false).unwrap();
+        while svc.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut sv = [0; 2];
+        // SAFETY: socketpair into a valid array.
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) }, 0);
+        // SAFETY: fresh descriptors we own.
+        let (a, b) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+        let node = DrmNode::with_relay(ProcResolver, svc.clone());
+        let t = std::thread::spawn(move || {
+            let mut s = Server::new(node, DevInfo { devname: "dri/renderD128".into(), dev_major: 0, dev_minor: 128 });
+            serve(b.as_fd(), &mut s, || Ok(true), |_| Ok(())).unwrap()
+        });
+        let send = |m: &[u8]| {
+            // SAFETY: valid buffer.
+            assert_eq!(unsafe { libc::write(a.as_raw_fd(), m.as_ptr().cast(), m.len()) }, m.len() as isize);
+        };
+        let recv = || {
+            let mut buf = vec![0u8; 8192];
+            // SAFETY: valid buffer.
+            let n = unsafe { libc::read(a.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            buf.truncate(n.max(0) as usize);
+            buf
+        };
+        let me = std::process::id();
+        // SAFETY: getter.
+        let uid = unsafe { libc::geteuid() };
+        send(&init_req(1, 45));
+        recv();
+        send(&req_as(FUSE_OPEN, 2, me, uid, &OpenIn::default().to_bytes()));
+        let fh = u64::from_ne_bytes(recv()[16..24].try_into().unwrap());
+        let (mut client, far) = UnixStream::pair().unwrap();
+        let arg = encode_connect(far.as_raw_fd(), "sv-bell:/run/hub.sock").unwrap();
+        let ioctl = |unique: u64, data: &[u8], uid: u32| {
+            let a = IoctlIn {
+                fh,
+                flags: FUSE_IOCTL_UNRESTRICTED,
+                cmd: DRM_IOCTL_SVDRM_CONNECT,
+                arg: 0x9000,
+                in_size: data.len() as u32,
+                out_size: 0,
+            };
+            let mut body = a.to_bytes();
+            body.extend_from_slice(data);
+            req_as(crate::cuse::FUSE_IOCTL, unique, me, uid, &body)
+        };
+        send(&ioctl(3, &[], uid));
+        assert!(matches!(decode_ioctl_reply(&recv(), 3), Got::Retry(..)));
+        send(&ioctl(4, &arg, uid + 1));
+        assert_eq!(decode_ioctl_reply(&recv(), 4), Got::Err(libc::EACCES), "cross-uid");
+        send(&ioctl(5, &arg, uid));
+        let r = recv();
+        assert_eq!(IoctlOut::parse(&r[16..]).unwrap().result, 0);
+        let mut got = reg.accept().unwrap();
+        assert_eq!(peer_cred(&got.stream).unwrap().pid as u32, me);
+        got.stream.write_all(b"x").unwrap();
+        let mut c = [0u8; 1];
+        client.read_exact(&mut c).unwrap();
+        assert_eq!(&c, b"x");
+        drop(a);
+        assert!(matches!(t.join().unwrap(), crate::cuse::Stop::Closed));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

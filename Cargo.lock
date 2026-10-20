@@ -1313,6 +1313,7 @@ dependencies = [
  "arena-record",
  "libc",
  "sv-arena",
+ "sv-drm",
  "sv-transport",
  "sv-wire",
 ]

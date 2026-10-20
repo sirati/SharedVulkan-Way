@@ -62,9 +62,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
                  sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
-                 sv-hostd ivshmem-serve --region <file> --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n                \
+                 sv-hostd ivshmem-serve --region <file> --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N] [--drm-services <sock>]\n                \
                  (--cold <sock>: the TCP cold path, debug only)\n  \
-                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock> [--port ...]   (§99: one per user, every session shares it)\n  \
+                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock> [--port ...] [--drm-services <sock>]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
@@ -631,24 +631,24 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             cold.clone()
         }
     );
-    let mut served = 0u64;
-    for conn in listener.incoming() {
-        let sock = match conn {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("sv-hostd: accept: {e}");
-                continue;
-            }
-        };
-        served += 1;
-        let i = served;
+    let next_client = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // One ICD's exchange, on its own thread: an accepted connection, or one
+    // the render node forwarded (§112).
+    let spawn_icd = {
+        let next_client = Arc::clone(&next_client);
+        let (file, region, cold) = (Arc::clone(&file), region.clone(), cold.clone());
+        let (mailboxes, cold_bell) = (mailboxes.clone(), cold_bell.clone());
+        Arc::new(move |sock: UnixStream, via: &'static str| {
+        let i = next_client.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let (file, region, cold) = (Arc::clone(&file), region.clone(), cold.clone());
         let (mailboxes, cold_bell) = (mailboxes.clone(), cold_bell.clone());
         std::thread::spawn(move || {
             let t = std::time::Instant::now();
+            let mut by_fd = false;
             let result = (|| -> Result<String, String> {
                 match recv(&sock).map_err(|e| format!("no attach request: {e}"))? {
                     ColdMessage::AttachRequest => {}
+                    ColdMessage::AttachRequestFds => by_fd = true,
                     other => return Err(format!("expected AttachRequest, got {other:?}")),
                 }
                 let mut timing = String::new();
@@ -695,12 +695,37 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     tcp_cold(&cold, &file, &region, region_len)?
                 };
-                send(&sock, &ColdMessage::Attach(at.clone())).map_err(|e| format!("Attach: {e}"))?;
+                if by_fd {
+                    // No names for a client that cannot open them: the
+                    // objects it would have opened, opened here as the same
+                    // user, travel with the message.
+                    let ctl = sv_transport::region::open_named(&at.object).map_err(|e| format!("{}: {e}", at.object))?;
+                    let arena = if at.arena_object.is_empty() || at.arena_object == at.object {
+                        None
+                    } else {
+                        Some(sv_transport::region::open_named(&at.arena_object).map_err(|e| format!("{}: {e}", at.arena_object))?)
+                    };
+                    let nameless = sv_transport::cold::Attachment { object: String::new(), arena_object: String::new(), ..at.clone() };
+                    let mut buf = Vec::new();
+                    ColdMessage::Attach(nameless).encode(&mut buf).map_err(|e| format!("Attach: {e}"))?;
+                    let mut fds = vec![ctl.as_fd()];
+                    fds.extend(arena.as_ref().map(|f| f.as_fd()));
+                    sv_transport::localfd::send_with_fds(&sock, &buf, &fds).map_err(|e| format!("Attach: {e}"))?;
+                } else {
+                    send(&sock, &ColdMessage::Attach(at.clone())).map_err(|e| format!("Attach: {e}"))?;
+                }
                 sock.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
                 match recv(&sock) {
                     Ok(ColdMessage::Accept { .. }) => {}
                     Ok(other) => return Err(format!("the ICD said {other:?}")),
                     Err(e) => return Err(format!("the ICD never acknowledged: {e}")),
+                }
+                if by_fd {
+                    // The pool's regions, by descriptor, for as long as the
+                    // ICD holds the connection.
+                    sock.set_read_timeout(None).ok();
+                    let (sock, region) = (sock.try_clone().map_err(|e| e.to_string())?, region.clone());
+                    std::thread::spawn(move || serve_regions(&sock, &region, i));
                 }
                 // What was checked: a slot's every page, or a pooled session's
                 // control region only (its arena is the whole device, §97).
@@ -714,14 +739,45 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     checked / sv_transport::region::PAGE as u64
                 ))
             })();
+            let how = if by_fd { ", by descriptor" } else { "" };
             match result {
-                Ok(s) => eprintln!("sv-hostd: ICD client {i} attached: {s} in {:.2?}", t.elapsed()),
+                Ok(s) => eprintln!("sv-hostd: ICD client {i} ({via}{how}) attached: {s} in {:.2?}", t.elapsed()),
                 Err(e) => {
                     let _ = send(&sock, &ColdMessage::Refuse { code: 2, reason: e.clone() });
-                    eprintln!("sv-hostd: ICD client {i}: {e}");
+                    eprintln!("sv-hostd: ICD client {i} ({via}{how}): {e}");
                 }
             }
         });
+        })
+    };
+
+    // §112: the same service through the render node, for an ICD in a
+    // sandbox that may not connect to `--socket`. Registered for this uid
+    // only; sv-drm passes only this uid's clients, and each is checked again.
+    if let Some(services) = arg("--drm-services") {
+        let name = sv_drm::relay::service_name(sv_drm::relay::GPU_PREFIX, &path);
+        let spawn_icd = Arc::clone(&spawn_icd);
+        let me = unsafe { libc::geteuid() };
+        sv_drm::relay::keep_registered(services.into(), name, false, move |f| {
+            match sv_drm::relay::peer_cred(&f.stream) {
+                Ok(c) if c.uid == me => spawn_icd(f.stream, "through the render node"),
+                Ok(c) => eprintln!("sv-hostd: a forwarded client of uid {} (pid {}) is not ours; dropped", c.uid, c.pid),
+                Err(e) => eprintln!("sv-hostd: a forwarded client without credentials ({e}); dropped"),
+            }
+        })?;
+    }
+
+    let mut served = 0u64;
+    for conn in listener.incoming() {
+        let sock = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sv-hostd: accept: {e}");
+                continue;
+            }
+        };
+        served += 1;
+        spawn_icd(sock, "socket");
         if clients != 0 && served >= clients {
             break;
         }
@@ -778,6 +834,53 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok((at, *hello))
     }
+}
+
+/// After an `AttachRequestFds` attach (waycompose-design.md §112): answer
+/// each `RegionRequest { k }` with region `k`'s descriptor, the file a named
+/// ICD would open as `poolhdr::region_path(region, k)`, opened here as the
+/// same user. Ends when the ICD closes the connection.
+#[cfg(target_os = "linux")]
+fn serve_regions(sock: &std::os::unix::net::UnixStream, region: &str, i: u64) {
+    use std::os::fd::AsFd;
+    use sv_transport::cold::{ColdMessage, recv, send};
+    let mut given = 0u32;
+    loop {
+        let k = match recv(sock) {
+            Ok(ColdMessage::RegionRequest { k }) => k,
+            Ok(other) => {
+                let _ = send(sock, &ColdMessage::Refuse { code: 1, reason: format!("expected RegionRequest, got {other:?}") });
+                break;
+            }
+            Err(_) => break,
+        };
+        let opened = if k as usize >= sv_arena::pool::MAX_REGIONS {
+            Err(format!("region {k} is past the pool's {} regions", sv_arena::pool::MAX_REGIONS))
+        } else {
+            let p = sv_transport::poolhdr::region_path(region, k);
+            sv_transport::region::open_named(&p)
+                .map_err(|e| format!("{p}: {e}"))
+                .and_then(|f| f.metadata().map(|m| (m.len(), f)).map_err(|e| format!("{p}: {e}")))
+        };
+        let sent = match opened {
+            Ok((len, f)) => {
+                let mut buf = Vec::new();
+                ColdMessage::Region { k, len }
+                    .encode(&mut buf)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| sv_transport::localfd::send_with_fds(sock, &buf, &[f.as_fd()]).map_err(|e| e.to_string()))
+                    .map(|()| given += 1)
+            }
+            Err(e) => {
+                eprintln!("sv-hostd: ICD client {i}: region {k}: {e}");
+                send(sock, &ColdMessage::Refuse { code: 4, reason: e }).map_err(|e| e.to_string())
+            }
+        };
+        if sent.is_err() {
+            break;
+        }
+    }
+    eprintln!("sv-hostd: ICD client {i}: {given} region descriptor(s) given; it closed the connection");
 }
 
 /// `UID:GID`, both numeric. Names are not resolved: this runs as root, and a
@@ -1406,6 +1509,7 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // §99.6: what a previous run of this unit left in systemd's store.
     let mut kept = sv_hostd::sdfd::take();
     let keep = std::env::var_os("NOTIFY_SOCKET").is_some();
+    let drm_services = args.iter().position(|a| a == "--drm-services").and_then(|i| args.get(i + 1)).cloned();
     if !kept.is_empty() {
         let mut names: Vec<&String> = kept.keys().collect();
         names.sort();
@@ -1435,7 +1539,23 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         };
         let inherited = kept.remove(&format!("{name}-up"));
         eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
-        hubs.push(sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?);
+        let hub = sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?;
+        // §112: the same hub through the render node, for an ICD in a
+        // sandbox that may not connect to it. This uid's clients only.
+        if let Some(services) = drm_services.clone() {
+            let svc = sv_drm::relay::service_name(sv_drm::relay::BELL_PREFIX, at);
+            let hub = std::sync::Arc::clone(&hub);
+            let me = unsafe { libc::geteuid() };
+            sv_drm::relay::keep_registered(services.into(), svc, false, move |f| match sv_drm::relay::peer_cred(&f.stream) {
+                Ok(c) if c.uid == me => {
+                    if let Err(e) = hub.add_client(f.stream) {
+                        eprintln!("bell-hub: a forwarded client could not be served: {e}");
+                    }
+                }
+                _ => eprintln!("bell-hub: a forwarded client that is not ours (pid {}); dropped", f.pid),
+            })?;
+        }
+        hubs.push(hub);
     }
     if hubs.is_empty() {
         return Err("bell-hub needs at least one --port UPSTREAM=HUB".into());

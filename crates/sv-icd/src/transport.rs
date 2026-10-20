@@ -502,6 +502,133 @@ fn lower(e: sv_transport::Error) -> LowerError {
     }
 }
 
+/// How the doorbell hub at `path` (`SV_BELL`) is reached, every time the
+/// doorman (re)connects: directly, and on Linux, when that fails and
+/// `SV_DRM_NODE` is set, through the render node (§112).
+#[cfg(unix)]
+fn bell_connector(path: &str) -> impl Fn() -> std::io::Result<sv_transport::vdoorbell::PortHandle> + Send + 'static {
+    let path = path.to_string();
+    move || match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(s) => Ok(sv_transport::vdoorbell::PortHandle::Unix(s)),
+        Err(e) => {
+            #[cfg(target_os = "linux")]
+            if let Some(r) = relay::connect(sv_drm::relay::BELL_PREFIX, &path) {
+                return r.map(sv_transport::vdoorbell::PortHandle::Unix).inspect(|_| {
+                    relay::say_once(&format!("{path}: {e}; the doorbell comes through the render node"));
+                });
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Why an attach failed: a name that did not open (worth retrying through the
+/// render node, §112), or anything else.
+#[cfg(target_os = "linux")]
+enum AttachError {
+    Name(String),
+    Other(String),
+}
+
+#[cfg(target_os = "linux")]
+impl AttachError {
+    fn text(self) -> String {
+        match self {
+            AttachError::Name(s) | AttachError::Other(s) => s,
+        }
+    }
+}
+
+/// The render node's relay, from this side (waycompose-design.md §112): a
+/// sandboxed process may open `SV_DRM_NODE` and issue its ioctls, but may not
+/// connect to `SV_SOCKET` or `SV_BELL` nor open the pool by name.
+#[cfg(target_os = "linux")]
+pub(crate) mod relay {
+    use std::os::unix::net::UnixStream;
+
+    pub const NODE_ENV: &str = "SV_DRM_NODE";
+
+    /// `service` (`sv-gpu:`/`sv-bell:` + the path this process was given)
+    /// through the node, or `None` when `SV_DRM_NODE` is unset.
+    pub fn connect(prefix: &str, path: &str) -> Option<std::io::Result<UnixStream>> {
+        let node = std::env::var_os(NODE_ENV)?;
+        let name = sv_drm::relay::service_name(prefix, path);
+        Some(sv_drm::relay::connect_via(std::path::Path::new(&node), &name))
+    }
+
+    /// What the relay did, said once per message.
+    pub fn say_once(what: &str) {
+        static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let mut s = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.iter().any(|x| x == what) {
+            s.push(what.to_string());
+            eprintln!("sv-icd: {what}");
+        }
+    }
+
+    /// Region `k`'s descriptor and length, asked of `sv-hostd` over the
+    /// connection the node introduced.
+    pub fn region(sock: &std::sync::Mutex<UnixStream>, k: u32) -> Result<(std::os::fd::OwnedFd, u64), String> {
+        use sv_transport::cold::{ColdMessage, send};
+        let s = sock.lock().unwrap_or_else(|e| e.into_inner());
+        send(&s, &ColdMessage::RegionRequest { k }).map_err(|e| format!("region {k}: {e}"))?;
+        let (msg, fds) = sv_transport::localfd::recv_all(&s).map_err(|e| format!("region {k}: {e}"))?;
+        match msg {
+            ColdMessage::Region { k: got, len } if got == k => {
+                let fd = fds.into_iter().next().ok_or_else(|| format!("region {k} came without a descriptor"))?;
+                Ok((fd, len))
+            }
+            ColdMessage::Refuse { code, reason } => Err(format!("region {k} refused ({code}): {reason}")),
+            other => Err(format!("region {k}: unexpected {other:?}")),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::fd::AsFd;
+        use sv_transport::cold::{ColdMessage, recv, send};
+
+        /// A region comes back as a descriptor of its file, and a refusal as
+        /// the daemon's reason.
+        #[test]
+        fn a_region_by_descriptor_and_a_refusal() {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let hostd = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    match recv(&theirs).unwrap() {
+                        ColdMessage::RegionRequest { k: 0 } => {
+                            let f = sv_transport::region::memfd("region0", 65536).unwrap();
+                            let mut b = Vec::new();
+                            ColdMessage::Region { k: 0, len: 65536 }.encode(&mut b).unwrap();
+                            sv_transport::localfd::send_with_fds(&theirs, &b, &[f.as_fd()]).unwrap();
+                        }
+                        ColdMessage::RegionRequest { k } => {
+                            send(&theirs, &ColdMessage::Refuse { code: 4, reason: format!("no region {k}") }).unwrap();
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            });
+            let sock = std::sync::Mutex::new(ours);
+            let (fd, len) = region(&sock, 0).unwrap();
+            assert_eq!(len, 65536);
+            let m = sv_transport::region::SharedRegion::map_fd(fd.as_fd(), 0, 65536).unwrap();
+            m.write_bytes(100, b"x").unwrap();
+            let e = region(&sock, 7).unwrap_err();
+            assert!(e.contains("no region 7"), "{e}");
+            hostd.join().unwrap();
+        }
+
+        #[test]
+        fn without_the_node_there_is_no_relay() {
+            if std::env::var_os(NODE_ENV).is_none() {
+                assert!(connect(sv_drm::relay::GPU_PREFIX, "/run/x.sock").is_none());
+            }
+        }
+    }
+}
+
 impl RingTransport {
     /// Connect to whichever side is serving the cold path, attach, claim rings.
     ///
@@ -516,41 +643,87 @@ impl RingTransport {
     /// descriptor. That path is same-machine-only by construction and cannot
     /// exist across a hypervisor; `sv_transport::localfd` documents why it is
     /// still here. Every other topology takes the name.
+    /// Linux: when `SV_SOCKET` cannot be reached, or names cannot be opened,
+    /// and `SV_DRM_NODE` is set, the same exchange runs over a connection the
+    /// render node introduces (waycompose-design.md §112), asking for
+    /// descriptors instead of names. Everything else is unchanged.
     #[cfg(target_os = "linux")]
     pub fn connect(socket: &str) -> Result<Attached, String> {
-        use std::os::fd::AsFd;
         use std::os::unix::net::UnixStream;
-        use sv_transport::cold::{ColdMessage, send};
-
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let sock = loop {
+        let (sock, by_fd) = loop {
             match UnixStream::connect(socket) {
-                Ok(s) => break s,
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
+                Ok(s) => break (s, false),
+                Err(e) => {
+                    let relayed = relay::connect(sv_drm::relay::GPU_PREFIX, socket);
+                    match relayed {
+                        Some(Ok(s)) => {
+                            relay::say_once(&format!("{socket}: {e}; reaching the GPU side through the render node"));
+                            break (s, true);
+                        }
+                        _ if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(20))
+                        }
+                        Some(Err(re)) => {
+                            return Err(format!("cannot reach {socket}: {e}; nor through the render node: {re}"));
+                        }
+                        None => return Err(format!("cannot reach {socket}: {e}")),
+                    }
                 }
-                Err(e) => return Err(format!("cannot reach {socket}: {e}")),
             }
         };
-        send(&sock, &ColdMessage::AttachRequest).map_err(|e| e.to_string())?;
+        match RingTransport::attach_over(sock, by_fd) {
+            // Reached, but the names did not open (a sandbox that permits the
+            // connect and not the open): once more through the node.
+            Err(AttachError::Name(e)) if !by_fd => match relay::connect(sv_drm::relay::GPU_PREFIX, socket) {
+                Some(Ok(s)) => {
+                    relay::say_once(&format!("{e}; attaching through the render node instead"));
+                    RingTransport::attach_over(s, true).map_err(AttachError::text)
+                }
+                Some(Err(re)) => Err(format!("{e}; and through the render node: {re}")),
+                None => Err(e),
+            },
+            r => r.map_err(AttachError::text),
+        }
+    }
+
+    /// The cold-path exchange over `sock`: by name, or (`by_fd`) by
+    /// descriptor, the connection then kept for the pool's regions.
+    #[cfg(target_os = "linux")]
+    fn attach_over(sock: std::os::unix::net::UnixStream, by_fd: bool) -> Result<Attached, AttachError> {
+        use std::os::fd::{AsFd, OwnedFd};
+        use sv_transport::cold::{ColdMessage, send};
+        use AttachError::Other;
+        let o = |e: sv_transport::Error| Other(e.to_string());
+
+        let ask = if by_fd { ColdMessage::AttachRequestFds } else { ColdMessage::AttachRequest };
+        send(&sock, &ask).map_err(o)?;
         // The nameless-arena provider sends its dma-buf with the message, so the
-        // read has to be able to collect one. Every other provider sends none,
-        // and `fds` is then empty.
+        // read has to be able to collect one. On the named path every other
+        // provider sends none, and `fds` is then empty; by descriptor, the
+        // control object and, if it is another one, the arena.
         let mut buf = Vec::new();
-        let fds =
-            sv_transport::localfd::recv_with_fds(&sock, &mut buf).map_err(|e| e.to_string())?;
-        let at = match ColdMessage::decode(&buf).map_err(|e| e.to_string())? {
+        let fds = sv_transport::localfd::recv_with_fds(&sock, &mut buf).map_err(o)?;
+        let at = match ColdMessage::decode(&buf).map_err(o)? {
             ColdMessage::Attach(a) => a,
             ColdMessage::Refuse { code, reason } => {
-                return Err(format!("refused {code}: {reason}"));
+                return Err(Other(format!("refused {code}: {reason}")));
             }
-            other => return Err(format!("unexpected cold-path message {other:?}")),
+            other => return Err(Other(format!("unexpected cold-path message {other:?}"))),
         };
 
-        // Open the control region by name. Always: even the quarantined provider
-        // names it, which is what reduced that path to one nameless object.
-        let control_file =
-            sv_transport::region::open_named(&at.object).map_err(|e| e.to_string())?;
+        // Open the control region by name. Always on the named path: even the
+        // quarantined provider names it, which is what reduced that path to
+        // one nameless object.
+        let mut fds = fds.into_iter();
+        let (control_file, by_fd_arena): (OwnedFd, Option<OwnedFd>) = if by_fd {
+            let c = fds.next().ok_or_else(|| Other("the daemon sent no descriptor for the control region".into()))?;
+            (c, fds.next())
+        } else {
+            let f = sv_transport::region::open_named(&at.object).map_err(|e| AttachError::Name(format!("{}: {e}", at.object)))?;
+            (f.into(), None)
+        };
+        let fds: Vec<OwnedFd> = fds.collect();
 
         // A non-zero `run_count` means the extent is scattered through the
         // object and the daemon is sending the runs next. That is the
@@ -560,45 +733,35 @@ impl RingTransport {
         // ICDs".
         let (control_region, arena) = if at.run_count != 0 {
             let mut buf = Vec::new();
-            sv_transport::cold::recv_bytes(&sock, &mut buf).map_err(|e| e.to_string())?;
-            let runs = match ColdMessage::decode(&buf).map_err(|e| e.to_string())? {
+            sv_transport::cold::recv_bytes(&sock, &mut buf).map_err(o)?;
+            let runs = match ColdMessage::decode(&buf).map_err(o)? {
                 ColdMessage::Runs(r) => r,
-                other => return Err(format!("expected the run list, got {other:?}")),
+                other => return Err(Other(format!("expected the run list, got {other:?}"))),
             };
             if runs.len() as u64 != at.run_count {
-                return Err(format!(
-                    "the daemon said {} runs and sent {}",
-                    at.run_count,
-                    runs.len()
-                ));
+                return Err(Other(format!("the daemon said {} runs and sent {}", at.run_count, runs.len())));
             }
-            RingTransport::stitch_two(control_file.as_fd(), &at, &runs)?
+            RingTransport::stitch_two(control_file.as_fd(), &at, &runs).map_err(Other)?
         } else {
-            let control = Arc::new(
-                SharedRegion::map_fd(control_file.as_fd(), at.control_offset, at.control_len as usize)
-                    .map_err(|e| e.to_string())?,
-            );
-            let arena = if at.arena_object.is_empty() {
+            let map = |fd: std::os::fd::BorrowedFd<'_>, off: u64, len: u64| {
+                SharedRegion::map_fd(fd, off, len as usize).map(Arc::new).map_err(o)
+            };
+            let control = map(control_file.as_fd(), at.control_offset, at.control_len)?;
+            let arena = if by_fd {
+                let fd = by_fd_arena.as_ref().unwrap_or(&control_file);
+                map(fd.as_fd(), at.arena_offset, at.arena_len)?
+            } else if at.arena_object.is_empty() {
                 // The one nameless object in the project: an exported dma-buf.
                 let fd = fds
                     .first()
-                    .ok_or("the peer named no arena and sent no descriptor for one")?;
-                Arc::new(
-                    SharedRegion::map_fd(fd.as_fd(), at.arena_offset, at.arena_len as usize)
-                        .map_err(|e| e.to_string())?,
-                )
+                    .ok_or_else(|| Other("the peer named no arena and sent no descriptor for one".into()))?;
+                map(fd.as_fd(), at.arena_offset, at.arena_len)?
             } else if at.arena_object == at.object {
-                Arc::new(
-                    SharedRegion::map_fd(control_file.as_fd(), at.arena_offset, at.arena_len as usize)
-                        .map_err(|e| e.to_string())?,
-                )
+                map(control_file.as_fd(), at.arena_offset, at.arena_len)?
             } else {
                 let f = sv_transport::region::open_named(&at.arena_object)
-                    .map_err(|e| e.to_string())?;
-                Arc::new(
-                    SharedRegion::map_fd(f.as_fd(), at.arena_offset, at.arena_len as usize)
-                        .map_err(|e| e.to_string())?,
-                )
+                    .map_err(|e| AttachError::Name(format!("{}: {e}", at.arena_object)))?;
+                map(f.as_fd(), at.arena_offset, at.arena_len)?
             };
             (control, arena)
         };
@@ -607,8 +770,11 @@ impl RingTransport {
         let _ = send(&sock, &ColdMessage::Accept { generation: at.generation });
         // What the pool's regions are mapped from, should the GPU side say the
         // arena is leased: the named file (region 0, and the files beside it),
-        // or on the development export path the one descriptor.
-        let source = if at.arena_object.is_empty() {
+        // on the development export path the one descriptor, and through the
+        // render node this connection, which answers `RegionRequest`s.
+        let source = if by_fd {
+            PoolSource::Relay(Mutex::new(sock))
+        } else if at.arena_object.is_empty() {
             match fds.first().map(|f| f.try_clone()) {
                 Some(Ok(fd)) => PoolSource::Fd(fd),
                 _ => PoolSource::None,
@@ -616,8 +782,11 @@ impl RingTransport {
         } else {
             PoolSource::Path(at.arena_object.clone())
         };
-        let mut attached = RingTransport::finish_attach(control_region, arena, at.arena_len)?;
-        attached.enter_pool(source, at.arena_offset, at.arena_len)?;
+        let mut attached = RingTransport::finish_attach(control_region, arena, at.arena_len).map_err(Other)?;
+        attached.enter_pool(source, at.arena_offset, at.arena_len).map_err(Other)?;
+        if by_fd {
+            relay::say_once("attached by descriptor through the render node; no name was opened");
+        }
         Ok(attached)
     }
 
@@ -859,7 +1028,7 @@ impl RingTransport {
             Err(_) => None,
             // §99: reconnecting, so a restarted hub costs this session only
             // the bells in the gap.
-            Ok(path) => match sv_transport::vdoorbell::attach_host_reconnecting(&path, Arc::clone(&control))
+            Ok(path) => match sv_transport::vdoorbell::attach_reconnecting_with(&path, bell_connector(&path), Arc::clone(&control))
                 .map_err(|e| e.to_string())
             {
                 Ok((d, true)) => {
@@ -2065,6 +2234,10 @@ pub enum PoolSource {
     /// The development export path's one descriptor: region 0 only.
     #[cfg(target_os = "linux")]
     Fd(std::os::fd::OwnedFd),
+    /// Through the render node (§112): the connection to `sv-hostd`, which
+    /// answers `RegionRequest { k }` with region `k`'s descriptor.
+    #[cfg(target_os = "linux")]
+    Relay(Mutex<std::os::unix::net::UnixStream>),
     None,
 }
 
@@ -2112,6 +2285,10 @@ impl Attached {
             }
             PoolSource::Fd(fd) => {
                 view.map_fixed(0, fd.as_fd(), arena_offset, arena_len).map_err(|e| format!("the pool descriptor: {e}"))?;
+            }
+            PoolSource::Relay(sock) => {
+                let (fd, _) = relay::region(sock, 0)?;
+                view.map_fixed(0, fd.as_fd(), arena_offset, arena_len).map_err(|e| format!("region 0 by descriptor: {e}"))?;
             }
             PoolSource::None => return Err("the arena is leased and nothing names the pool to map".into()),
         }
@@ -2188,12 +2365,19 @@ impl RingTransport {
     #[cfg(target_os = "linux")]
     fn map_region(&self, pool: &PoolView, k: u32) -> IcdResult<()> {
         use std::os::fd::AsFd;
-        let PoolSource::Path(boot) = &pool.source else {
-            return Err(LowerError::Shape("a lease in a region this process has no name for"));
+        let (f, len): (std::os::fd::OwnedFd, u64) = match &pool.source {
+            PoolSource::Path(boot) => {
+                let path = sv_transport::poolhdr::region_path(boot, k);
+                let f = sv_transport::region::open_named(&path).map_err(lower)?;
+                let len = f.metadata().map_err(|_| LowerError::Shape("a pool region with no size"))?.len();
+                (f.into(), len)
+            }
+            PoolSource::Relay(sock) => relay::region(sock, k).map_err(|e| {
+                relay::say_once(&e);
+                LowerError::Shape("a pool region the GPU service did not hand over")
+            })?,
+            _ => return Err(LowerError::Shape("a lease in a region this process has no name for")),
         };
-        let path = sv_transport::poolhdr::region_path(boot, k);
-        let f = sv_transport::region::open_named(&path).map_err(lower)?;
-        let len = f.metadata().map_err(|_| LowerError::Shape("a pool region with no size"))?.len();
         self.arena
             .map_fixed(u64::from(k) * sv_arena::pool::REGION_STRIDE, f.as_fd(), 0, len)
             .map_err(lower)?;
