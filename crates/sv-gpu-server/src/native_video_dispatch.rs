@@ -427,7 +427,7 @@ impl GpuServer {
             profile(&list.p_profiles[0])?;
             let supported = vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
                 | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-                | vk::ImageUsageFlags::TRANSFER_DST;
+                | vk::ImageUsageFlags::SAMPLED;
             let requested = vk::ImageUsageFlags::from_raw(info.image_usage.0);
             if requested.is_empty()
                 || !supported.contains(requested)
@@ -456,7 +456,7 @@ impl GpuServer {
             let mut out = p::VkVideoFormatPropertiesKHR::default();
             out.format = p::VkFormat(vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw());
             out.image_type = p::VkImageType(vk::ImageType::TYPE_2D.as_raw());
-            out.image_tiling = p::VkImageTiling(vk::ImageTiling::OPTIMAL.as_raw());
+            out.image_tiling = p::VkImageTiling(vk::ImageTiling::LINEAR.as_raw());
             out.image_usage_flags = p::VkImageUsageFlags(supported.as_raw());
             reply.p_video_format_property_count = Some(1);
             reply.p_video_format_properties = vec![out];
