@@ -41,6 +41,7 @@ members = [
 
   # The Wayland side.
   "crates/wc-transport",
+  "crates/wc-hyperlinux",
   "crates/wc-handle",
   "crates/wc-server",
   "crates/wc-compositor",

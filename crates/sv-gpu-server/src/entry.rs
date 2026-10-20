@@ -23,6 +23,9 @@
 //! between the two, which is the point — everything above the provider is the
 //! same code.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod hyperlinux;
+
 /// The Windows GPU side.
 ///
 /// ```text
@@ -878,6 +881,7 @@ pub fn run_main(_argv: Vec<String>) -> std::process::ExitCode {
 #[cfg(target_os = "macos")]
 pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
     let r = match argv.get(1).map(String::as_str) {
+        Some("hl-local") => hyperlinux::run(&argv),
         Some("guest" | "mem-guest") => mem_guest(&argv),
         Some("probe") => mac_probe(&argv),
         _ => {
@@ -1194,6 +1198,7 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
     let mode = args.get(1).cloned().unwrap_or_default();
+    if mode == "hl-local" { return hyperlinux::run(&args); }
     // §103.6: the cold path in the extent's first page, over a shared file.
     if mode == "mem-guest" {
         return mem_guest(&args);

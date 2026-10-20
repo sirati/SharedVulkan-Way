@@ -1296,6 +1296,7 @@ dependencies = [
  "sv-wire",
  "wc-broker",
  "wc-handle",
+ "wc-hyperlinux",
 ]
 
 [[package]]
@@ -1780,6 +1781,14 @@ dependencies = [
  "objc2",
  "wc-hostint",
  "windows-sys",
+]
+
+[[package]]
+name = "wc-hyperlinux"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sv-drm",
 ]
 
 [[package]]

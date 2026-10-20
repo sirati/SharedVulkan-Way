@@ -4,6 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # ARM64 Linux bootstrap and the existing native KosmicKrisp provider use
+    # the already audited runtime package set, independently of the dev shell.
+    hyperlinux-runtime-nixpkgs.url = "github:NixOS/nixpkgs/afce96367b2e37fc29afb5543573cd49db3357b7";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -21,7 +24,7 @@
     };
   };
 
-  outputs = {
+  outputs = inputs@{
     nixpkgs,
     flake-utils,
     rust-overlay,
@@ -502,5 +505,23 @@
         .system
         .build
         .vm;
+    }) // (let
+      stack = import ./nix/hyperlinux/stack.nix {
+        inputs = inputs // {
+          nixpkgs = inputs.hyperlinux-runtime-nixpkgs;
+          nativeNixpkgs = inputs.nixpkgs;
+        };
+      };
+    in {
+      # These outputs contain Darwin launchers but every derivation builds on
+      # Linux. Realize/copy the complete closure on vmhost before nix run on Mac.
+      packages.aarch64-darwin.hyperlinux-firefox = stack.firefox.launcher;
+      packages.aarch64-darwin.hyperlinux-runtime = stack.hl;
+      packages.aarch64-darwin.hyperlinux-native = stack.hostTools;
+      apps.aarch64-darwin.hyperlinux-firefox = stack.firefox.app;
+      packages.aarch64-darwin.hyperlinux-shared-probe = stack.probe;
+      apps.aarch64-darwin.hyperlinux-shared-probe = {
+        type = "app"; program = "${stack.probe}/bin/hyperlinux-shared-probe";
+      };
     });
 }
