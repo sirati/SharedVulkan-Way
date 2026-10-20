@@ -1,0 +1,255 @@
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -17,0 +18 @@
++#include "udmabuf-protected.h"
+@@ -27,0 +29,3 @@
++	/* Serializes cached CPU SG creation, direction, sync and teardown. */
++	struct mutex cpu_lock;
++	struct udmabuf_retirement *retirement;
+@@ -94,0 +99,2 @@
++	.open = udmabuf_vma_open,
++	.close = udmabuf_vma_close,
+@@ -103,0 +110,15 @@
++	if (ubuf->retirement) {
++		if (vma->vm_pgoff > ubuf->pagecount ||
++		    vma_pages(vma) > ubuf->pagecount - vma->vm_pgoff)
++			return -EINVAL;
++		if ((vma->vm_flags & VM_EXEC) ||
++		    (udmabuf_is_readonly(ubuf) && (vma->vm_flags & VM_WRITE)))
++			return -EACCES;
++		vm_flags_clear(vma, VM_MAYEXEC);
++		if (udmabuf_is_readonly(ubuf))
++			vm_flags_clear(vma, VM_MAYWRITE);
++	}
++	/* Retain this exact dma-buf file even if an importer called the
++	 * exporter directly instead of the public dma_buf_mmap helper. */
++	if (ubuf->retirement)
++		vma_set_file(vma, buf->file);
+@@ -106,0 +128 @@
++	udmabuf_vma_open(vma);
+@@ -117,0 +140,2 @@
++	if (udmabuf_is_readonly(ubuf))
++		return -EACCES;
+@@ -132,0 +157,2 @@
++	if (ubuf->retirement)
++		atomic_inc(&ubuf->retirement->vmaps);
+@@ -142,0 +169,2 @@
++	if (ubuf->retirement)
++		atomic_dec(&ubuf->retirement->vmaps);
+@@ -189 +217,8 @@
+-	return get_sg_table(at->dev, at->dmabuf, direction);
++	struct udmabuf *ubuf = at->dmabuf->priv;
++	struct sg_table *sg;
++	if (udmabuf_is_readonly(ubuf))
++		return ERR_PTR(-EACCES);
++	sg = get_sg_table(at->dev, at->dmabuf, direction);
++	if (!IS_ERR(sg) && ubuf->retirement)
++		atomic_inc(&ubuf->retirement->maps);
++	return sg;
+@@ -196 +231,4 @@
+-	return put_sg_table(at->dev, sg, direction);
++	struct udmabuf *ubuf = at->dmabuf->priv;
++	put_sg_table(at->dev, sg, direction);
++	if (ubuf->retirement)
++		atomic_dec(&ubuf->retirement->maps);
+@@ -234,0 +273,10 @@
++static void udmabuf_cleanup_cpu(struct udmabuf *ubuf)
++{
++	mutex_lock(&ubuf->cpu_lock);
++	if (ubuf->sg) {
++		put_sg_table(ubuf->device->this_device, ubuf->sg, ubuf->sg_dir);
++		ubuf->sg = NULL;
++	}
++	mutex_unlock(&ubuf->cpu_lock);
++}
++
+@@ -235,0 +284,14 @@
++{
++	struct udmabuf *ubuf = buf->priv;
++
++	if (ubuf->retirement) {
++		udmabuf_retire_buffer(buf);
++		return;
++	}
++	udmabuf_cleanup_cpu(ubuf);
++	deinit_udmabuf(ubuf);
++	kfree(ubuf);
++}
++
++static int begin_cpu_udmabuf(struct dma_buf *buf,
++			   enum dma_data_direction direction)
+@@ -239,10 +301,25 @@
+-
+-	if (ubuf->sg)
+-		put_sg_table(dev, ubuf->sg, ubuf->sg_dir);
+-
+-	deinit_udmabuf(ubuf);
+-	kfree(ubuf);
+-}
+-
+-static int begin_cpu_udmabuf(struct dma_buf *buf,
+-			     enum dma_data_direction direction)
++	enum dma_data_direction mapped = udmabuf_is_readonly(ubuf) ?
++		DMA_FROM_DEVICE : DMA_BIDIRECTIONAL;
++	int ret = 0;
++
++	if (udmabuf_is_readonly(ubuf) && direction != DMA_FROM_DEVICE)
++		return -EACCES;
++	mutex_lock(&ubuf->cpu_lock);
++	if (!ubuf->sg) {
++		struct sg_table *sg = get_sg_table(dev, buf, mapped);
++
++		if (IS_ERR(sg)) {
++			ret = PTR_ERR(sg);
++			goto out;
++		}
++		ubuf->sg = sg;
++		ubuf->sg_dir = mapped;
++	}
++	dma_sync_sgtable_for_cpu(dev, ubuf->sg, ubuf->sg_dir);
++out:
++	mutex_unlock(&ubuf->cpu_lock);
++	return ret;
++}
++
++static int end_cpu_udmabuf(struct dma_buf *buf,
++			 enum dma_data_direction direction)
+@@ -251,25 +328,5 @@
+-	struct device *dev = ubuf->device->this_device;
+-
+-	if (!ubuf->sg) {
+-		ubuf->sg = get_sg_table(dev, buf, direction);
+-		if (IS_ERR(ubuf->sg)) {
+-			int ret;
+-
+-			ret = PTR_ERR(ubuf->sg);
+-			ubuf->sg = NULL;
+-			return ret;
+-		} else {
+-			ubuf->sg_dir = direction;
+-		}
+-	}
+-
+-	dma_sync_sgtable_for_cpu(dev, ubuf->sg, direction);
+-	return 0;
+-}
+-
+-static int end_cpu_udmabuf(struct dma_buf *buf,
+-			   enum dma_data_direction direction)
+-{
+-	struct udmabuf *ubuf = buf->priv;
+-	struct device *dev = ubuf->device->this_device;
+-
++	int ret = 0;
++
++	if (udmabuf_is_readonly(ubuf) && direction != DMA_FROM_DEVICE)
++		return -EACCES;
++	mutex_lock(&ubuf->cpu_lock);
+@@ -277,4 +334,6 @@
+-		return -EINVAL;
+-
+-	dma_sync_sgtable_for_device(dev, ubuf->sg, direction);
+-	return 0;
++		ret = -EINVAL;
++	else
++		dma_sync_sgtable_for_device(ubuf->device->this_device,
++					   ubuf->sg, ubuf->sg_dir);
++	mutex_unlock(&ubuf->cpu_lock);
++	return ret;
+@@ -283,0 +343,2 @@
++	.attach = udmabuf_protected_attach,
++	.detach = udmabuf_protected_detach,
+@@ -304 +365 @@
+-	seals = memfd_fcntl(memfd, F_GET_SEALS, 0);
++	seals = udmabuf_protected_get_seals(memfd);
+@@ -324 +385 @@
+-	exp_info.flags = O_RDWR;
++	exp_info.flags = udmabuf_is_readonly(ubuf) ? O_RDONLY : O_RDWR;
+@@ -375 +436 @@
+-static long udmabuf_create(struct miscdevice *device,
++static struct dma_buf *udmabuf_create_buffer(struct miscdevice *device,
+@@ -377 +438,2 @@
+-			   struct udmabuf_create_item *list)
++			   struct udmabuf_create_item *list,
++			   struct udmabuf_retirement *tracking, struct file *original)
+@@ -385 +447 @@
+-	u32 i, flags;
++	u32 i;
+@@ -389 +451,5 @@
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
++	mutex_init(&ubuf->cpu_lock);
++	ubuf->retirement = tracking;
++	if (tracking)
++		kref_get(&tracking->refs);
+@@ -422 +488 @@
+-		struct file *memfd = fget(list[i].memfd);
++		struct file *memfd = original ? get_file(original) : fget(list[i].memfd);
+@@ -433,0 +500,5 @@
++		if (tracking && (list[i].offset > i_size_read(file_inode(memfd)) ||
++		    list[i].size > i_size_read(file_inode(memfd)) - list[i].offset)) {
++			ret = -EINVAL;
++			goto out_unlock;
++		}
+@@ -447 +517,0 @@
+-	flags = head->flags & UDMABUF_FLAGS_CLOEXEC ? O_CLOEXEC : 0;
+@@ -453,10 +522,0 @@
+-	/*
+-	 * Ownership of ubuf is held by the dmabuf from here.
+-	 * If the following dma_buf_fd() fails, dma_buf_put() cleans up both the
+-	 * dmabuf and the ubuf (through udmabuf_ops.release).
+-	 */
+-
+-	ret = dma_buf_fd(dmabuf, flags);
+-	if (ret < 0)
+-		dma_buf_put(dmabuf);
+-
+@@ -464 +524 @@
+-	return ret;
++	return dmabuf;
+@@ -468,0 +529 @@
++	udmabuf_retirement_put(ubuf->retirement);
+@@ -471 +532,14 @@
+-	return ret;
++	return ERR_PTR(ret);
++}
++
++static long udmabuf_create(struct miscdevice *device,
++			 struct udmabuf_create_list *head, struct udmabuf_create_item *list)
++{
++	struct dma_buf *buf = udmabuf_create_buffer(device, head, list, NULL, NULL);
++	int fd;
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++	fd = dma_buf_fd(buf, head->flags & UDMABUF_FLAGS_CLOEXEC ? O_CLOEXEC : 0);
++	if (fd < 0)
++		dma_buf_put(buf);
++	return fd;
+@@ -519,0 +594,2 @@
++	case UDMABUF_PROTECTED_CREATE:
++		return udmabuf_ioctl_protected(filp, arg);
+@@ -540,0 +617,6 @@
++#ifdef UDMABUF_TEST_NODE
++#define UDMABUF_NODE_NAME "udmabuf-protected-test"
++#else
++#define UDMABUF_NODE_NAME "udmabuf"
++#endif
++
+@@ -543 +625 @@
+-	.name           = "udmabuf",
++	.name           = UDMABUF_NODE_NAME,
+@@ -546,0 +629,2 @@
++#include "udmabuf-protected.c"
++
+@@ -550,0 +635,4 @@
++	get_random_bytes(udmabuf_instance, sizeof(udmabuf_instance));
++	udmabuf_retire_wq = alloc_workqueue("udmabuf-retire", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
++	if (!udmabuf_retire_wq)
++		return -ENOMEM;
+@@ -553,0 +642 @@
++		destroy_workqueue(udmabuf_retire_wq);
+@@ -561,0 +651 @@
++		destroy_workqueue(udmabuf_retire_wq);
+@@ -569,0 +660,2 @@
++	/* Flush cleanup before destroying the device or module text. */
++	destroy_workqueue(udmabuf_retire_wq);

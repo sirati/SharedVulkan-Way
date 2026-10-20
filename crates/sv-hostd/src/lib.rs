@@ -730,3 +730,6 @@ mod tests {
         assert_eq!(peer.generation(), 3);
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod protected_qmp;

@@ -30,3 +30,6 @@ pub mod peerloop;
 pub mod brokered;
 #[cfg(target_os = "linux")]
 pub mod hugesub;
+
+#[cfg(target_os = "linux")]
+pub mod linux_payload;

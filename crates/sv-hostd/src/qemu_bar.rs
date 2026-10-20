@@ -83,6 +83,11 @@ fn device_size(pci: &Value, id: &str, slot: u8) -> io::Result<u64> {
         .ok_or_else(|| invalid("QMP ivshmem BAR2 has no valid size"))
 }
 
+pub(crate) fn protected_device_size(pci: &Value, device: &str, slot: u8, expected: u64) -> io::Result<()> {
+    if device_size(pci, device, slot)? != expected { return Err(invalid("protected PCI BAR differs from original size")); }
+    Ok(())
+}
+
 impl QemuBar {
     /// Bind QMP's live PCI device and shared backend to the exact file held
     /// open by the QMP peer process. Retain this object while its mappings live.

@@ -1339,7 +1339,7 @@ dependencies = [
  "serde_json",
  "sv-arena",
  "sv-drm",
- "sv-proto",
+ "sv-ram",
  "sv-transport",
  "sv-wire",
  "wc-broker",
@@ -1890,10 +1890,7 @@ name = "wc-transport"
 version = "0.1.0"
 dependencies = [
  "libc",
- "sv-transport",
  "uds_windows",
- "wc-cygwin-link",
- "wc-handle",
  "windows-sys",
 ]
 

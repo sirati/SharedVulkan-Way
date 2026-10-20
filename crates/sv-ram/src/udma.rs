@@ -88,6 +88,20 @@ const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
 /// shrinking, as QEMU's RAM memfd is).
 pub fn create(memfd: BorrowedFd<'_>, runs: &[(u64, u64)], l: Limits) -> std::io::Result<Vec<Part>> {
     let dev = std::fs::OpenOptions::new().read(true).write(true).open("/dev/udmabuf")?;
+    create_with_device(std::os::fd::AsFd::as_fd(&dev), memfd, runs, l)
+}
+
+/// Reuse the privileged service's retained /dev/udmabuf handle. Never pass
+/// that handle or the original memfd to a desktop client. Export access is
+/// kernel-defined: stock udmabuf returns O_RDWR, not an immutable RO view.
+pub fn create_with_device(dev: BorrowedFd<'_>, memfd: BorrowedFd<'_>, runs: &[(u64, u64)], l: Limits) -> std::io::Result<Vec<Part>> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 || l.list_limit == 0 || l.list_limit > u32::MAX as usize
+        || l.size_limit == 0 || !l.size_limit.is_multiple_of(page as u64)
+        || runs.is_empty() || runs.iter().any(|(o,n)| *n == 0
+            || !o.is_multiple_of(page as u64) || !n.is_multiple_of(page as u64) || o.checked_add(*n).is_none()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid udmabuf range/limits"));
+    }
     let mut parts = Vec::new();
     for (offset, items) in plan(runs, l) {
         let mut buf: Vec<u64> = vec![0; 1 + items.len() * 3];

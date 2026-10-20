@@ -32,3 +32,6 @@ libc = { workspace = true }
 # waycompose-design.md §111.10: the GPU BAR (`--region broker:ID`) and the
 # doorbell hub (`--cold-bell broker:sv-hub`) through the broker.
 wc-broker = { workspace = true }
+
+# Unactivated protected original-page adapter, never the legacy whole-BAR client path.
+sv-ram = { path = "../sv-ram" }
