@@ -71,15 +71,132 @@ function Secure-Dir([string]$d, [bool]$UsersRead) {
   Secure-Path $d $true $UsersRead
 }
 
+# Validate provenance before changing any existing service or normalizing ACLs.
+# A protected DACL alone is insufficient: a desktop owner can rewrite it.
+function Assert-TrustedKeyTree([string]$p) {
+  if (-not (Test-Path -LiteralPath $p)) { throw "existing broker key tree missing; trusted recovery required" }
+  $item = Get-Item -Force -LiteralPath $p
+  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "untrusted broker key tree: reparse object" }
+  $acl = Get-Acl -LiteralPath $p
+  $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+  if ($owner -notin @('S-1-5-18', 'S-1-5-32-544') -or -not $acl.AreAccessRulesProtected) {
+    throw "untrusted broker key tree owner or inheritance; trusted recovery required"
+  }
+  foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        $rule.IdentityReference.Value -notin @('S-1-5-18', 'S-1-5-32-544')) {
+      throw "untrusted broker key tree access; trusted recovery required"
+    }
+  }
+  if ($item.PSIsContainer) {
+    foreach ($child in Get-ChildItem -Force -LiteralPath $p) { Assert-TrustedKeyTree $child.FullName }
+  }
+}
+
+function Assert-NoKeyReparse([string]$p) {
+  $item = Get-Item -Force -LiteralPath $p
+  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "refusing legacy key reparse object; trusted recovery required" }
+  if ($item.PSIsContainer) {
+    foreach ($child in Get-ChildItem -Force -LiteralPath $p) { Assert-NoKeyReparse $child.FullName }
+  }
+}
+
+function Protect-RecoveryTree([string]$p) {
+  $item = Get-Item -Force -LiteralPath $p
+  Secure-Path $p $item.PSIsContainer $false
+  if ($item.PSIsContainer) {
+    foreach ($child in Get-ChildItem -Force -LiteralPath $p) { Protect-RecoveryTree $child.FullName }
+  }
+}
+
+# Enrollment provenance is created only after the key action publishes a new
+# object. Bind it to the file ID so an old receipt cannot bless a replacement.
+function Key-FileId([string]$p) {
+  $r = Run fsutil.exe @('file', 'queryfileid', $p)
+  if ($r[0] -ne 0 -or $r[1] -notmatch '0x[0-9a-fA-F]+') { throw 'cannot identify enrolled key object' }
+  return $Matches[0].ToLowerInvariant()
+}
+function Assert-KeyEnrollments {
+  $records = Join-Path $Data 'key-enrollment'
+  Assert-TrustedKeyTree $records
+  foreach ($key in Get-ChildItem -Force -LiteralPath $Keys) {
+    if ($key.PSIsContainer -or $key.Name -notmatch '^([A-Za-z0-9_-]{1,32})\.key$') { throw 'unknown broker key object; trusted reenrollment required' }
+    $record = Join-Path $records ($Matches[1] + '.json')
+    if (-not (Test-Path -LiteralPath $record)) { throw 'unknown broker key provenance; trusted reenrollment required' }
+    Assert-TrustedKeyTree $record
+    $r = Get-Content -Raw -LiteralPath $record | ConvertFrom-Json
+    if ($r.version -ne 1 -or $r.install -cne $key.BaseName -or $r.generation -notmatch '^[a-f0-9]{32}$' -or $r.fileId -cne (Key-FileId $key.FullName)) {
+      throw 'unknown broker key provenance; trusted reenrollment required'
+    }
+  }
+}
+function Record-KeyEnrollment([string]$p, [string]$id) {
+  $records = Join-Path $Data 'key-enrollment'
+  Secure-Dir $records $false
+  $record = Join-Path $records ($id + '.json')
+  $tmp = Join-Path $records ([Guid]::NewGuid().ToString('N') + '.tmp')
+  try {
+    $r = @{version=1; install=$id; generation=[Guid]::NewGuid().ToString('N'); fileId=(Key-FileId $p)} | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($tmp, $r)
+    Secure-Path $tmp $false $false
+    if (Test-Path -LiteralPath $record) { Remove-Item -Force -LiteralPath $record }
+    Move-Item -LiteralPath $tmp -Destination $record
+  } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -Force -LiteralPath $tmp } }
+}
+
+function Prepare-InstallKeys([bool]$ExistingService) {
+  if ($ExistingService) {
+    # Include the parent: otherwise normalization can hide its prior exposure.
+    Assert-TrustedKeyTree $Keys
+    Assert-KeyEnrollments
+    if ((Get-Item -Force -LiteralPath $Data).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "untrusted broker data reparse object" }
+    $acl = Get-Acl -LiteralPath $Data
+    if (-not $acl.AreAccessRulesProtected) { throw "untrusted broker data inheritance; trusted recovery required" }
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin @('S-1-5-18', 'S-1-5-32-544')) { throw "untrusted broker data owner; trusted recovery required" }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+      if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+          $rule.IdentityReference.Value -notin @('S-1-5-18', 'S-1-5-32-544')) {
+        throw "untrusted broker data access; trusted recovery required"
+      }
+    }
+    return
+  }
+  if ((Test-Path -LiteralPath $Data) -and ((Get-Item -Force -LiteralPath $Data).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "refusing reparse broker data directory" }
+  if (Test-Path -LiteralPath $Keys) { Assert-NoKeyReparse $Keys }
+  $records = Join-Path $Data "key-enrollment"
+  if (Test-Path -LiteralPath $records) { Assert-NoKeyReparse $records }
+  Secure-Dir $Data $false
+  if (Test-Path -LiteralPath $Keys) {
+    # Never publish pre-service key objects to the SYSTEM signer. Retain them
+    # only for privileged recovery, with owners and DACLs replaced recursively.
+    $recovery = Join-Path $Data ('key-recovery-' + [Guid]::NewGuid().ToString('N'))
+    Secure-Dir $recovery $false
+    $saved = Join-Path $recovery 'keys'
+    Move-Item -LiteralPath $Keys -Destination $saved
+    Protect-RecoveryTree $saved
+    if (Test-Path -LiteralPath $records) {
+      $savedRecords = Join-Path $recovery "key-enrollment"
+      Move-Item -LiteralPath $records -Destination $savedRecords
+      Protect-RecoveryTree $savedRecords
+    }
+    Say 'preexisting key objects quarantined for privileged recovery; fresh protected enrollment required'
+  }
+  Secure-Dir $Keys $false
+  if (Test-Path -LiteralPath $records) { throw "orphan key enrollment records; trusted recovery required" }
+  Secure-Dir $records $false
+}
+
 switch ($Action) {
   "install" {
     if (-not $Source) { throw "-Source is required" }
     $src = Join-Path $Source "sv-guest.exe"
     if (-not (Test-Path $src)) { throw "no $src" }
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    Prepare-InstallKeys ([bool]$svc)
     Secure-Dir $Dir $true
     Secure-Dir $Data $false
     Secure-Dir $Keys $false
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     $baseline = Join-Path $Data "devices.txt"
     if (-not (Test-Path $baseline)) {
       if ($svc -or (Test-Path (Join-Path $Before "complete")) -or (Test-Path (Join-Path $Data "devices.secured"))) {
@@ -182,6 +299,7 @@ switch ($Action) {
     } finally {
       if (Test-Path -LiteralPath $tmp) { Remove-Item -Force -LiteralPath $tmp }
     }
+    Record-KeyEnrollment $p $Install
     Say "key of installation $Install stored in $p (SYSTEM and Administrators only)"
   }
   "show" {
