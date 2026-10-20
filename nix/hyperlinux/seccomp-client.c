@@ -74,11 +74,16 @@ static void *status_worker(void *unused) {
     return NULL;
 }
 static int wait_status_tests(const char *self) {
-    for (int mode=0;mode<9;++mode) {
+    for (int mode=0;mode<10;++mode) {
         pid_t child=fork(); CHECK(child>=0);
         if (!child) {
             if (mode==0) _exit(159);
             if (mode==8) _exit(143);
+            if (mode==9) {
+                pthread_t t; CHECK(pthread_create(&t,NULL,killed_worker,NULL)==0);
+                CHECK(pthread_join(t,NULL)==0 && atomic_load(&stage)==1);
+                _exit(159);
+            }
             if (mode==6) { raise(SIGTERM); _exit(92); }
             CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
             if (mode==3) {
@@ -114,14 +119,14 @@ static int wait_status_tests(const char *self) {
                   info.si_pid==child && info.si_status==SIGSYS);
         }
         CHECK(waitpid(mode==1 ? -1 : child,&status,0)==child);
-        if (mode==0 || mode==8) {
-            CHECK(WIFEXITED(status) && WEXITSTATUS(status)==(mode==0 ? 159 : 143));
+        if (mode==0 || mode==8 || mode==9) {
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status)==(mode==8 ? 143 : 159));
         } else {
             CHECK(WIFSIGNALED(status) && WTERMSIG(status)==(mode==6 ? SIGTERM : SIGSYS));
         }
         errno=0; CHECK(waitpid(child,&status,WNOHANG)==-1 && errno==ECHILD);
     }
-    puts("seccomp fatal waits: KILL_PROCESS group, TRAP default/ignored/blocked, KILL_THREAD, SIGTERM, exec, WNOWAIT and normal159/143 passed");
+    puts("seccomp fatal waits: KILL_PROCESS group, TRAP default/ignored/blocked, KILL_THREAD, SIGTERM, exec, WNOWAIT, worker-only fatal and normal159/143 passed");
     return 0;
 }
 int main(int argc,char **argv) {
