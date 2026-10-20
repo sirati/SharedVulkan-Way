@@ -1,6 +1,6 @@
 //! Hardware-only H.264 decoder. Compressed input stays pinned until CoreMedia
 //! releases its block; decoded pixels are retained by `Picture` in the callback.
-use super::macos::Picture;
+use super::macos::{Picture, Range as PixelRange};
 use std::{
     collections::HashMap,
     ffi::c_void,
@@ -10,6 +10,8 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 type Ref = *mut c_void;
+// CoreMedia and VideoToolbox SDK headers use #pragma pack(push, 4), including
+// misaligned callback pointers in the 28-byte CMBlockBufferCustomBlockSource.
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 struct Time {
@@ -39,6 +41,9 @@ struct Callback {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(value: Ref);
+    fn CFGetTypeID(value: Ref) -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(value: Ref) -> u8;
     fn CFDictionaryCreate(
         allocator: Ref,
         keys: *const Ref,
@@ -60,6 +65,8 @@ unsafe extern "C" {
 }
 #[link(name = "CoreMedia", kind = "framework")]
 unsafe extern "C" {
+    static kCMFormatDescriptionExtension_FullRangeVideo: Ref;
+    fn CMFormatDescriptionGetExtension(format: Ref, key: Ref) -> Ref;
     fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
         allocator: Ref,
         count: usize,
@@ -186,6 +193,63 @@ unsafe impl CompressedBytes for Box<[u8]> {
         self
     }
 }
+/// Independent completion signals. The picture callback retires pixel decode;
+/// input_released retires every retained original compressed slice block. Drain
+/// the decoder and wait for both before permitting source Vulkan buffer reuse.
+pub struct Submission {
+    pub picture: mpsc::Receiver<Result<Arc<Picture>, String>>,
+    pub input_released: mpsc::Receiver<()>,
+}
+struct TrackedInput {
+    owner: Option<Arc<dyn CompressedBytes>>,
+    released: Option<mpsc::Sender<()>>,
+}
+unsafe impl CompressedBytes for TrackedInput {
+    fn bytes(&self) -> &[u8] {
+        self.owner.as_ref().expect("live tracked input").bytes()
+    }
+}
+impl Drop for TrackedInput {
+    fn drop(&mut self) {
+        // Drop the source lease before signaling. A receiver can immediately
+        // permit guest writes, so signaling from before field-drop is unsafe.
+        drop(self.owner.take());
+        if let Some(sender) = self.released.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+fn tracked_input(
+    owner: Arc<dyn CompressedBytes>,
+) -> (Arc<dyn CompressedBytes>, mpsc::Receiver<()>) {
+    let (sender, receiver) = mpsc::channel();
+    (
+        Arc::new(TrackedInput {
+            owner: Some(owner),
+            released: Some(sender),
+        }),
+        receiver,
+    )
+}
+fn format_range(format: &Owned) -> Result<PixelRange, String> {
+    unsafe {
+        // The extension is borrowed from the live format description. Absence
+        // means unspecified/video range, per the H.264 VUI default.
+        let value =
+            CMFormatDescriptionGetExtension(format.0, kCMFormatDescriptionExtension_FullRangeVideo);
+        if value.is_null() {
+            return Ok(PixelRange::Video);
+        }
+        if CFGetTypeID(value) != CFBooleanGetTypeID() {
+            return Err("FullRangeVideo format extension is not a CFBoolean".into());
+        }
+        Ok(if CFBooleanGetValue(value) != 0 {
+            PixelRange::Full
+        } else {
+            PixelRange::Video
+        })
+    }
+}
 struct Input {
     _owner: Arc<dyn CompressedBytes>,
 }
@@ -194,6 +258,7 @@ unsafe extern "C" fn release_input(context: Ref, _: Ref, size: usize) {
     unsafe { drop(Box::from_raw(context.cast::<Input>())) }
 }
 struct Callbacks {
+    range: PixelRange,
     pending: Mutex<HashMap<usize, mpsc::Sender<Result<Arc<Picture>, String>>>>,
 }
 unsafe extern "C" fn completed(
@@ -224,7 +289,15 @@ unsafe extern "C" fn completed(
             Err("VideoToolbox dropped the frame".into())
         } else {
             trace(format_args!("retain completed picture begin"));
-            let result = unsafe { Picture::from_completed_buffer(image) }.map_err(str::to_owned);
+            let result = unsafe { Picture::from_completed_buffer(image) }
+                .map_err(str::to_owned)
+                .and_then(|picture| {
+                    if picture.range() == state.range {
+                        Ok(picture)
+                    } else {
+                        Err("VideoToolbox ignored requested NV12 sample range".into())
+                    }
+                });
             trace(format_args!(
                 "retain completed picture ok={}",
                 result.is_ok()
@@ -242,6 +315,7 @@ pub struct Decoder {
     callbacks: Box<Callbacks>,
     next: usize,
     parameter_sets: (Vec<u8>, Vec<u8>),
+    pub output_range: PixelRange,
     pub coded_extent: [u32; 2],
     pub display_extent: [u32; 2],
     pub crop_origin: [u32; 2],
@@ -282,12 +356,18 @@ impl Decoder {
                 ),
                 "H.264 format",
             )?;
+            let output_range = format_range(&format)?;
+            trace(format_args!("format output range={output_range:?}"));
             let specification = dictionary(
                 &[kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder],
                 &[kCFBooleanTrue],
             )?;
             let empty = dictionary(&[], &[])?;
-            let nv12 = u32::from_be_bytes(*b"420v");
+            let nv12 = u32::from_be_bytes(if output_range == PixelRange::Full {
+                *b"420f"
+            } else {
+                *b"420v"
+            });
             trace(format_args!("NV12 CFNumber create begin"));
             let number = Owned(CFNumberCreate(
                 ptr::null_mut(),
@@ -306,6 +386,7 @@ impl Decoder {
                 &[number.0, empty.0, kCFBooleanTrue],
             )?;
             let mut callbacks = Box::new(Callbacks {
+                range: output_range,
                 pending: Mutex::new(HashMap::new()),
             });
             let callback = Callback {
@@ -331,6 +412,7 @@ impl Decoder {
                 callbacks,
                 next: 1,
                 parameter_sets: (sps.to_vec(), pps.to_vec()),
+                output_range,
                 coded_extent: extent.coded_extent,
                 display_extent: extent.display_extent,
                 crop_origin: extent.crop_origin,
@@ -368,6 +450,11 @@ impl Decoder {
                 "updated H.264 format",
             )?;
         }
+        if format_range(&candidate)? != self.output_range {
+            return Err(
+                "VideoToolbox NV12 range change requires explicit reset/IDR boundary".into(),
+            );
+        }
         // No old-format callbacks remain when the following sample switches
         // format. This drains output, without discarding VT reference state.
         self.drain()?;
@@ -389,6 +476,33 @@ impl Decoder {
         self.display_extent = geometry.display_extent;
         self.crop_origin = geometry.crop_origin;
         Ok(())
+    }
+    /// Submit AVC with an event sent by the final original-input FreeBlock.
+    pub fn submit_tracked(
+        &mut self,
+        owner: Arc<dyn CompressedBytes>,
+        range: Range<usize>,
+    ) -> Result<Submission, String> {
+        let (owner, input_released) = tracked_input(owner);
+        let picture = self.submit(owner, range)?;
+        Ok(Submission {
+            picture,
+            input_released,
+        })
+    }
+    /// Submit Annex B with an event sent by the final original-input FreeBlock.
+    pub fn submit_annex_b_tracked(
+        &mut self,
+        owner: Arc<dyn CompressedBytes>,
+        range: Range<usize>,
+        offsets: &[u32],
+    ) -> Result<Submission, String> {
+        let (owner, input_released) = tracked_input(owner);
+        let picture = self.submit_annex_b(owner, range, offsets)?;
+        Ok(Submission {
+            picture,
+            input_released,
+        })
     }
     /// Submit one complete AVC access unit, with four-byte big-endian NAL sizes.
     /// The caller converts Annex B framing separately. The payload is not copied.
@@ -982,5 +1096,50 @@ mod abi_tests {
             assert_eq!(align_of::<Callback>(), 4);
             assert_eq!(offset_of!(Callback, context), 8);
         }
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+    struct Source(Arc<AtomicBool>);
+    unsafe impl CompressedBytes for Source {
+        fn bytes(&self) -> &[u8] {
+            &[0x65]
+        }
+    }
+    impl Drop for Source {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    #[test]
+    fn release_event_waits_for_last_original_slice_freeblock() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (owner, released) = tracked_input(Arc::new(Source(Arc::clone(&dropped))));
+        let first = Box::into_raw(Box::new(Input {
+            _owner: Arc::clone(&owner),
+        }));
+        let second = Box::into_raw(Box::new(Input {
+            _owner: Arc::clone(&owner),
+        }));
+        drop(owner);
+        unsafe {
+            release_input(first.cast(), ptr::null_mut(), 1);
+        }
+        assert!(matches!(
+            released.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!dropped.load(Ordering::Acquire));
+        unsafe {
+            release_input(second.cast(), ptr::null_mut(), 1);
+        }
+        released.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(dropped.load(Ordering::Acquire));
     }
 }

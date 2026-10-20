@@ -235,15 +235,30 @@ mod fixture {
         let mut pictures = Vec::new();
         for (frame, slice) in slices.iter().enumerate() {
             eprintln!("fixture stage=submit frame={frame} nal_type={}", slice.0);
-            let completion = decoder.submit_annex_b(source.clone(), slice.1.clone(), &[0])?;
+            let completion =
+                decoder.submit_annex_b_tracked(source.clone(), slice.1.clone(), &[0])?;
             // Exercise drain without resetting references, so the following P
             // picture must use the preceding IDR/P reference in this session.
             eprintln!("fixture stage=drain frame={frame}");
             decoder.drain()?;
             eprintln!("fixture stage=receive frame={frame}");
             let picture = completion
+                .picture
                 .recv_timeout(Duration::from_secs(2))
                 .map_err(|e| format!("frame {frame}: callback {e}"))??;
+            eprintln!("fixture stage=wait source release frame={frame}");
+            completion
+                .input_released
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|e| {
+                    format!("frame {frame}: compressed source did not release before fence: {e}")
+                })?;
+            if Arc::strong_count(&source) != 1 {
+                return Err(format!(
+                    "frame {frame}: source still retained after release event"
+                ));
+            }
+            eprintln!("fixture stage=source released before fence frame={frame}");
             eprintln!("fixture stage=verify frame={frame}");
             verify(&picture, frame)?;
             pictures.push(picture);
