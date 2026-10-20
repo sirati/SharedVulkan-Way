@@ -190,8 +190,9 @@ returns an error without stealing the lock or releasing any reference.
 This shared directory is cooperative coordination state. Client-writable
 metadata does not authenticate a producer or authorize privileged retirement.
 The broker integration requires separate trusted allocation records and an
-actual retained process HANDLE proven exited. Unregistered allocations cannot
-use the kernel-death retirement hook. DLL teardown retains outstanding local
+actual retained process HANDLE proven exited. The cooperative directory has
+no production retirement API. Kernel-death recovery must use independent
+protected allocation and consumer records. DLL teardown retains outstanding local
 capabilities and mappings; it does not pretend they completed or that the host
 drained. Protected broker/driver integration is separate work.
 
