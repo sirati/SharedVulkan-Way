@@ -1,0 +1,574 @@
+--- a/src/syscall_fs.c
++++ b/src/syscall_fs.c
+@@ -44,6 +44,20 @@
+ #include <sys/mount.h>
+ #include <sys/xattr.h>
+ #include <pthread.h>
++
++/* Keep native aliases alive until all filesystem operations finish. */
++typedef struct { hl_fd_ref_t refs[4]; unsigned count; } fs_fd_scope;
++static void fs_fd_scope_end(fs_fd_scope *scope) {
++    for (unsigned i = 0; i < scope->count; i++) hl_fd_put(&scope->refs[i]);
++}
++static int fs_fd_pin(fs_fd_scope *scope, int guest_fd) {
++    if (scope->count == 4) { errno = EMFILE; return -1; }
++    hl_fd_ref_t *ref = &scope->refs[scope->count];
++    if (hl_fd_get_pinned(guest_fd, ref) < 0) { errno = EBADF; return -1; }
++    scope->count++;
++    return ref->host_fd;
++}
++#define FS_FD_SCOPE fs_fd_scope fd_scope __attribute__((cleanup(fs_fd_scope_end))) = {0}
+ 
+ /* ---------- stat translation ---------- */
+ 
+@@ -376,14 +390,14 @@
+     return pfd;
+ }
+ 
+-static int host_dirfd_for_op(int dirfd, const char *guest_path) {
++static int host_dirfd_for_op(fs_fd_scope *scope, int dirfd, const char *guest_path) {
+     /* An ABSOLUTE guest path ignores dirfd entirely on Linux — a bad/closed
+      * dirfd must NOT make an absolute-path *at() fail with EBADF (V13). */
+     if (guest_path && guest_path[0] == '/')
+         return AT_FDCWD;
+     if (hl_vfs_mode() == HL_FS_ROOTED || dirfd == LINUX_AT_FDCWD)
+         return AT_FDCWD;
+-    int hfd = fd_to_host(dirfd);
++    int hfd = fs_fd_pin(scope, dirfd);
+     return hfd < 0 ? -1 : hfd;
+ }
+ 
+@@ -444,6 +458,7 @@
+ 
+ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
+                    int linux_flags, int mode) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -473,7 +488,8 @@
+             return -LINUX_ENOMEM;
+         }
+         fd_table[guest_fd].linux_flags = linux_flags;
+-        if (hl_wc_memfd_restore(guest_fd) < 0) { int saved = errno; sys_close(guest_fd); errno = saved; return linux_errno(); }
++        /* Restore removes only its expected descriptor on failure. */
++        if (hl_wc_memfd_restore(guest_fd) < 0) return linux_errno();
+         return guest_fd;
+     }
+     if (intercepted == -1) {
+@@ -582,7 +598,7 @@
+         if (dirfd == LINUX_AT_FDCWD) {
+             host_dirfd = AT_FDCWD;
+         } else {
+-            host_dirfd = fd_to_host(dirfd);
++            host_dirfd = fs_fd_pin(&fd_scope, dirfd);
+             if (host_dirfd < 0) return -LINUX_EBADF;
+         }
+     }
+@@ -699,9 +715,10 @@
+ /* ---------- stat family ---------- */
+ 
+ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva) {
++    FS_FD_SCOPE;
+     {
+         hl_fd_ref_t ref;
+-        if (hl_fd_get(fd, &ref) == 0) {
++        if (hl_fd_get_pinned(fd, &ref) == 0) {
+             if (ref.of && ref.of->ops && ref.of->ops->fstat) {
+                 int64_t r = ref.of->ops->fstat(ref.of, ref.host_fd, g, stat_gva);
+                 hl_fd_put(&ref);
+@@ -716,7 +733,7 @@
+     if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_VIRTUAL_DIR)
+         return vdir_fill_stat(g, stat_gva);
+ 
+-    int host_fd = fd_to_host(fd);
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) {
+         if (g->verbose) fprintf(stderr, "hl: fstat(%d): EBADF (no host fd)\n", fd);
+         return -LINUX_EBADF;
+@@ -753,6 +770,7 @@
+ 
+ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
+                        uint64_t stat_gva, int flags) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -761,7 +779,7 @@
+     if (dirfd == LINUX_AT_FDCWD) {
+         host_dirfd = AT_FDCWD;
+     } else {
+-        host_dirfd = fd_to_host(dirfd);
++        host_dirfd = fs_fd_pin(&fd_scope, dirfd);
+         /* A synthetic dir dirfd has no host fd but is valid for a relative
+          * lookup (V17). Keep host_dirfd = -1; resolve_path_for_op_ex uses
+          * dirfd_guest_path for it. Reject only a genuinely bad fd. */
+@@ -843,7 +861,8 @@
+ }
+ 
+ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     struct statfs mac_st;
+@@ -981,6 +1000,7 @@
+ /* ---------- dup/fcntl ---------- */
+ 
+ int64_t sys_dup(int oldfd) {
++    FS_FD_SCOPE;
+     if (oldfd < 0 || oldfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+     if (fd_table[oldfd].type == FD_CLOSED) return -LINUX_EBADF;
+     /* Descriptor-backed fds must share the open-file description (POSIX).
+@@ -1001,7 +1021,7 @@
+         return gfd;
+     }
+ 
+-    int host_fd = fd_to_host(oldfd);
++    int host_fd = fs_fd_pin(&fd_scope, oldfd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     int new_host_fd = dup(host_fd);
+@@ -1038,6 +1058,7 @@
+ }
+ 
+ int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
++    FS_FD_SCOPE;
+     if (oldfd < 0 || oldfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+     if (newfd < 0 || newfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+     /* Linux dup3(2): EINVAL if oldfd == newfd (unlike dup2 which is a no-op) */
+@@ -1048,7 +1069,7 @@
+     if (fd_table[oldfd].desc)
+         return hl_fd_dup3(oldfd, newfd, linux_flags);
+ 
+-    int host_fd = fd_to_host(oldfd);
++    int host_fd = fs_fd_pin(&fd_scope, oldfd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     int new_host_fd = dup(host_fd);
+@@ -1087,9 +1108,12 @@
+ }
+ 
+ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
++    FS_FD_SCOPE;
++    hl_fd_ref_t fcntl_ref __attribute__((cleanup(hl_fd_put))) = {0};
++    if (hl_fd_get_pinned(fd, &fcntl_ref) < 0) return -LINUX_EBADF;
+     if (cmd == 1033 || cmd == 1034) {
+         hl_fd_ref_t ref;
+-        if (hl_fd_get(fd, &ref) != 0) return -LINUX_EBADF;
++        if (hl_fd_get_pinned(fd, &ref) != 0) return -LINUX_EBADF;
+         int64_t result = hl_wc_seal_fcntl(ref.host_fd, cmd, arg);
+         if (result >= 0 && cmd == 1033 && ref.of && hl_wc_memfd_adopt(ref.of, ref.host_fd) < 0)
+             result = linux_errno();
+@@ -1122,7 +1146,7 @@
+      * for its own purposes — reporting or mutating that leaked internal
+      * state to the guest and left the guest's own O_NONBLOCK request
+      * unseen by the OSS write path. */
+-    hl_open_file_t *of = fd_table[fd].of;
++    hl_open_file_t *of = fcntl_ref.of;
+     /* ...but ONLY for those: a plain file or stdio also carries an open-file
+      * object, and its status_flags are never seeded from the host, so
+      * F_GETFL reported O_RDONLY for stdout and F_SETFL(O_NONBLOCK) never
+@@ -1144,7 +1168,7 @@
+         return hl_fd_dup_from(fd, (int)arg, cmd == 1030);
+     }
+ 
+-    int host_fd = fd_to_host(fd);
++    int host_fd = fcntl_ref.host_fd;
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     /* Linux F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4,
+@@ -1509,7 +1533,8 @@
+ }
+ 
+ int64_t sys_lseek(int fd, int64_t offset, int whence) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     /* Directory FDs: getdents64 is backed by a host DIR* (fdopendir).
+@@ -1548,6 +1573,7 @@
+ 
+ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
+                        uint64_t buf_gva, uint64_t bufsiz) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -1575,7 +1601,7 @@
+     if (rr < 0) return rr;
+     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+         ? host_dirfd_for_resolved()
+-        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
++        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fs_fd_pin(&fd_scope, dirfd));
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+         return -LINUX_EBADF;
+ 
+@@ -1601,6 +1627,7 @@
+ }
+ 
+ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -1619,7 +1646,7 @@
+ 
+     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+         ? host_dirfd_for_resolved()
+-        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
++        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fs_fd_pin(&fd_scope, dirfd));
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+         return -LINUX_EBADF;
+ 
+@@ -1642,6 +1669,7 @@
+ }
+ 
+ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -1657,7 +1685,7 @@
+ 
+     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+         ? host_dirfd_for_resolved()
+-        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
++        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fs_fd_pin(&fd_scope, dirfd));
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+         return -LINUX_EBADF;
+ 
+@@ -1706,6 +1734,7 @@
+ 
+ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
+                       int newdirfd, uint64_t newpath_gva, int flags) {
++    FS_FD_SCOPE;
+     char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
+     if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
+         return -LINUX_EFAULT;
+@@ -1728,8 +1757,8 @@
+         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
+         if ((om && (om->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) || (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))))
+             return -LINUX_EROFS;
+-        host_olddir = host_dirfd_for_op(olddirfd, oldpath);
+-        host_newdir = host_dirfd_for_op(newdirfd, newpath);
++        host_olddir = host_dirfd_for_op(&fd_scope, olddirfd, oldpath);
++        host_newdir = host_dirfd_for_op(&fd_scope, newdirfd, newpath);
+         if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
+     }
+ 
+@@ -1833,6 +1862,7 @@
+ 
+ int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
+                    int newdirfd, uint64_t newpath_gva, int flags) {
++    FS_FD_SCOPE;
+     char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
+     if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
+         return -LINUX_EFAULT;
+@@ -1854,8 +1884,8 @@
+         if (r2 < 0) return r2;
+         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
+         if (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
+-        host_olddir = host_dirfd_for_op(olddirfd, oldpath);
+-        host_newdir = host_dirfd_for_op(newdirfd, newpath);
++        host_olddir = host_dirfd_for_op(&fd_scope, olddirfd, oldpath);
++        host_newdir = host_dirfd_for_op(&fd_scope, newdirfd, newpath);
+         if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
+     }
+ 
+@@ -1881,6 +1911,7 @@
+ 
+ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
+                       int mode, int flags) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -1901,7 +1932,7 @@
+ 
+     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+         ? host_dirfd_for_resolved()
+-        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
++        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fs_fd_pin(&fd_scope, dirfd));
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+         return -LINUX_EBADF;
+ 
+@@ -1954,7 +1985,8 @@
+ /* ---------- permissions/ownership ---------- */
+ 
+ int64_t sys_fchmod(int fd, uint32_t mode) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+     if (fchmod(host_fd, mode) < 0)
+         return linux_errno();
+@@ -1963,6 +1995,7 @@
+ 
+ int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
+                      uint32_t mode, int flags) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -1976,7 +2009,7 @@
+                                      &host_path, &mnt);
+         if (rr < 0) return rr;
+         if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
+-        host_dirfd = host_dirfd_for_op(dirfd, path);
++        host_dirfd = host_dirfd_for_op(&fd_scope, dirfd, path);
+         if (host_dirfd == -1) return -LINUX_EBADF;
+     }
+ 
+@@ -2008,6 +2041,7 @@
+ 
+ int64_t sys_fchownat(guest_t *g, int dirfd, uint64_t path_gva,
+                      uint32_t owner, uint32_t group, int flags) {
++    FS_FD_SCOPE;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+@@ -2021,7 +2055,7 @@
+                                      &host_path, &mnt);
+         if (rr < 0) return rr;
+         if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
+-        host_dirfd = host_dirfd_for_op(dirfd, path);
++        host_dirfd = host_dirfd_for_op(&fd_scope, dirfd, path);
+         if (host_dirfd == -1) return -LINUX_EBADF;
+     }
+ 
+@@ -2043,7 +2077,8 @@
+ }
+ 
+ int64_t sys_fchown(int fd, uint32_t owner, uint32_t group) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+     if (fchown(host_fd, owner, group) < 0)
+         return linux_errno();
+@@ -2052,6 +2087,7 @@
+ 
+ int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
+                       uint64_t times_gva, int flags) {
++    FS_FD_SCOPE;
+     int host_dirfd = resolve_dirfd(dirfd);
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD
+         && hl_vfs_mode() != HL_FS_ROOTED)
+@@ -2078,7 +2114,7 @@
+             if (g_utimensat_mnt &&
+                 (g_utimensat_mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)))
+                 return -LINUX_EROFS;
+-            host_dirfd = host_dirfd_for_op(dirfd, path);
++            host_dirfd = host_dirfd_for_op(&fd_scope, dirfd, path);
+             if (host_dirfd == -1) return -LINUX_EBADF;
+         }
+     }
+@@ -2293,7 +2329,8 @@
+ 
+ int64_t sys_fgetxattr(guest_t *g, int fd, uint64_t name_gva,
+                       uint64_t value_gva, uint64_t size) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     char name[256];
+@@ -2320,7 +2357,8 @@
+ 
+ int64_t sys_fsetxattr(guest_t *g, int fd, uint64_t name_gva,
+                       uint64_t value_gva, uint64_t size, int flags) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     char name[256];
+@@ -2347,7 +2385,8 @@
+ }
+ 
+ int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     if (size == 0) {
+@@ -2369,7 +2408,8 @@
+ }
+ 
+ int64_t sys_fremovexattr(guest_t *g, int fd, uint64_t name_gva) {
+-    int host_fd = fd_to_host(fd);
++    FS_FD_SCOPE;
++    int host_fd = fs_fd_pin(&fd_scope, fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     char name[256];
+--- a/src/syscall_fd.c
++++ b/src/syscall_fd.c
+@@ -24,6 +24,10 @@
+ #include <pthread.h>
+ #include <sys/event.h>
+ 
++/* A blocking syscall must not use a special-fd number after its owner
++ * releases sfd_lock: close can recycle it into private runtime state. */
++static void sfd_alias_end(int *fd) { if (*fd >= 0) close(*fd); }
++
+ /* Mutex protecting timerfd/eventfd/signalfd per-slot state.  Prevents
+  * races when two threads operate on the same special FD concurrently
+  * (e.g., two threads reading the same eventfd). Lock order: 5a
+@@ -150,7 +154,9 @@
+         }
+     }
+ 
+-    int kq = timerfd_state[slot].kq_fd;
++    int kq __attribute__((cleanup(sfd_alias_end))) =
++        fcntl(timerfd_state[slot].kq_fd, F_DUPFD_CLOEXEC, 0);
++    if (kq < 0) { pthread_mutex_unlock(&sfd_lock); return linux_errno(); }
+     /* Clamp large seconds values to prevent signed integer overflow.
+      * INT64_MAX / 1e6 ≈ 9.2e12 seconds; INT64_MAX / 1e9 ≈ 9.2e9. */
+     int64_t val_sec = its.it_value_sec;
+@@ -271,7 +277,9 @@
+     int slot = timerfd_find(guest_fd);
+     if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EBADF; }
+ 
+-    int kq = timerfd_state[slot].kq_fd;
++    int kq __attribute__((cleanup(sfd_alias_end))) =
++        fcntl(timerfd_state[slot].kq_fd, F_DUPFD_CLOEXEC, 0);
++    if (kq < 0) { pthread_mutex_unlock(&sfd_lock); return linux_errno(); }
+ 
+     /* Collect pending timer events via kevent(). The data field contains
+      * the number of times the timer fired since the last kevent() call. */
+@@ -325,7 +333,7 @@
+     timerfd_state[slot].expirations = 0;
+     int armed = timerfd_state[slot].armed;
+     int64_t intv = timerfd_state[slot].interval_ns;
+-    int rearm_kq = timerfd_state[slot].kq_fd;
++    int rearm_kq = kq;
+ 
+     /* Re-arm repeating timers with the interval period.  The initial
+      * fire used EV_ONESHOT (see timerfd_settime), so we re-arm here
+@@ -485,7 +493,9 @@
+          * read() actually waits for the writer. Matches signalfd_read.
+          * Another thread may close the fd while we wait — read()
+          * returns EBADF in that case, and we re-validate the slot. */
+-        int rd_fd = eventfd_state[slot].pipe_rd;
++        int rd_fd __attribute__((cleanup(sfd_alias_end))) =
++            fcntl(eventfd_state[slot].pipe_rd, F_DUPFD_CLOEXEC, 0);
++        if (rd_fd < 0) { pthread_mutex_unlock(&sfd_lock); return linux_errno(); }
+         pthread_mutex_unlock(&sfd_lock);
+         uint8_t byte;
+         fcntl(rd_fd, F_SETFL, 0);          /* Make temporarily blocking */
+@@ -729,7 +739,9 @@
+ 
+     uint64_t mask = signalfd_state[slot].mask;
+     int nonblock = signalfd_state[slot].nonblock;
+-    int pipe_rd = signalfd_state[slot].pipe_rd;
++    int pipe_rd __attribute__((cleanup(sfd_alias_end))) =
++        fcntl(signalfd_state[slot].pipe_rd, F_DUPFD_CLOEXEC, 0);
++    if (pipe_rd < 0) { pthread_mutex_unlock(&sfd_lock); return linux_errno(); }
+     size_t max_signals = count / sizeof(linux_signalfd_siginfo_t);
+     if (max_signals == 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EINVAL; }
+     pthread_mutex_unlock(&sfd_lock);
+--- a/src/syscall_io.c
++++ b/src/syscall_io.c
+@@ -1245,7 +1245,7 @@
+      * Synthetic devices (OSS) must not see Linux request codes on host. */
+     if (!record_socket) {
+         hl_fd_ref_t ref;
+-        if (hl_fd_get(fd, &ref) == 0) {
++        if (hl_fd_get_pinned(fd, &ref) == 0) {
+             if (ref.of && ref.of->ops && ref.of->ops->ioctl) {
+                 int64_t r = ref.of->ops->ioctl(ref.of, ref.host_fd, g,
+                                                request, arg);
+--- a/src/fd_object.c
++++ b/src/fd_object.c
+@@ -200,6 +200,72 @@
+ int hl_fd_get(int guest_fd, hl_fd_ref_t *out) { return get_descriptor(guest_fd, out, 0); }
+ int hl_fd_get_pinned(int guest_fd, hl_fd_ref_t *out) { return get_descriptor(guest_fd, out, 1); }
+ 
++
++/* Restore needs a stable identity, including for legacy regular files. */
++int hl_fd_get_replaceable(int guest_fd, hl_fd_ref_t *out) {
++    if (!out || guest_fd < 0 || guest_fd >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
++    pthread_mutex_lock(&fd_lock);
++    fd_entry_t *entry = &fd_table[guest_fd];
++    if (entry->type != FD_REGULAR) {
++        pthread_mutex_unlock(&fd_lock); errno = EBADF; return -1;
++    }
++    if (!entry->desc) {
++        hl_open_file_t *of = entry->of;
++        int created = !of;
++        if (!of) of = hl_open_file_create(FD_REGULAR, &hl_fd_ops_host_file,
++            entry->linux_flags & ~LINUX_O_CLOEXEC, NULL);
++        if (!of) { pthread_mutex_unlock(&fd_lock); errno = ENOMEM; return -1; }
++        hl_descriptor_t *d = hl_descriptor_create(of, entry->host_fd,
++            entry->linux_flags & LINUX_O_CLOEXEC, entry->type, entry->dir);
++        if (!d) {
++            pthread_mutex_unlock(&fd_lock);
++            if (created) hl_open_file_release(of);
++            errno = ENOMEM; return -1;
++        }
++        entry->of = of;
++        entry->desc = d;
++    }
++    hl_descriptor_t *d = entry->desc;
++    if (!d->of || atomic_load(&d->removed)) {
++        pthread_mutex_unlock(&fd_lock); errno = EBADF; return -1;
++    }
++    hl_descriptor_retain(d);
++    if (d->of) hl_open_file_retain(d->of);
++    *out = (hl_fd_ref_t){ .desc = d, .of = d->of, .host_fd = d->host_fd,
++        .guest_fd = guest_fd, .fd_flags = atomic_load(&d->fd_flags) };
++    pthread_mutex_unlock(&fd_lock);
++    return 0;
++}
++
++/* Consume replacement ownership even when a concurrent close/reuse wins. */
++int hl_fd_install_if_current(const hl_fd_ref_t *expected, hl_open_file_t *of,
++                             int host_fd, uint32_t fd_flags) {
++    if (!of || of->kind != FD_REGULAR || !expected || !expected->desc ||
++        expected->desc->type != FD_REGULAR || expected->guest_fd < 0 ||
++        expected->guest_fd >= FD_TABLE_SIZE) {
++        if (of) hl_open_file_release(of);
++        if (host_fd >= 0) close(host_fd);
++        errno = EBADF; return -1;
++    }
++    hl_descriptor_t *replacement = hl_descriptor_create(of, host_fd, fd_flags, of->kind, NULL);
++    if (!replacement) {
++        hl_open_file_release(of); if (host_fd >= 0) close(host_fd);
++        errno = ENOMEM; return -1;
++    }
++    int guest_fd = expected->guest_fd;
++    pthread_mutex_lock(&fd_lock);
++    hl_descriptor_t *old = fd_table[guest_fd].desc;
++    if (old != expected->desc || fd_table[guest_fd].type == FD_CLOSED || atomic_load(&old->removed)) {
++        pthread_mutex_unlock(&fd_lock);
++        hl_descriptor_release(replacement); errno = EAGAIN; return -1;
++    }
++    atomic_store(&old->removed, true);
++    fd_table[guest_fd].desc = replacement;
++    hl_fd_sync_legacy(guest_fd);
++    pthread_mutex_unlock(&fd_lock);
++    hl_descriptor_release(old);
++    return guest_fd;
++}
+ 
+ void hl_fd_put(hl_fd_ref_t *ref) {
+     if (!ref) return;
+--- a/src/fd_object.h
++++ b/src/fd_object.h
+@@ -158,6 +158,11 @@
+ /* Lookup and pin descriptor + open-file for syscall duration. */
+ int hl_fd_get(int guest_fd, hl_fd_ref_t *out);
+ int hl_fd_get_pinned(int guest_fd, hl_fd_ref_t *out);
++/* Stable identity for replacing regular files (only FD_REGULAR); retains returned ref. */
++int hl_fd_get_replaceable(int guest_fd, hl_fd_ref_t *out);
++/* Requires FD_REGULAR source/replacement. Consumes of+host_fd on all paths; preserves a reused slot. */
++int hl_fd_install_if_current(const hl_fd_ref_t *expected, hl_open_file_t *of,
++                             int host_fd, uint32_t fd_flags);
+ void hl_fd_put(hl_fd_ref_t *ref);
+ 
+ /* Install: takes ownership of one open-file ref and host_fd. */
