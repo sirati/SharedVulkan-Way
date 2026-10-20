@@ -545,3 +545,40 @@ fn a_lease_is_told_before_its_fds_are_sent() {
     assert_eq!(rx.try_recv().unwrap(), (id, std::process::id()), "told before the reply was read");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A failed durable record refuses the lease without leaking handles or a
+/// lease that would prevent the region draining.
+#[test]
+fn a_failed_lease_record_sends_no_handles_and_leaves_no_holder() {
+    let d = dir("lease-record-failed");
+    let unix = Unix::bind(d.join("broker.sock"), vec![]).unwrap();
+    let b = Broker::new(
+        unix,
+        Config {
+            devices: vec![],
+            services: vec![],
+            keys: None,
+            release: Release::OwnerFree,
+            budget: None,
+            run: 3,
+        },
+    );
+    b.on_leased_checked(Box::new(|_, _| Err(std::io::Error::other("disk full"))));
+    let fd = unsafe { libc::memfd_create(c"lease-record".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 4096) }, 0);
+    let id = b.publish(
+        User::uid(unsafe { libc::geteuid() }),
+        "gpu.0",
+        1,
+        vec![(Unix::object(fd), 0, 4096)],
+    );
+    let serving = b.clone();
+    std::thread::spawn(move || serving.serve());
+    let mut c = Client::connect(&d.join("broker.sock").to_string_lossy()).unwrap();
+    let error = c.find("gpu.0").unwrap_err();
+    assert!(error.to_string().contains("disk full"), "{error}");
+    assert!(b.holders(id).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}

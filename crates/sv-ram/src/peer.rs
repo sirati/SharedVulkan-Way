@@ -39,6 +39,8 @@ pub enum PeerEvent {
 /// `UNMAPPED`. The broker is one ([`crate::brokered`]); a peer that is the
 /// only mapper has [`NoMappers`].
 pub trait Mappers {
+    /// False freezes all table answers while mapper recovery is untrusted.
+    fn can_scan(&self) -> bool { true }
     /// Region `m` is mapped and verified, and not yet answered: make it
     /// reachable for the host's other mappers. An error refuses the region
     /// (`MAP`), so nothing is leased in it.
@@ -160,6 +162,9 @@ impl Peer {
     /// entry about to go).
     pub fn scan(&mut self, mut before_unmap: impl FnMut(&Mapped)) -> Vec<PeerEvent> {
         let mut ev = Vec::new();
+        if !self.mappers.can_scan() {
+            return ev;
+        }
         let h = self.table().header();
         if !h.valid {
             return ev;
