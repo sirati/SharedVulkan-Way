@@ -37074,7 +37074,12 @@ live DACL and PnP descriptor before changing either. Binary `SPDRP_SECURITY`
 includes the mandatory label. The five-column `devices.txt` and durable count
 checkpoint are flushed before mutation. Missing, truncated, unreadable or
 invalid installed history requires trusted recovery. A fresh install records
-an explicit empty baseline; restart cannot invent lost history.
+an explicit empty baseline; restart cannot invent lost history. Independent
+startup verification requires both live and PnP raw descriptors to remain
+protected, even when securing failed or rollback history was lost. Unknown or
+permissive protection fails before the public pipe or signer is created.
+Missing optional devices are skipped. Protected devices with missing history
+can still recover retained holder sections; their uninstall stays refused.
 
 Uninstall checks before stopping the service whether either original raw BAR
 descriptor could expose old bytes. Anything beyond the exact protected SYSTEM
@@ -37083,7 +37088,9 @@ same check. Retaining the SID file cannot police direct opens through a
 permissive DACL. Uninstall is therefore unavailable for ordinary pre-broker
 permissive raw baselines and is not an application rollback procedure. The
 installer retains the original port task/files and all recovery state on
-refusal. Only an empty holder and protected raw baseline permit removal.
+refusal. Any saved legacy grant task, script or port map also refuses uninstall
+before service mutation. Such unreviewed code could undo safe raw descriptors
+later, so protected original ACLs alone do not make legacy task restoration safe. Only an empty holder and protected raw baseline permit removal.
 
 Raw BAR ownership is bound to the canonical physical PnP instance and a
 privileged reviewed SID policy. Process exit, holder or broker restart, and
