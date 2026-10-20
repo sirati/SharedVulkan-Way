@@ -764,6 +764,9 @@ mod win {
 
     impl Urgent {
         fn now() -> Urgent {
+            if std::env::var("WC_REQ_PRIO").is_ok_and(|v| v == "0") {
+                return Urgent { was: i32::MIN };
+            }
             // SAFETY: the calling thread's pseudo-handle; no other effect.
             let was = unsafe { GetThreadPriority(GetCurrentThread()) };
             // SAFETY: as above; 2 is THREAD_PRIORITY_HIGHEST.
@@ -774,6 +777,9 @@ mod win {
 
     impl Drop for Urgent {
         fn drop(&mut self) {
+            if self.was == i32::MIN {
+                return;
+            }
             // SAFETY: as in `now`.
             unsafe { SetThreadPriority(GetCurrentThread(), self.was) };
         }

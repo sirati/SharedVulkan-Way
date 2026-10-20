@@ -819,6 +819,9 @@ impl Urgent {
     fn now() -> Urgent {
         #[cfg(windows)]
         {
+            if !raised() {
+                return Urgent { was: i32::MIN };
+            }
             // SAFETY: the pseudo-handle of the calling thread; no other effect.
             let was = unsafe { prio::GetThreadPriority(prio::GetCurrentThread()) };
             // SAFETY: as above.
@@ -833,6 +836,10 @@ impl Urgent {
 impl Drop for Urgent {
     fn drop(&mut self) {
         #[cfg(windows)]
+        if self.was == i32::MIN {
+            return;
+        }
+        #[cfg(windows)]
         // SAFETY: as in `now`.
         unsafe {
             prio::SetThreadPriority(prio::GetCurrentThread(), self.was);
@@ -840,14 +847,25 @@ impl Drop for Urgent {
     }
 }
 
+/// `WC_REQ_PRIO=0` leaves every thread at its own priority, to measure.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn raised() -> bool {
+    static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *R.get_or_init(|| !std::env::var("WC_REQ_PRIO").is_ok_and(|v| v == "0"))
+}
+
 /// One turn of a wait's spin: give way to a thread of this priority that is
 /// ready on this processor, and to nobody else (Windows); a yield elsewhere.
 fn relax() {
     #[cfg(windows)]
-    // SAFETY: no arguments that matter; Sleep(0) only gives up the slice.
-    unsafe {
-        prio::Sleep(0)
-    };
+    {
+        if !raised() {
+            std::thread::yield_now();
+            return;
+        }
+        // SAFETY: no arguments that matter; Sleep(0) only gives up the slice.
+        unsafe { prio::Sleep(0) };
+    }
     #[cfg(not(windows))]
     std::thread::yield_now();
 }
@@ -1617,9 +1635,11 @@ fn answer(conn: wc_transport::Stream, ctl: &Ctl) {
     // the thread running where it is queued waits for that thread's quantum
     // to end (one or two 15.6 ms ticks).
     #[cfg(windows)]
-    // SAFETY: the calling thread's pseudo-handle.
-    unsafe {
-        prio::SetThreadPriority(prio::GetCurrentThread(), prio::HIGHEST);
+    if raised() {
+        // SAFETY: the calling thread's pseudo-handle.
+        unsafe {
+            prio::SetThreadPriority(prio::GetCurrentThread(), prio::HIGHEST);
+        }
     }
     lines(conn, |line| {
         let line = line.trim();
