@@ -37723,7 +37723,17 @@ generation with `services.waycompose`. For each installation it does this:
   installation. It does not run the product test itself. Replacing an
   installation requires a confirmed baseline; deployments never overwrite it
   automatically. Confirm a later candidate only after its own successful
-  product session. Rollback restores the accepted application's configuration
+  product session. Root first installs the accepted stock-policy source hashes
+  in `/var/lib/waycompose/policy/stock-session.sources`, owned by root with
+  mode 0600 beneath a root-owned 0700 directory. Each line is
+  `stock-defaults-v1 SHA256`, from the exact script accepted by the real
+  mapped-user stock-policy proof. Deployment never creates this receipt.
+  Confirmation records that source hash alongside the tested snapshot;
+  deployment and rollback validate the actual script bytes against it.
+  Old pre-stock snapshots or a newly added version label alone cannot pass.
+  Adding a reviewed policy source requires its own successful product proof;
+  preserve an older receipt entry only while that source remains approved.
+  Rollback restores the accepted application's configuration
   and binaries, including its known-working broker-aware transport baseline,
   with the current trusted key. Shared services and user mapping stay in place.
   Both confirmation and rollback require idle admin and mapped-user sessions.
