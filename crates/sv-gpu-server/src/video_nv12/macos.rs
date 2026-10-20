@@ -102,6 +102,12 @@ impl Picture {
     /// The retained CVPixelBuffer, for reading color attachments. This pointer
     /// must not escape the lifetime of this Picture or be used to mutate pixels.
     pub fn layout(&self) -> Layout { self.layout }
+    /// Retain the exact joined IOSurface. This grants no broker permission and
+    /// never maps or reads its pixels. The CVPixelBuffer remains independently owned.
+    pub(crate) fn retain_surface(&self) -> wc_handle::iosection::Surface {
+        // SAFETY: this Picture owns the CVPixelBuffer retaining this IOSurface.
+        unsafe { wc_handle::iosection::Surface::retain_raw(self.surface) }
+    }
     pub fn range(&self) -> Range { self.range }
 
     pub fn pixel_buffer(&self) -> *mut c_void { self.buffer }

@@ -717,8 +717,71 @@ fn register(shared: &crate::server::Shared, id: u64, imp: SharedImport) {
     o.shared_imports.insert(id, imp);
 }
 
+#[cfg(target_os = "macos")]
+fn native_video_alloc(shared: &crate::server::Shared, d: &sv_proto::sv::AllocShared)
+    -> Option<Result<sv_proto::sv::AllocSharedReply, String>> {
+    let image = shared.objects().native_video.images.get(&d.image).cloned()?;
+    Some((|| {
+        {
+            let objects = shared.objects();
+            if d.memory == 0 || objects.memory(d.memory).is_some()
+                || !objects.native_video.exportable.contains(&d.image) {
+                return Err("native NV12 export lacks dedicated external image or fresh memory identity".into());
+            }
+        }
+        let requirements = image.requirements();
+        if d.size < requirements.size || requirements.memory_type_bits & 1 == 0 {
+            return Err("native NV12 export allocation requirements mismatch".into());
+        }
+        let memory = image.allocate().map_err(|error| format!("native NV12 allocation: {error:?}"))?;
+        let lease = crate::native_video_shared::register(std::sync::Arc::clone(&image))?;
+        if lease.size() < requirements.size {
+            return Err("original NV12 surface is smaller than native memory requirements".into());
+        }
+        let reply = sv_proto::sv::AllocSharedReply {
+            result: 0, memory_type: 0, size: lease.size(), nonce: lease.nonce(), name: lease.name().to_owned(),
+        };
+        let mut objects = shared.objects();
+        objects.insert_memory(d.memory, crate::table::MemoryRange { memory, base: 0, len: reply.size });
+        objects.native_video.memories.insert(d.memory, image);
+        objects.native_video.leases.insert(d.memory, lease);
+        Ok(reply)
+    })())
+}
+
+#[cfg(target_os = "macos")]
+fn native_video_import(shared: &crate::server::Shared, d: &sv_proto::sv::ImportShared)
+    -> Option<Result<sv_proto::sv::ImportSharedReply, String>> {
+    let image = shared.objects().native_video.images.get(&d.image).cloned()?;
+    Some((|| {
+        if d.memory == 0 || shared.objects().memory(d.memory).is_some() {
+            return Err("native NV12 import requires fresh memory identity".into());
+        }
+        let (lease, picture) = crate::native_video_shared::resolve(&d.name, d.size, &d.nonce)?;
+        let requirements = image.requirements();
+        if d.size < requirements.size || lease.size() < requirements.size || requirements.memory_type_bits & 1 == 0 {
+            return Err("native NV12 import allocation requirements mismatch".into());
+        }
+        let memory = image.allocate_picture(picture)
+            .map_err(|error| format!("original NV12 image import: {error:?}"))?;
+        let size = lease.size();
+        let mut objects = shared.objects();
+        objects.insert_memory(d.memory, crate::table::MemoryRange { memory, base: 0, len: size });
+        objects.native_video.memories.insert(d.memory, image);
+        objects.native_video.leases.insert(d.memory, lease);
+        Ok(sv_proto::sv::ImportSharedReply { result: 0, memory_type: 0, size })
+    })())
+}
+
 /// The `svAllocShared` arm of `session::protocol_command`.
 pub fn serve_alloc(shared: &crate::server::Shared, d: sv_proto::sv::AllocShared) -> sv_proto::sv::AllocSharedReply {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = native_video_alloc(shared, &d) {
+        return result.unwrap_or_else(|error| {
+            eprintln!("[gpu] original NV12 export refused: {error}");
+            sv_proto::sv::AllocSharedReply { result: OUT_OF_DEVICE_MEMORY, ..Default::default() }
+        });
+    }
     let made = driver_image(shared, d.image).and_then(|img| alloc(&shared.driver, d.size, img));
     match made {
         Ok((imp, nonce)) => {
@@ -742,6 +805,13 @@ pub fn serve_alloc(shared: &crate::server::Shared, d: sv_proto::sv::AllocShared)
 
 /// The `svImportShared` arm of `session::protocol_command`.
 pub fn serve_import(shared: &crate::server::Shared, d: sv_proto::sv::ImportShared) -> sv_proto::sv::ImportSharedReply {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = native_video_import(shared, &d) {
+        return result.unwrap_or_else(|error| {
+            eprintln!("[gpu] original NV12 import refused: {error}");
+            sv_proto::sv::ImportSharedReply { result: INVALID_EXTERNAL_HANDLE, ..Default::default() }
+        });
+    }
     let made = driver_image(shared, d.image).and_then(|img| open(&shared.driver, &d.name, d.size, &d.nonce, img));
     match made {
         Ok(imp) => {

@@ -141,6 +141,7 @@ struct Scope {
 #[derive(Default)]
 pub struct NativeVideo {
     ready: Ready,
+    proven64: bool,
     next: u64,
     sessions: HashMap<u64, Arc<Session>>,
     parameters: HashMap<u64, Parameters>,
@@ -152,6 +153,30 @@ impl NativeVideo {
         Self {
             ready,
             ..Self::default()
+        }
+    }
+    /// Exact immutable-proof scope. Readiness still requires every Ready bit;
+    /// constructing this contract does not probe hardware or enable startup.
+    pub fn proven64(ready: Ready) -> Self {
+        Self {
+            ready,
+            proven64: true,
+            ..Self::default()
+        }
+    }
+    /// StdVideo level enum, where zero is H.264 level 1.0.
+    pub fn max_level_idc(&self) -> u32 {
+        if self.proven64 {
+            0
+        } else {
+            15
+        }
+    }
+    pub fn supports_image_extent(&self, extent: vk::Extent2D) -> bool {
+        if self.proven64 {
+            extent.width == 64 && extent.height == 64
+        } else {
+            extent_valid(extent)
         }
     }
     pub fn available(&self) -> bool {
@@ -180,28 +205,28 @@ impl NativeVideo {
                 height: 16,
             })
             .min_coded_extent(vk::Extent2D {
-                width: 16,
-                height: 16,
+                width: if self.proven64 { 64 } else { 16 },
+                height: if self.proven64 { 64 } else { 16 },
             })
             .max_coded_extent(vk::Extent2D {
-                width: 4096,
-                height: 2304,
+                width: if self.proven64 { 64 } else { 4096 },
+                height: if self.proven64 { 64 } else { 2304 },
             })
-            .max_dpb_slots(16)
-            .max_active_reference_pictures(16))
+            .max_dpb_slots(if self.proven64 { 4 } else { 16 })
+            .max_active_reference_pictures(if self.proven64 { 4 } else { 16 }))
     }
     pub fn create_session(
         &mut self,
         profile: Profile,
         info: &vk::VideoSessionCreateInfoKHR<'_>,
     ) -> VideoResult<u64> {
-        let _ = self.capabilities(profile)?;
+        let caps = self.capabilities(profile)?;
         if !info.flags.is_empty()
             || info.picture_format != FORMAT
             || info.reference_picture_format != FORMAT
-            || !extent_valid(info.max_coded_extent)
-            || info.max_dpb_slots > 16
-            || info.max_active_reference_pictures > 16
+            || !self.supports_image_extent(info.max_coded_extent)
+            || info.max_dpb_slots > caps.max_dpb_slots
+            || info.max_active_reference_pictures > caps.max_active_reference_pictures
             || info.max_active_reference_pictures > info.max_dpb_slots
         {
             return unsupported();
@@ -235,7 +260,11 @@ impl NativeVideo {
         binds: &[vk::BindVideoSessionMemoryInfoKHR<'_>],
     ) -> VideoResult<()> {
         self.memory_requirements(id)?;
-        if binds.is_empty() { Ok(()) } else { invalid() }
+        if binds.is_empty() {
+            Ok(())
+        } else {
+            invalid()
+        }
     }
     pub fn session(&self, id: u64) -> VideoResult<Arc<Session>> {
         self.sessions
@@ -322,6 +351,8 @@ impl NativeVideo {
         sps: &[vk::native::StdVideoH264SequenceParameterSet],
         pps: &[vk::native::StdVideoH264PictureParameterSet],
     ) -> VideoResult<()> {
+        let max_level = self.max_level_idc();
+        let proven64 = self.proven64;
         let p = self
             .parameters
             .get_mut(&id)
@@ -337,7 +368,7 @@ impl NativeVideo {
         for s in sps {
             if sets.sps.contains_key(&s.seq_parameter_set_id)
                 || !p.session.profile.supports_sps_profile(s.profile_idc)
-                || s.level_idc > 15
+                || s.level_idc > max_level
                 || u32::from(s.max_num_ref_frames) > p.session.dpb_slots
                 || s.flags.frame_mbs_only_flag() == 0
                 || s.chroma_format_idc != 1
@@ -356,7 +387,10 @@ impl NativeVideo {
                 .checked_add(1)
                 .and_then(|v| v.checked_mul(16))
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if width > p.session.extent.width || height > p.session.extent.height {
+            if width > p.session.extent.width
+                || height > p.session.extent.height
+                || (proven64 && (width != 64 || height != 64))
+            {
                 return unsupported();
             }
             const MAX_FS: [u32; 16] = [
@@ -633,10 +667,9 @@ mod tests {
         let id = v.create_session(Profile { idc: 100 }, &info()).unwrap();
         assert!(v.memory_requirements(id).unwrap().is_empty());
         assert!(v.bind_memory(id, &[]).is_ok());
-        assert!(
-            v.bind_memory(id, &[vk::BindVideoSessionMemoryInfoKHR::default()])
-                .is_err()
-        );
+        assert!(v
+            .bind_memory(id, &[vk::BindVideoSessionMemoryInfoKHR::default()])
+            .is_err());
     }
     #[test]
     fn failed_update_preserves_sequence_and_snapshot() {
@@ -1119,5 +1152,169 @@ mod tests_reference_matching {
         picture.field_pic_flag = false;
         picture.pic_order_cnt = [i32::MIN, i32::MAX];
         assert!(!reference.recordable_setup(&picture));
+    }
+}
+
+#[cfg(test)]
+mod tests_proven64 {
+    use super::*;
+    fn ready() -> Ready {
+        Ready {
+            hardware_h264: true,
+            joined_nv12_import: true,
+            native_queue_bound_decode: true,
+        }
+    }
+    fn info() -> vk::VideoSessionCreateInfoKHR<'static> {
+        vk::VideoSessionCreateInfoKHR::default()
+            .picture_format(FORMAT)
+            .reference_picture_format(FORMAT)
+            .max_coded_extent(vk::Extent2D {
+                width: 64,
+                height: 64,
+            })
+            .max_dpb_slots(4)
+            .max_active_reference_pictures(4)
+    }
+    fn sps(profile: u32) -> vk::native::StdVideoH264SequenceParameterSet {
+        let mut s: vk::native::StdVideoH264SequenceParameterSet = unsafe { std::mem::zeroed() };
+        s.profile_idc = profile;
+        s.chroma_format_idc = 1;
+        s.max_num_ref_frames = 4;
+        s.pic_width_in_mbs_minus1 = 3;
+        s.pic_height_in_map_units_minus1 = 3;
+        s.flags.set_frame_mbs_only_flag(1);
+        s.flags.set_direct_8x8_inference_flag(1);
+        s
+    }
+    #[test]
+    fn scoped_queries_are_exact_and_do_not_implicitly_enable_readiness() {
+        let v = NativeVideo::proven64(ready());
+        for idc in [66, 77, 100] {
+            let caps = v.capabilities(Profile { idc }).unwrap();
+            assert_eq!(
+                caps.min_coded_extent,
+                vk::Extent2D {
+                    width: 64,
+                    height: 64
+                }
+            );
+            assert_eq!(caps.max_coded_extent, caps.min_coded_extent);
+            assert_eq!(
+                caps.picture_access_granularity,
+                vk::Extent2D {
+                    width: 16,
+                    height: 16
+                }
+            );
+            assert_eq!(caps.max_dpb_slots, 4);
+            assert_eq!(caps.max_active_reference_pictures, 4);
+            assert_eq!(
+                caps.flags,
+                vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES
+            );
+        }
+        assert_eq!(v.max_level_idc(), 0);
+        assert!(v.capabilities(Profile { idc: 110 }).is_err());
+        assert!(v.supports_image_extent(vk::Extent2D {
+            width: 64,
+            height: 64
+        }));
+        for extent in [(16, 16), (64, 48), (66, 64), (4096, 2304)] {
+            assert!(!v.supports_image_extent(vk::Extent2D {
+                width: extent.0,
+                height: extent.1
+            }));
+        }
+        assert!(!NativeVideo::proven64(Ready::default()).available());
+        assert!(NativeVideo::proven64(Ready::default())
+            .capabilities(Profile { idc: 66 })
+            .is_err());
+    }
+    #[test]
+    fn scoped_sessions_reject_extents_and_reference_counts_outside_contract() {
+        let mut v = NativeVideo::proven64(ready());
+        assert!(v.create_session(Profile { idc: 100 }, &info()).is_ok());
+        for (width, height, dpb, references) in [
+            (64, 48, 4, 4),
+            (80, 64, 4, 4),
+            (64, 64, 5, 4),
+            (64, 64, 4, 5),
+        ] {
+            let info = info()
+                .max_coded_extent(vk::Extent2D { width, height })
+                .max_dpb_slots(dpb)
+                .max_active_reference_pictures(references);
+            assert!(v.create_session(Profile { idc: 100 }, &info).is_err());
+        }
+    }
+    #[test]
+    fn scoped_sps_accepts_proved_profiles_and_refuses_wider_syntax_without_partial_commit() {
+        for profile in [66, 77, 100] {
+            let mut v = NativeVideo::proven64(ready());
+            let session = v.create_session(Profile { idc: profile }, &info()).unwrap();
+            let params = v.create_parameters(session, None, 1, 1).unwrap();
+            let original = sps(profile);
+            let mut rejected = Vec::new();
+            let mut value = original;
+            value.level_idc = 1;
+            rejected.push(value);
+            let mut value = original;
+            value.max_num_ref_frames = 5;
+            rejected.push(value);
+            let mut value = original;
+            value.pic_width_in_mbs_minus1 = 4;
+            rejected.push(value);
+            let mut value = original;
+            value.pic_height_in_map_units_minus1 = 2;
+            rejected.push(value);
+            let mut value = original;
+            value.flags.set_frame_mbs_only_flag(0);
+            rejected.push(value);
+            let mut value = original;
+            value.bit_depth_luma_minus8 = 2;
+            rejected.push(value);
+            let mut value = original;
+            value.chroma_format_idc = 2;
+            rejected.push(value);
+            for invalid in rejected {
+                assert!(unsafe { v.update_parameters(params, 1, &[invalid], &[]) }.is_err());
+            }
+            // All failed attempts leave both parameter IDs and sequence usable.
+            unsafe { v.update_parameters(params, 1, &[original], &[]) }.unwrap();
+        }
+    }
+    #[test]
+    fn diagnostic_constructor_and_default_keep_the_previous_contract() {
+        let diagnostic = NativeVideo::new(ready());
+        let caps = diagnostic.capabilities(Profile { idc: 100 }).unwrap();
+        assert_eq!(
+            caps.min_coded_extent,
+            vk::Extent2D {
+                width: 16,
+                height: 16
+            }
+        );
+        assert_eq!(
+            caps.max_coded_extent,
+            vk::Extent2D {
+                width: 4096,
+                height: 2304
+            }
+        );
+        assert_eq!(caps.max_dpb_slots, 16);
+        assert_eq!(caps.max_active_reference_pictures, 16);
+        assert_eq!(diagnostic.max_level_idc(), 15);
+        assert!(diagnostic.supports_image_extent(vk::Extent2D {
+            width: 64,
+            height: 48
+        }));
+        let default = NativeVideo::default();
+        assert!(!default.available());
+        assert_eq!(default.max_level_idc(), 15);
+        assert!(default.supports_image_extent(vk::Extent2D {
+            width: 4096,
+            height: 2304
+        }));
     }
 }

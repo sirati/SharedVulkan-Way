@@ -110,6 +110,15 @@ mod native_queue;
 #[cfg(target_os = "macos")]
 mod native_video_image;
 
+#[cfg(target_os = "macos")]
+mod native_video_shared;
+
+#[cfg(any(target_os = "macos", test))]
+mod native_video_shared_policy;
+
+#[cfg(any(target_os = "macos", test))]
+mod native_video_image_contract;
+
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod video_recording;
 

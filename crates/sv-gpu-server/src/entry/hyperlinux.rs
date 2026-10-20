@@ -442,6 +442,8 @@ fn serve_one(
         queue_lock: Arc::new(Mutex::new(())),
         pool_lock: Arc::new(Mutex::new(())),
         video_stable: Default::default(),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         poisoned: Default::default(),
     });
     let result = (|| -> Result<(), Error> {

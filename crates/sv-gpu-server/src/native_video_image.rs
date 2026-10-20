@@ -12,9 +12,7 @@ use crate::{
 use ash::vk;
 use std::sync::{Arc, Mutex};
 
-#[path = "native_video_image_contract.rs"]
-mod contract;
-pub(crate) use contract::Contract;
+pub(crate) use crate::native_video_image_contract::Contract;
 
 struct Allocation {
     memory: vk::DeviceMemory,
@@ -188,15 +186,25 @@ impl Image {
     /// Allocate once for the exact image; ownership stays here until both
     /// logical image and memory owners, and every submitted reader, release it.
     pub(crate) fn allocate(&self) -> Result<vk::DeviceMemory, vk::Result> {
+        let picture =
+            Picture::allocate_target(self.width as usize, self.height as usize, Range::Video)
+                .map_err(|_| vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+        self.allocate_picture(picture)
+    }
+    /// Import the original retained target into another image. This creates a
+    /// native memory import only, never a new CVPixelBuffer or IOSurface.
+    pub(crate) fn allocate_picture(
+        &self,
+        picture: Arc<Picture>,
+    ) -> Result<vk::DeviceMemory, vk::Result> {
         let mut allocation = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
         if allocation.is_some() {
             return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
         }
-        // Vulkan images have no inherent full/narrow interpretation. The source
-        // stream attachments and VkSamplerYcbcrConversion carry it at use time.
-        let picture =
-            Picture::allocate_target(self.width as usize, self.height as usize, Range::Video)
-                .map_err(|_| vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+        let layout = picture.layout();
+        if layout.width != self.width as usize || layout.height != self.height as usize {
+            return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE);
+        }
         let (memory, storage, _) =
             unsafe { joined::allocate_for_image(&self.driver, self.image, picture) }
                 .map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
