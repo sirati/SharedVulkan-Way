@@ -139,25 +139,50 @@ canonical broker must compose all independent native holds and both sides'
 trusted completion before reusing any physical extent. Retirement does not
 scrub data; the existing owner must enforce zeroing and cross-user policy.
 
-## Validation limits and required guest proof
+## Validation and remaining limits
 
-Source preparation and an actual external-module compile/link against the
-matching Linux 6.18.55 configuration are implemented. The fixture alternate-node
-build passed with `W=1` using GCC 16.2.0. BTF generation was skipped because the
-prepared dev output has no vmlinux image. This does not establish runtime
-correctness. Isolated native alias and importer tests remain pending. No host kernel or module, family VM, Windows lease, security setting,
-or application binary was changed for this preparation.
+Both default-node and fixture-node modules compiled and linked against the
+matching Linux 6.18.55 configuration with `W=1`, using GCC 16.2.0. BTF generation
+was skipped because the prepared dev output has no vmlinux image. Independent
+source review found an inherited CPU SG initialization race. The per-buffer
+mutex fix was compiled, independently reviewed, and applied before any load.
 
-Required private Linux guest cases include initial RO mmap, failed writable
-mmap/mprotect/execute upgrades, exact range bounds, multiple VMAs and split
-munmap, surviving dup, fork and SCM_RIGHTS aliases, VMA survival after every
-user FD closes, recipient exit with other holders alive, and eventual monitor
-retirement only after the final alias disappears. A native importer fixture
-must retain and release real dma-buf references, device attachments, mappings
-and independently delayed fences. Actual GPU importer lifetime needs its own
-proof in addition to a synthetic importer fixture. Negative cases must retain
-pins and never produce RETIRED. Portable arithmetic tests or userspace counts
-do not satisfy this kernel gate.
+The committed [native fixtures](tests/README.md) passed in separate runs of an
+own private matching Linux 6.18.55 KVM guest, first with one CPU and then two,
+with 1 GiB configured RAM, no network and no GPU. They exercised RO restrictions,
+bounded mappings, twelve concurrent CPU-sync callers, dup, fork, split VMAs,
+queued and received SCM_RIGHTS, unprivileged RO recipients, and VMAs surviving
+all user FD closes. Producer exit while a transferred alias remained queued
+and recipient exit while another VMA survived both left the monitor LIVE.
+Retirement followed the final alias release.
 
-Source audit and future build/runtime evidence belong outside Git at
+A synthetic kernel importer retained actual dma-buf, attachment, SG and vmap
+references. With all user FDs closed it kept the monitor LIVE. After releasing
+all native references but leaving an independently held BOOKKEEP fence
+unsignaled, the monitor remained DRAINING. Explicit kernel fence signal allowed
+cleanup and RETIRED. RO device attachment was refused. This is a real kernel
+reference/fence test with no GPU submission or hardware completion claim.
+
+The broker owner's immutable Rust helper also passed its exact native
+`create_checked` adapter test against this kernel interface, including source
+geometry/access/range checks, RO write/execute refusal, RW original-byte
+visibility, VMA-held LIVE and final monitor RETIRED. It did not exercise a
+complete canonical ServiceContext, QMP or compositor flow, or release a
+canonical exclusion.
+
+Both guest runs unloaded the modules normally and shut down cleanly. The stock
+udmabuf device identity was unchanged. Captured kernel logs contained no BUG,
+WARNING, Oops, KASAN or UBSAN reports; the expected out-of-tree-module taint is
+recorded. The final two-CPU scope peaked below 607 MiB host memory. No host
+module, family VM, Windows lease, security policy or application was changed.
+
+Actual GPU importer behavior and cross-VM/native completion composition remain
+unproved. RO GPU import is intentionally unsupported. Allocation-failure and
+corrupt-importer fault injection remain separate tests; the source refuses to
+certify those cleanup failures. No runtime result here enables production
+activation or substitutes for canonical durable release and all independent
+native holds.
+
+Source audit, exact artifact/config/source hashes, boot recipes, build logs,
+resource measurements and runtime receipts remain outside Git under
 `/mnt/datasets/builds/evidence/linux-udmabuf-retirement`.
