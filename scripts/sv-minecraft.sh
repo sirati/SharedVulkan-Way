@@ -49,6 +49,7 @@
 #   SVMC_MEM       the game's memory cap (6G); the heap is Prism's 3 GiB
 #   SVMC_GPU_ARENA_MIB  the GPU side's arena (512); the guest gives a session 64 or 240
 #   SVMC_GPU_POOL_MIB   lease from one pool of this size instead, as the guest does (§97)
+#   SVMC_GPU_MODE       serve (exported arena) or pool (shared host-memory fixture)
 . "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
@@ -80,9 +81,11 @@ GLFW=$(nixpath glfw3-minecraft) || true
 export PATH="$XDOTOOL/bin:$PATH"
 
 KIDS=()
+MC_POOL_FILE=""
 cleanup() {
   kill "${KIDS[@]}" 2>/dev/null
   [ -n "${WINEPREFIX:-}" ] && WINEPREFIX="$WINEPREFIX" wineserver -k 2>/dev/null
+  [ -n "$MC_POOL_FILE" ] && rm -f "$MC_POOL_FILE"
 }
 trap cleanup EXIT INT TERM
 
@@ -357,7 +360,18 @@ run() {
     local VVL; VVL=$(nixpath vulkan-validation-layers)
     GPU_ENV+=(VK_LAYER_PATH="$VVL/share/vulkan/explicit_layer.d" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
   fi
-  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 --arena $(( ${SVMC_GPU_ARENA_MIB:-512} << 20 )) ${SVMC_GPU_POOL_MIB:+--pool $(( SVMC_GPU_POOL_MIB << 20 ))} \
+  local -a GPU_ARGS=(serve --clients 16 --arena $(( ${SVMC_GPU_ARENA_MIB:-512} << 20 )))
+  local PORT=$((30000 + RANDOM % 20000))
+  if [ "${SVMC_GPU_MODE:-serve}" = pool ]; then
+    need socat
+    [ -x "$BIN/sv-hostd" ] || die "build sv-hostd for the pool fixture"
+    MC_POOL_FILE=/dev/shm/svmc-$$-gpu
+    truncate -s "$(( ${SVMC_GPU_POOL_MIB:-1024} << 20 ))" "$MC_POOL_FILE"
+    GPU_ARGS=(pool-guest --pool-file "$MC_POOL_FILE" --port "$PORT" --sessions 8)
+  elif [ -n "${SVMC_GPU_POOL_MIB:-}" ]; then
+    GPU_ARGS+=(--pool "$(( SVMC_GPU_POOL_MIB << 20 ))")
+  fi
+  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" "${GPU_ARGS[@]}" \
       --socket "$RUN/gpu.sock" --idle $((secs + 120)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" -v keep="${SVMC_KEEP_PIPELINE_TRACE:-0}" -v keepf="$RUN/gpu-pipelines.txt" '
@@ -373,6 +387,15 @@ run() {
         /^\[blob\]/ { next }
         { print; fflush() }' >"$RUN/gpu.log" &
   KIDS+=($!)
+  if [ "${SVMC_GPU_MODE:-serve}" = pool ]; then
+    for _ in $(seq 1 100); do grep -q "publishing the extent" "$RUN/gpu.log" && break; sleep 0.1; done
+    grep -q "publishing the extent" "$RUN/gpu.log" || die "pool GPU side never published its extent"
+    socat "UNIX-LISTEN:$RUN/cold.sock,fork,reuseaddr" "TCP:127.0.0.1:$PORT" >"$RUN/socat.log" 2>&1 &
+    KIDS+=($!)
+    "$BIN/sv-hostd" ivshmem-serve --region "$MC_POOL_FILE" --cold "$RUN/cold.sock" \
+      --socket "$RUN/gpu.sock" >"$RUN/hostd.log" 2>&1 &
+    KIDS+=($!)
+  fi
   for _ in $(seq 1 80); do [ -S "$RUN/gpu.sock" ] && [ -S "$RUN/xdg/svmc" ] && break; sleep 0.25; done
   [ -S "$RUN/gpu.sock" ] || die "the GPU side never listened; see $RUN/gpu.log"
   [ -S "$RUN/xdg/svmc" ] || die "wc-proxy never listened; see $RUN/proxy.log"
