@@ -8,6 +8,15 @@ let
   guest = import inputs.nixpkgs {
     localSystem = "x86_64-linux";
     crossSystem = "aarch64-linux";
+    crossOverlays = [ (_final: prev: {
+      # GCC16's target libgomp trips format-truncation under its own -Werror.
+      # Keep the target compiler source unchanged and make warnings nonfatal.
+      gcc16 = prev.gcc16.override {
+        cc = prev.gcc16.cc.overrideAttrs (old: {
+          configureFlags = (old.configureFlags or []) ++ [ "--disable-werror" ];
+        });
+      };
+    }) ];
     config.allowUnfree = true;
   };
   # Use the same target libc source/version for stock apps and custom libraries.
