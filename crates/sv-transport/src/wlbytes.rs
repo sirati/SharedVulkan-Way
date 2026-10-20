@@ -403,6 +403,35 @@ impl ByteChannel {
         }
     }
 
+    /// Fit a short write to currently available ring credits.
+    pub fn write_available(&mut self, bytes: &[u8]) -> Result<usize> {
+        if bytes.is_empty() { return Ok(0); }
+        let count = bytes.len().min(self.write_capacity()?);
+        // Even when no payload fits, attempt one byte so `place` can publish
+        // a wrap pad. The peer consumes that pad and returns the missing credit.
+        self.write(&bytes[..count.max(1)])
+    }
+    pub fn write_capacity(&self) -> Result<usize> { self.tx.available_payload() }
+    pub fn tx_credit_bell(&self) -> Result<crate::park::Bell<'_>> {
+        self.tx.ctrl().bell(self.endpoint.tx())
+    }
+    pub fn credit_epoch(&self) -> Result<u32> {
+        Ok(self.tx_credit_bell()?.wake.load(std::sync::atomic::Ordering::Acquire))
+    }
+    /// Park on producer credits after recording the epoch before the caller's
+    /// last readiness check. Consumer head publication rings this lane.
+    pub fn wait_writable_since(&self, epoch: u32, timeout: std::time::Duration) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        if self.write_capacity()? > 0 { return Ok(true); }
+        let bell = self.tx_credit_bell()?;
+        bell.parked.fetch_add(1, Ordering::SeqCst);
+        if self.write_capacity()? == 0 {
+            crate::park::sys::wait(bell.wake, epoch, timeout);
+        }
+        bell.parked.fetch_sub(1, Ordering::SeqCst);
+        Ok(self.write_capacity()? > 0)
+    }
+
     /// Send the zero-length packet that means end of stream, once.
     ///
     /// Ordered behind every byte already written, because it is a packet in the
@@ -481,6 +510,41 @@ impl ByteChannel {
                 ReadOutcome::Bytes(n)
             }
         })
+    }
+
+    /// Read using a shared packet cursor instead of a local remainder buffer.
+    ///
+    /// Callers serialize all readers of this lane and cursor. A partial read
+    /// leaves the packet in the original ring, preserving ordering and credits
+    /// when another alias performs the next read. Do not mix with `read`.
+    pub fn read_shared(&mut self, buf: &mut [u8], cursor: &std::sync::atomic::AtomicU64) -> Result<ReadOutcome> {
+        use std::sync::atomic::Ordering;
+        if buf.is_empty() { return Ok(ReadOutcome::Empty); }
+        if self.has_buffered() { return Err(Error::BadColdMessage("mixed byte-channel cursor modes")); }
+        let Some(packet) = self.rx.next()? else { return Ok(ReadOutcome::Empty); };
+        if packet.kind != PacketKind::Bytes {
+            self.rx.defer();
+            return Err(Error::BadPacketLength { ring: self.slot, len: u32::MAX });
+        }
+        let at = cursor.load(Ordering::Relaxed) as usize;
+        if packet.payload.is_empty() && at == 0 {
+            self.rx.advance()?;
+            return Ok(ReadOutcome::Eof);
+        }
+        if at >= packet.payload.len() {
+            self.rx.defer();
+            return Err(Error::BadPacketLength { ring: self.slot, len: u32::MAX });
+        }
+        let count = buf.len().min(packet.payload.len() - at);
+        buf[..count].copy_from_slice(&packet.payload[at..at + count]);
+        if at + count == packet.payload.len() {
+            cursor.store(0, Ordering::Relaxed);
+            self.rx.advance()?;
+        } else {
+            cursor.store((at + count) as u64, Ordering::Relaxed);
+            self.rx.defer();
+        }
+        Ok(ReadOutcome::Bytes(count))
     }
 
     /// Is there anything to read without touching the ring?
@@ -967,6 +1031,52 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(5), "{took:?}");
         drop(mem);
     }
+    #[test]
+    fn returned_credits_wake_a_parked_writer() {
+        use std::sync::atomic::Ordering;
+        let (_control, mut writer, mut reader) = pair();
+        while writer.write_available(&[0xa5; 4096]).unwrap() != 0 {}
+        let epoch = writer.credit_epoch().unwrap();
+        let (ready, wait) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                ready.send(()).unwrap();
+                writer.wait_writable_since(epoch, std::time::Duration::from_secs(5)).unwrap()
+            });
+            wait.recv().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while writer.tx_credit_bell().unwrap().parked.load(Ordering::Acquire) == 0 {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let mut bytes = [0; 4096];
+            assert!(matches!(reader.read(&mut bytes).unwrap(), ReadOutcome::Bytes(_)));
+            assert!(waiting.join().unwrap());
+        });
+        assert!(writer.write_available(b"after credit").unwrap() > 0);
+    }
+
+    #[test]
+    fn shared_short_cursor_does_not_acknowledge_the_partial_packet() {
+        use std::sync::atomic::AtomicU64;
+        let (control, mut writer, mut first) = pair();
+        let mut second = ByteChannel::open(&control, writer.slot(), Endpoint::Peer).unwrap();
+        let cursor = AtomicU64::new(0);
+        writer.write(b"0123456789").unwrap();
+        let credit_before = writer.free_bytes().unwrap();
+        let mut short = [0; 3];
+        assert_eq!(first.read_shared(&mut short, &cursor).unwrap(), ReadOutcome::Bytes(3));
+        assert_eq!(&short, b"012");
+        assert_eq!(writer.free_bytes().unwrap(), credit_before);
+        assert_eq!(second.read_shared(&mut short, &cursor).unwrap(), ReadOutcome::Bytes(3));
+        assert_eq!(&short, b"345");
+        assert_eq!(writer.free_bytes().unwrap(), credit_before);
+        let mut rest = [0; 8];
+        assert_eq!(first.read_shared(&mut rest, &cursor).unwrap(), ReadOutcome::Bytes(4));
+        assert_eq!(&rest[..4], b"6789");
+        assert!(writer.free_bytes().unwrap() > credit_before);
+    }
+
 }
 
 #[cfg(test)]
