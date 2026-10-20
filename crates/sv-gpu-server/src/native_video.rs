@@ -105,6 +105,8 @@ pub struct Reference {
 }
 #[derive(Clone)]
 pub struct Decode {
+    /// Apply the coding-scope initial reference snapshot only for this job.
+    pub begin_before: bool,
     pub h264: H264Picture,
     pub reset_before: bool,
     pub begin_references: Arc<[Reference]>,
@@ -477,6 +479,7 @@ impl NativeVideo {
             }
             validate_picture(&r.picture, &scope.session)?;
         }
+        job.begin_before = scope.jobs.is_empty();
         job.reset_before = scope.reset;
         job.begin_references = scope.begin_references.clone();
         scope.reset = false;
@@ -763,6 +766,7 @@ mod tests_multiple_scopes {
             extent: info.max_coded_extent,
         };
         let job = Decode {
+            begin_before: false,
             session: v.session(id).unwrap(),
             configuration: Configuration {
                 sps: Arc::from([1]),
@@ -790,25 +794,49 @@ mod tests_multiple_scopes {
             reset_before: true,
             begin_references: Arc::from([]),
         };
+        let mut sets = ParameterSets::default();
+        sets.sps.insert(
+            0,
+            Sps {
+                nal: Arc::from([1]),
+                profile: 100,
+            },
+        );
+        sets.pps.insert(
+            0,
+            Pps {
+                nal: Arc::from([2]),
+                sps: 0,
+            },
+        );
+        v.parameters.get_mut(&p).unwrap().sets = Arc::new(sets);
         v.begin(7, id, p).unwrap();
-        v.scopes.get_mut(&7).unwrap().jobs.push(job.clone());
+        v.reset_scope(7).unwrap();
+        v.record(7, job.clone(), 0, 0).unwrap();
+        let mut second = job.clone();
+        second.source_buffer = 2;
+        v.record(7, second, 0, 0).unwrap();
         v.end(7).unwrap();
         let old = v.recording(7).unwrap();
         v.begin(7, id, p).unwrap();
         v.reset_scope(7).unwrap();
         assert!(v.end(7).is_err());
-        v.scopes.get_mut(&7).unwrap().reset = false;
-        let mut second = job;
-        second.source_buffer = 2;
-        second.reset_before = false;
-        v.scopes.get_mut(&7).unwrap().jobs.push(second);
+        let mut third = job;
+        third.source_buffer = 3;
+        v.record(7, third, 0, 0).unwrap();
         v.end(7).unwrap();
         let recorded = v.recording(7).unwrap();
-        assert_eq!(old.len(), 1);
-        assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[0].source_buffer, 1);
-        assert_eq!(recorded[1].source_buffer, 2);
+        assert_eq!(old.len(), 2);
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(
+            recorded.iter().map(|v| v.source_buffer).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(recorded[0].begin_before);
+        assert!(!recorded[1].begin_before);
+        assert!(recorded[2].begin_before);
         assert!(recorded[0].reset_before);
         assert!(!recorded[1].reset_before);
+        assert!(recorded[2].reset_before);
     }
 }
