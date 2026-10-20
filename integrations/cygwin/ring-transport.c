@@ -21,10 +21,13 @@ __declspec(dllimport) void wc_bridge_close(void);
 struct pump { int socket; unsigned references; pthread_mutex_t lock; };
 static pthread_mutex_t owner_lock = PTHREAD_MUTEX_INITIALIZER;
 static int owner_fd = -1;
+static pid_t owner_process;
 static pthread_t owner_tx, owner_rx;
+__attribute__((constructor)) static void initialize_ring_process(void) { owner_process = getpid(); }
 
 void wc_cygwin_ring_disconnect(int fd)
 {
+    if (owner_process != getpid()) return;
     pthread_mutex_lock(&owner_lock);
     if (fd != owner_fd) { pthread_mutex_unlock(&owner_lock); return; }
     owner_fd = -1;
@@ -95,6 +98,7 @@ done:
 
 int wc_cygwin_ring_socket(void)
 {
+    if (owner_process != getpid()) { errno = ENOTSUP; return -1; }
     int sockets[2];
     if (socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) < 0) return -1;
     struct pump *p = calloc(1, sizeof(*p));
@@ -116,7 +120,19 @@ int wc_cygwin_ring_socket(void)
         release(p); pthread_join(tx, NULL); errno = EAGAIN; return -1;
     }
     pthread_mutex_lock(&owner_lock);
-    owner_fd = sockets[0]; owner_tx = tx; owner_rx = rx;
+    owner_process = getpid(); owner_fd = sockets[0]; owner_tx = tx; owner_rx = rx;
     pthread_mutex_unlock(&owner_lock);
     return sockets[0];
+}
+
+/* Standard clients can exit without wl_display_disconnect. Finishing protocol
+ * pumps is not producer death or pixel retirement: their capabilities remain
+ * owned until actual close/munmap, or future trusted kernel-death recovery. */
+__attribute__((destructor)) static void finish_ring_on_exit(void)
+{
+    if (owner_process != getpid()) return;
+    pthread_mutex_lock(&owner_lock);
+    int fd = owner_fd;
+    pthread_mutex_unlock(&owner_lock);
+    if (fd >= 0) { wc_cygwin_ring_disconnect(fd); close(fd); }
 }

@@ -76,7 +76,7 @@ mod windows {
     }
     impl Connection {
         fn valid(&self) -> bool {
-            self.header.is_none_or(|(base, expected)| {
+            !self._door.ended() && self.header.is_none_or(|(base, expected)| {
                 read_header(base, expected.region_len as usize)
                     .is_ok_and(|actual| actual == expected)
             })
@@ -159,7 +159,9 @@ mod windows {
         }
         let port = wc_broker::client::lend::port("org.sirati.wcbell.0", "wayland-client")
             .ok_or("broker did not lend the Wayland doorbell")?;
-        let door = vdoorbell::attach(PortHandle::Pipe(Arc::new(port)), Arc::clone(&control))
+        let controls = wc_handle::bar_stream::controls();
+        controls.add(&control);
+        let door = vdoorbell::attach_set(PortHandle::Pipe(Arc::new(port)), controls)
             .map_err(|e| e.to_string())?;
         let tx = ByteChannel::claim(&control, u64::from(std::process::id()))
             .map_err(|e| e.to_string())?;
@@ -189,6 +191,10 @@ mod windows {
                     )
                 }
                 .map_err(|e| e.to_string())?;
+                let (stream_start, _) = directory.stream_partition();
+                // SAFETY: retained original driver view maps this exact tail RW.
+                unsafe { directory.enable_streams((pool_base as *mut u8).add(stream_start)) }
+                    .map_err(|error| error.to_string())?;
                 wc_handle::bar_lease::register(header.arena_id, directory.clone())
                     .map_err(|e| e.to_string())?;
                 Some(directory)
@@ -341,6 +347,8 @@ mod windows {
             capacity,
         )
     }
+
+    include!("stream_bridge.rs");
 
     fn hold_handle(c: &Connection, handle: wc_handle::Handle) -> Result<u64, ()> {
         let id = c

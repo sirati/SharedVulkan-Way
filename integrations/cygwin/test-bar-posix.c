@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,7 @@ int wc_cygwin_fd_from_words(const uint32_t *, size_t);
 static _Alignas(4096) uint8_t bar[262144];
 static volatile unsigned fallback_maps, fallback_unmaps;
 static volatile unsigned live, drops;
+#include "test-stream-native.inc"
 int wc_bridge_lease_create(size_t len, uintptr_t *address, uint64_t *offset, size_t *capacity, uint64_t *lease)
 {
     if (len > 65536 || live) return -1;
@@ -25,6 +27,7 @@ int wc_bridge_lease_create(size_t len, uintptr_t *address, uint64_t *offset, siz
 }
 int wc_bridge_lease_words(uint64_t lease, uint32_t *words)
 {
+    if (lease >= 100) return mock_words(lease, words);
     assert(lease == 1 && live);
     uint32_t value[7] = {24, 6, 42, 0, 0, 1, 0}; memcpy(words, value, sizeof(value)); return 0;
 }
@@ -34,7 +37,7 @@ int wc_bridge_lease_import(const uint32_t *words, uintptr_t *address, size_t *le
     ++live; *address = (uintptr_t)(bar + 131072); *length = 4096; *lease = 2; return 0;
 }
 int wc_bridge_lease_grow(uint64_t lease, size_t len) { return lease != 1 || len > 65536 ? -1 : 0; }
-int wc_bridge_lease_drop(uint64_t lease) { assert((lease == 1 || lease == 2) && live); --live; ++drops; return 0; }
+int wc_bridge_lease_drop(uint64_t lease) { if (lease >= 100) return mock_drop(lease); assert((lease == 1 || lease == 2) && live); --live; ++drops; return 0; }
 int wc_bridge_bar_overlap(uintptr_t start, size_t length)
 {
     if (length > UINTPTR_MAX - start) return 1;
@@ -46,8 +49,11 @@ static void *original_mmap(void *a, size_t n, int p, int f, int fd, off_t o)
     ++fallback_maps; errno = EAGAIN; return MAP_FAILED;
 }
 static int original_munmap(void *a, size_t n) { (void)a; (void)n; ++fallback_unmaps; errno = EAGAIN; return -1; }
+extern int _IO_fclose(FILE *);
+static int original_fclose(FILE *file) { return _IO_fclose(file); }
 static int original_close(int fd) { return syscall(SYS_close, fd); }
 static int original_ftruncate(int fd, off_t size) { return syscall(SYS_ftruncate, fd, size); }
+static int original_pipe2(int fds[2], int flags) { return syscall(SYS_pipe2, fds, flags); }
 static int original_dup(int fd) { return syscall(SYS_dup, fd); }
 static int original_dup2(int fd, int target) { return syscall(SYS_dup2, fd, target); }
 static int original_fcntl(int fd, int command, ...)
@@ -63,7 +69,7 @@ void *dlsym(void *handle, const char *name)
 {
     assert(handle == bar);
 #define SYMBOL(n) if (!strcmp(name, #n)) return (void *)original_##n
-    SYMBOL(mmap); SYMBOL(munmap); SYMBOL(close); SYMBOL(ftruncate); SYMBOL(dup); SYMBOL(dup2); SYMBOL(fcntl);
+    SYMBOL(fclose); SYMBOL(pipe2); SYMBOL(mmap); SYMBOL(munmap); SYMBOL(close); SYMBOL(ftruncate); SYMBOL(dup); SYMBOL(dup2); SYMBOL(fcntl);
     abort();
 }
 int dlclose(void *handle) { assert(handle == bar); return 0; }
@@ -117,5 +123,6 @@ int main(int argc, char **argv)
     assert(unknown >= 0 && wc_cygwin_fd_words(unknown, words) == -1 && errno == ENOTSUP);
     close(unknown);
     assert(os_create_anonymous_file(65537) == -1 && errno == ENOSPC);
+    test_streams();
     return 0;
 }

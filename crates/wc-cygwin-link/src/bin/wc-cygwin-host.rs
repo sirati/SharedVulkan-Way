@@ -46,11 +46,13 @@ mod host {
     impl BellTarget for Wake {
         fn ring_token(&self, token: u8, count: &AtomicU64) -> bool {
             let rung = self.control.ring_token(token, count);
+            let streams = wc_handle::bar_stream::controls().ring_token(token, count);
             self.poke();
-            rung
+            rung || streams
         }
         fn rescan(&self, count: &AtomicU64) {
             self.control.rescan(count);
+            wc_handle::bar_stream::controls().rescan(count);
             self.poke();
         }
     }

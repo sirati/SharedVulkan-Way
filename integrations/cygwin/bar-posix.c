@@ -42,6 +42,7 @@ struct pool {
 };
 static struct pool *pools;
 static unsigned created, retired;
+static pid_t bridge_process;
 static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void *runtime_symbol(const char *name)
@@ -72,7 +73,7 @@ static int real_dupfd(int fd)
 int wc_cygwin_ring_enabled(void)
 {
     const char *value = getenv("WC_WAYLAND_RING");
-    return value && !strcmp(value, "1");
+    return getpid() == bridge_process && value && !strcmp(value, "1");
 }
 static struct pool *find_pool(int fd)
 {
@@ -149,8 +150,38 @@ int os_create_anonymous_file(off_t size)
     return fd;
 }
 /* Invoked by libwayland's signature-aware decoder before event dispatch. */
+#include "stream-posix.inc"
+
+/* Fork children may inherit real local pipe fds for immediate dup/exec. They
+ * never use copied native DLL pointers or acquire a BAR capability implicitly. */
+static void posix_before_fork(void)
+{
+    pthread_mutex_lock(&pool_lock);
+    for (struct stream_token *stream = streams; stream; stream = stream->next) stream->fork_shared = 1;
+}
+static void posix_parent_after_fork(void) { pthread_mutex_unlock(&pool_lock); }
+static void posix_child_after_fork(void)
+{
+    pools = NULL; streams = NULL;
+    created = retired = streams_created = streams_retired = 0;
+    pthread_mutex_unlock(&pool_lock);
+}
+__attribute__((constructor)) static void initialize_posix_bridge(void)
+{
+    bridge_process = getpid();
+    pthread_atfork(posix_before_fork, posix_parent_after_fork, posix_child_after_fork);
+}
+
 int wc_cygwin_fd_from_words(const uint32_t *words, size_t count)
 {
+    if (words && count >= 7 && words[0] == 24 && words[1] == 7) {
+        int writer; uint64_t lease;
+        if (wc_bridge_stream_import(words, &writer, &lease)) { errno = EPROTO; return -1; }
+        int fd = stream_token(lease, writer, O_CLOEXEC);
+        if (fd < 0) wc_bridge_lease_drop(lease);
+        return fd;
+    }
+
     if (count < 7 || words[0] != 24) { errno = EPROTO; return -1; }
     struct pool *p = calloc(1, sizeof(*p));
     if (!p) return -1;
@@ -179,6 +210,7 @@ static int bar_overlap(void *address, size_t length)
 }
 void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offset)
 {
+    if (getpid() != bridge_process) { errno = ENOTSUP; return MAP_FAILED; }
     pthread_mutex_lock(&pool_lock);
     struct pool *p = find_pool(fd);
     if (p) {
@@ -200,6 +232,7 @@ void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offs
 }
 int munmap(void *address, size_t length)
 {
+    if (getpid() != bridge_process) { errno = ENOTSUP; return -1; }
     pthread_mutex_lock(&pool_lock);
     for (struct pool *p = pools; p; p = p->next) {
         if (p->address != address) continue;
@@ -219,9 +252,32 @@ int close(int fd)
 {
     pthread_mutex_lock(&pool_lock);
     struct pool *p = find_pool(fd);
+    struct stream_token *stream = find_stream(fd);
     int result = real_close(fd);
     if (!result && p) { remove_fd(p, fd); retire(p); }
-    pthread_mutex_unlock(&pool_lock); return result;
+    int join = !result && stream && stream_fd_closed(stream, fd);
+    pthread_mutex_unlock(&pool_lock);
+    if (join) stream_join(stream);
+    return result;
+}
+int fclose(FILE *file)
+{
+    int (*function)(FILE *) = runtime_symbol("fclose");
+    if (!function) return EOF;
+    int fd = fileno(file);
+    pthread_mutex_lock(&pool_lock);
+    struct pool *p = find_pool(fd);
+    struct stream_token *stream = find_stream(fd);
+    pthread_mutex_unlock(&pool_lock);
+    /* fclose may flush through a blocking pipe. Do not hold pool_lock while
+     * the actual runtime drains stdio and closes its kernel descriptor. */
+    int result = function(file);
+    pthread_mutex_lock(&pool_lock);
+    if (p) { remove_fd(p, fd); retire(p); }
+    int join = stream && stream_fd_closed(stream, fd);
+    pthread_mutex_unlock(&pool_lock);
+    if (join) stream_join(stream);
+    return result;
 }
 int ftruncate(int fd, off_t size)
 {
@@ -242,8 +298,10 @@ int dup(int fd)
     if (!function) return -1;
     pthread_mutex_lock(&pool_lock);
     struct pool *p = find_pool(fd);
+    struct stream_token *stream = find_stream(fd);
     int result = function(fd);
     if (result >= 0 && p && add_fd(p, result)) { real_close(result); result = -1; }
+    if (result >= 0 && stream && stream_add_fd(stream, result)) { real_close(result); result = -1; }
     pthread_mutex_unlock(&pool_lock); return result;
 }
 int dup2(int fd, int target)
@@ -252,13 +310,22 @@ int dup2(int fd, int target)
     if (!function) return -1;
     pthread_mutex_lock(&pool_lock);
     struct pool *source = find_pool(fd), *old = find_pool(target);
+    struct stream_token *stream = find_stream(fd), *old_stream = find_stream(target);
     int result = function(fd, target);
+    struct stream_token *join = NULL;
     if (result >= 0 && fd != target) {
         if (old) remove_fd(old, target);
         if (source && add_fd(source, result)) { real_close(result); result = -1; }
         if (old) retire(old);
+        if (old_stream) stream_remove_fd(old_stream, target);
+        if (stream && stream_add_fd(stream, target)) { real_close(target); result = -1; }
+        if (old_stream) {
+            if (old_stream != stream && stream_fd_closed(old_stream, target)) join = old_stream;
+        }
     }
-    pthread_mutex_unlock(&pool_lock); return result;
+    pthread_mutex_unlock(&pool_lock);
+    if (join) stream_join(join);
+    return result;
 }
 int fcntl(int fd, int command, ...)
 {
@@ -268,6 +335,7 @@ int fcntl(int fd, int command, ...)
     va_list args; va_start(args, command);
     pthread_mutex_lock(&pool_lock);
     struct pool *p = find_pool(fd);
+    struct stream_token *stream = find_stream(fd);
     switch (command) {
     case F_GETFD: case F_GETFL: case F_GETOWN:
         result = function(fd, command); break;
@@ -281,12 +349,22 @@ int fcntl(int fd, int command, ...)
     if (result >= 0 && p && (command == F_DUPFD || command == F_DUPFD_CLOEXEC) && add_fd(p, result)) {
         real_close(result); result = -1;
     }
+    if (result >= 0 && stream && (command == F_DUPFD || command == F_DUPFD_CLOEXEC) && stream_add_fd(stream, result)) {
+        real_close(result); result = -1;
+    }
     pthread_mutex_unlock(&pool_lock); va_end(args); return result;
 }
 int wc_cygwin_fd_words(int fd, uint32_t *words)
 {
     pthread_mutex_lock(&pool_lock);
     struct pool *p = find_pool(fd);
+    struct stream_token *stream = find_stream(fd);
+    if (stream && words) {
+        int result = wc_bridge_lease_words(stream->lease, words);
+        pthread_mutex_unlock(&pool_lock);
+        if (result) errno = ENOTSUP;
+        return result;
+    }
     if (!p || !words || add_fd(p, fd) || wc_bridge_lease_words(p->lease, words)) {
         pthread_mutex_unlock(&pool_lock); errno = ENOTSUP; return -1;
     }
@@ -305,6 +383,10 @@ __attribute__((destructor)) static void close_tokens(void)
         ++retained;
         for (struct map_ref *r = p->maps; r; r = r->next) ++mappings;
     }
+    unsigned retained_streams = 0;
+    for (struct stream_token *stream = streams; stream; stream = stream->next) ++retained_streams;
+    fprintf(stderr, "WC_CYGWIN_STREAM_TEARDOWN created=%u retired=%u retained=%u actual_endpoint_completion_required=1\n",
+            streams_created, streams_retired, retained_streams);
     fprintf(stderr, "WC_CYGWIN_BAR_TEARDOWN pools=%u local_retired=%u retained_capabilities=%u retained_maps=%u kernel_death_required=1 consumer_completion_required=1\n",
             created, retired, retained, mappings);
     pthread_mutex_unlock(&pool_lock);
